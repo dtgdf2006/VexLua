@@ -1,0 +1,583 @@
+package stdlib
+
+import (
+	"fmt"
+	"strings"
+
+	"vexlua/internal/chunk51"
+	rt "vexlua/internal/runtime"
+	"vexlua/internal/vm"
+)
+
+func registerString(runtime *rt.Runtime, machine *vm.VM) error {
+	handle := runtime.Heap().NewTable(8)
+	table := runtime.Heap().Table(handle)
+	set := func(name string, value rt.Value) {
+		table.SetSymbol(runtime.InternSymbol(name), value)
+	}
+	set("len", runtime.NewHostFunction("string.len", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) != 1 {
+			return rt.NilValue, fmt.Errorf("string.len expects 1 argument")
+		}
+		s, ok := runtime.ToString(args[0])
+		if !ok {
+			return rt.NilValue, fmt.Errorf("string.len expects string")
+		}
+		return rt.NumberValue(float64(len(s))), nil
+	}))
+	set("sub", runtime.NewHostFunction("string.sub", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) < 2 || len(args) > 3 {
+			return rt.NilValue, fmt.Errorf("string.sub expects 2 or 3 arguments")
+		}
+		s, ok := runtime.ToString(args[0])
+		if !ok {
+			return rt.NilValue, fmt.Errorf("string.sub expects string")
+		}
+		if !args[1].IsNumber() {
+			return rt.NilValue, fmt.Errorf("string.sub start expects number")
+		}
+		start, end := luaStringRange(len(s), int(args[1].Number()), len(s))
+		if len(args) == 3 {
+			if !args[2].IsNumber() {
+				return rt.NilValue, fmt.Errorf("string.sub end expects number")
+			}
+			start, end = luaStringRange(len(s), int(args[1].Number()), int(args[2].Number()))
+		}
+		if start > end {
+			return runtime.StringValue(""), nil
+		}
+		return runtime.StringValue(s[start-1 : end]), nil
+	}))
+	set("lower", runtime.NewHostFunction("string.lower", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) != 1 {
+			return rt.NilValue, fmt.Errorf("string.lower expects 1 argument")
+		}
+		s, ok := runtime.ToString(args[0])
+		if !ok {
+			return rt.NilValue, fmt.Errorf("string.lower expects string")
+		}
+		return runtime.StringValue(strings.ToLower(s)), nil
+	}))
+	set("upper", runtime.NewHostFunction("string.upper", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) != 1 {
+			return rt.NilValue, fmt.Errorf("string.upper expects 1 argument")
+		}
+		s, ok := runtime.ToString(args[0])
+		if !ok {
+			return rt.NilValue, fmt.Errorf("string.upper expects string")
+		}
+		return runtime.StringValue(strings.ToUpper(s)), nil
+	}))
+	set("byte", runtime.NewHostFunctionMulti("string.byte", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) < 1 || len(args) > 3 {
+			return nil, fmt.Errorf("string.byte expects 1 to 3 arguments")
+		}
+		s, ok := runtime.ToString(args[0])
+		if !ok {
+			return nil, fmt.Errorf("string.byte expects string")
+		}
+		start := 1
+		finish := 1
+		if len(args) >= 2 {
+			if !args[1].IsNumber() {
+				return nil, fmt.Errorf("string.byte start expects number")
+			}
+			start = int(args[1].Number())
+			finish = start
+		}
+		if len(args) == 3 {
+			if !args[2].IsNumber() {
+				return nil, fmt.Errorf("string.byte end expects number")
+			}
+			finish = int(args[2].Number())
+		}
+		start, end := luaStringRange(len(s), start, finish)
+		if start > end {
+			return nil, nil
+		}
+		results := make([]rt.Value, 0, end-start+1)
+		for i := start - 1; i < end; i++ {
+			results = append(results, rt.NumberValue(float64(s[i])))
+		}
+		return results, nil
+	}))
+	set("char", runtime.NewHostFunction("string.char", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		buf := make([]byte, 0, len(args))
+		for _, arg := range args {
+			if !arg.IsNumber() {
+				return rt.NilValue, fmt.Errorf("string.char expects numbers")
+			}
+			code := int(arg.Number())
+			if code < 0 || code > 255 {
+				return rt.NilValue, fmt.Errorf("string.char value out of range")
+			}
+			buf = append(buf, byte(code))
+		}
+		return runtime.StringValue(string(buf)), nil
+	}))
+	set("reverse", runtime.NewHostFunction("string.reverse", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) != 1 {
+			return rt.NilValue, fmt.Errorf("string.reverse expects 1 argument")
+		}
+		s, ok := runtime.ToString(args[0])
+		if !ok {
+			return rt.NilValue, fmt.Errorf("string.reverse expects string")
+		}
+		buf := make([]byte, len(s))
+		for i := range s {
+			buf[len(s)-1-i] = s[i]
+		}
+		return runtime.StringValue(string(buf)), nil
+	}))
+	set("rep", runtime.NewHostFunction("string.rep", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) != 2 {
+			return rt.NilValue, fmt.Errorf("string.rep expects 2 arguments")
+		}
+		s, ok := runtime.ToString(args[0])
+		if !ok {
+			return rt.NilValue, fmt.Errorf("string.rep expects string")
+		}
+		if !args[1].IsNumber() {
+			return rt.NilValue, fmt.Errorf("string.rep count expects number")
+		}
+		count := int(args[1].Number())
+		if count <= 0 {
+			return runtime.StringValue(""), nil
+		}
+		return runtime.StringValue(strings.Repeat(s, count)), nil
+	}))
+	set("find", runtime.NewHostFunctionMulti("string.find", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) < 2 || len(args) > 4 {
+			return nil, fmt.Errorf("string.find expects 2 to 4 arguments")
+		}
+		s, ok := runtime.ToString(args[0])
+		if !ok {
+			return nil, fmt.Errorf("string.find expects string")
+		}
+		pattern, ok := runtime.ToString(args[1])
+		if !ok {
+			return nil, fmt.Errorf("string.find pattern expects string")
+		}
+		start := 1
+		if len(args) >= 3 {
+			if !args[2].IsNumber() {
+				return nil, fmt.Errorf("string.find init expects number")
+			}
+			start = int(args[2].Number())
+		}
+		plain := len(args) == 4 && isTruthy(args[3])
+		return stringFind(runtime, s, pattern, start, plain)
+	}))
+	set("match", runtime.NewHostFunctionMulti("string.match", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) < 2 || len(args) > 3 {
+			return nil, fmt.Errorf("string.match expects 2 or 3 arguments")
+		}
+		s, ok := runtime.ToString(args[0])
+		if !ok {
+			return nil, fmt.Errorf("string.match expects string")
+		}
+		pattern, ok := runtime.ToString(args[1])
+		if !ok {
+			return nil, fmt.Errorf("string.match pattern expects string")
+		}
+		start := 1
+		if len(args) == 3 {
+			if !args[2].IsNumber() {
+				return nil, fmt.Errorf("string.match init expects number")
+			}
+			start = int(args[2].Number())
+		}
+		return stringMatch(runtime, s, pattern, start)
+	}))
+	gmatchFunc := runtime.NewHostFunction("string.gmatch", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) < 2 || len(args) > 3 {
+			return rt.NilValue, fmt.Errorf("string.gmatch expects 2 or 3 arguments")
+		}
+		s, ok := runtime.ToString(args[0])
+		if !ok {
+			return rt.NilValue, fmt.Errorf("string.gmatch expects string")
+		}
+		pattern, ok := runtime.ToString(args[1])
+		if !ok {
+			return rt.NilValue, fmt.Errorf("string.gmatch pattern expects string")
+		}
+		start := 1
+		if len(args) == 3 {
+			if !args[2].IsNumber() {
+				return rt.NilValue, fmt.Errorf("string.gmatch init expects number")
+			}
+			start = int(args[2].Number())
+		}
+		return stringGMatch(runtime, s, pattern, start)
+	})
+	set("gmatch", gmatchFunc)
+	set("gfind", gmatchFunc)
+	set("gsub", runtime.NewHostFunctionMulti("string.gsub", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) < 3 || len(args) > 4 {
+			return nil, fmt.Errorf("string.gsub expects 3 or 4 arguments")
+		}
+		s, ok := runtime.ToString(args[0])
+		if !ok {
+			return nil, fmt.Errorf("string.gsub expects string")
+		}
+		pattern, ok := runtime.ToString(args[1])
+		if !ok {
+			return nil, fmt.Errorf("string.gsub pattern expects string")
+		}
+		limit := -1
+		if len(args) == 4 {
+			if !args[3].IsNumber() {
+				return nil, fmt.Errorf("string.gsub count expects number")
+			}
+			limit = int(args[3].Number())
+		}
+		return stringGSub(runtime, machine, s, pattern, args[2], limit)
+	}))
+	set("format", runtime.NewHostFunction("string.format", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) == 0 {
+			return rt.NilValue, fmt.Errorf("string.format expects format string")
+		}
+		format, ok := runtime.ToString(args[0])
+		if !ok {
+			return rt.NilValue, fmt.Errorf("string.format expects string format")
+		}
+		text, err := stringFormat(runtime, format, args[1:])
+		if err != nil {
+			return rt.NilValue, err
+		}
+		return runtime.StringValue(text), nil
+	}))
+	set("dump", runtime.NewHostFunction("string.dump", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) < 1 || len(args) > 2 {
+			return rt.NilValue, fmt.Errorf("string.dump expects 1 or 2 arguments")
+		}
+		h, ok := args[0].Handle()
+		if !ok || h.Kind() != rt.ObjectLuaClosure {
+			return rt.NilValue, fmt.Errorf("string.dump expects Lua function")
+		}
+		closure := runtime.Heap().LuaClosure(h).(*vm.LuaClosure)
+		data, err := chunk51.Dump(runtime, closure.Proto)
+		if err != nil {
+			return rt.NilValue, err
+		}
+		return runtime.StringValue(string(data)), nil
+	}))
+	runtime.SetGlobal("string", rt.HandleValue(handle))
+	return nil
+}
+
+func stringFind(runtime *rt.Runtime, s string, pattern string, start int, plain bool) ([]rt.Value, error) {
+	searcher, err := compileStringPattern(pattern, plain)
+	if err != nil {
+		return nil, err
+	}
+	start = luaStringStart(len(s), start)
+	match, err := searcher.find(s, start-1)
+	if err != nil {
+		return nil, err
+	}
+	if match == nil {
+		return []rt.Value{rt.NilValue}, nil
+	}
+	results := []rt.Value{
+		rt.NumberValue(float64(match.start + 1)),
+		rt.NumberValue(float64(match.end)),
+	}
+	for _, capture := range match.captures {
+		results = append(results, stringCaptureToValue(runtime, capture))
+	}
+	return results, nil
+}
+
+func stringMatch(runtime *rt.Runtime, s string, pattern string, start int) ([]rt.Value, error) {
+	searcher, err := compileStringPattern(pattern, false)
+	if err != nil {
+		return nil, err
+	}
+	start = luaStringStart(len(s), start)
+	match, err := searcher.find(s, start-1)
+	if err != nil {
+		return nil, err
+	}
+	if match == nil {
+		return []rt.Value{rt.NilValue}, nil
+	}
+	return stringMatchResults(runtime, s[match.start:match.end], match.captures), nil
+}
+
+func stringGMatch(runtime *rt.Runtime, s string, pattern string, start int) (rt.Value, error) {
+	searcher, err := compileStringPattern(pattern, false)
+	if err != nil {
+		return rt.NilValue, err
+	}
+	position := luaStringStart(len(s), start) - 1
+	done := false
+	return runtime.NewHostFunctionMulti("string.gmatch.iter", func(runtime *rt.Runtime, _ []rt.Value) ([]rt.Value, error) {
+		if done || position > len(s) {
+			return nil, nil
+		}
+		match, err := searcher.find(s, position)
+		if err != nil {
+			return nil, err
+		}
+		if match == nil {
+			done = true
+			return nil, nil
+		}
+		full := s[match.start:match.end]
+		if match.end == match.start {
+			if match.end < len(s) {
+				position = match.end + 1
+			} else {
+				position = len(s) + 1
+				done = true
+			}
+		} else {
+			position = match.end
+		}
+		return stringMatchResults(runtime, full, match.captures), nil
+	}), nil
+}
+
+func stringGSub(runtime *rt.Runtime, machine *vm.VM, s string, pattern string, repl rt.Value, limit int) ([]rt.Value, error) {
+	searcher, err := compileStringPattern(pattern, false)
+	if err != nil {
+		return nil, err
+	}
+	if limit == 0 {
+		return []rt.Value{runtime.StringValue(s), rt.NumberValue(0)}, nil
+	}
+	count := 0
+	position := 0
+	var builder strings.Builder
+	for position <= len(s) && limit != 0 {
+		match, err := searcher.find(s, position)
+		if err != nil {
+			return nil, err
+		}
+		if match == nil {
+			break
+		}
+		full := s[match.start:match.end]
+		builder.WriteString(s[position:match.start])
+		replacement, replace, err := stringGSubReplacement(runtime, machine, repl, full, match.captures)
+		if err != nil {
+			return nil, err
+		}
+		if replace {
+			builder.WriteString(replacement)
+		} else {
+			builder.WriteString(full)
+		}
+		count++
+		if limit > 0 {
+			limit--
+		}
+		if match.end == match.start {
+			if match.end < len(s) {
+				builder.WriteByte(s[match.end])
+				position = match.end + 1
+				continue
+			}
+			position = len(s) + 1
+			break
+		}
+		position = match.end
+	}
+	if position <= len(s) {
+		builder.WriteString(s[position:])
+	}
+	return []rt.Value{runtime.StringValue(builder.String()), rt.NumberValue(float64(count))}, nil
+}
+
+func stringGSubReplacement(runtime *rt.Runtime, machine *vm.VM, repl rt.Value, full string, captures []stringPatternCapture) (string, bool, error) {
+	if s, ok := runtime.ToString(repl); ok {
+		text, err := expandStringGSubReplacement(s, full, captures)
+		return text, true, err
+	}
+	if repl.IsNumber() {
+		return fmt.Sprintf("%g", repl.Number()), true, nil
+	}
+	h, ok := repl.Handle()
+	if !ok {
+		return "", false, fmt.Errorf("string.gsub replacement expects string, number, function or table")
+	}
+	switch h.Kind() {
+	case rt.ObjectHostFunction, rt.ObjectLuaClosure:
+		callArgs := make([]rt.Value, 0, max(1, len(captures)))
+		if len(captures) == 0 {
+			callArgs = append(callArgs, runtime.StringValue(full))
+		} else {
+			for _, capture := range captures {
+				callArgs = append(callArgs, stringCaptureToValue(runtime, capture))
+			}
+		}
+		results, err := machine.CallValue(repl, callArgs)
+		if err != nil {
+			return "", false, err
+		}
+		if len(results) == 0 || results[0].Kind() == rt.KindNil || (results[0].Kind() == rt.KindBool && !results[0].Bool()) {
+			return "", false, nil
+		}
+		text, ok := concatString(runtime, results[0])
+		if !ok {
+			return "", false, fmt.Errorf("string.gsub replacement function must return string or number")
+		}
+		return text, true, nil
+	case rt.ObjectTable:
+		key := rt.Value(runtime.StringValue(full))
+		if len(captures) > 0 {
+			key = stringCaptureToValue(runtime, captures[0])
+		}
+		value, found, err := runtime.GetTable(repl, key)
+		if err != nil {
+			return "", false, err
+		}
+		if !found || value.Kind() == rt.KindNil || (value.Kind() == rt.KindBool && !value.Bool()) {
+			return "", false, nil
+		}
+		text, ok := concatString(runtime, value)
+		if !ok {
+			return "", false, fmt.Errorf("string.gsub table replacement must contain strings or numbers")
+		}
+		return text, true, nil
+	default:
+		return "", false, fmt.Errorf("string.gsub replacement expects string, number, function or table")
+	}
+}
+
+func expandStringGSubReplacement(template string, full string, captures []stringPatternCapture) (string, error) {
+	var builder strings.Builder
+	for i := 0; i < len(template); i++ {
+		if template[i] != '%' {
+			builder.WriteByte(template[i])
+			continue
+		}
+		if i+1 >= len(template) {
+			return "", fmt.Errorf("invalid use of '%%' in replacement string")
+		}
+		i++
+		switch next := template[i]; {
+		case next == '%':
+			builder.WriteByte('%')
+		case next == '0':
+			builder.WriteString(full)
+		case next >= '1' && next <= '9':
+			index := int(next - '1')
+			if index < len(captures) {
+				builder.WriteString(stringCaptureToString(captures[index]))
+			}
+		default:
+			return "", fmt.Errorf("invalid capture index %%%c in replacement string", next)
+		}
+	}
+	return builder.String(), nil
+}
+
+func stringFormat(runtime *rt.Runtime, format string, args []rt.Value) (string, error) {
+	var builder strings.Builder
+	argIndex := 0
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' {
+			builder.WriteByte(format[i])
+			continue
+		}
+		if i+1 < len(format) && format[i+1] == '%' {
+			builder.WriteByte('%')
+			i++
+			continue
+		}
+		spec, verb, next, err := parseStringFormatSpec(format, i)
+		if err != nil {
+			return "", err
+		}
+		if argIndex >= len(args) {
+			return "", fmt.Errorf("string.format missing argument for %%%c", verb)
+		}
+		formatted, err := formatStringValue(runtime, spec, verb, args[argIndex])
+		if err != nil {
+			return "", err
+		}
+		builder.WriteString(formatted)
+		argIndex++
+		i = next - 1
+	}
+	return builder.String(), nil
+}
+
+func parseStringFormatSpec(format string, start int) (string, byte, int, error) {
+	i := start + 1
+	for i < len(format) && strings.IndexByte("-+ #0", format[i]) >= 0 {
+		i++
+	}
+	for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+		i++
+	}
+	if i < len(format) && format[i] == '.' {
+		i++
+		for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+			i++
+		}
+	}
+	if i >= len(format) {
+		return "", 0, 0, fmt.Errorf("unterminated format option")
+	}
+	verb := format[i]
+	return format[start : i+1], verb, i + 1, nil
+}
+
+func formatStringValue(runtime *rt.Runtime, spec string, verb byte, value rt.Value) (string, error) {
+	switch verb {
+	case 'd', 'i':
+		integer, err := formatIntegerValue(value)
+		if err != nil {
+			return "", err
+		}
+		if verb == 'i' {
+			spec = spec[:len(spec)-1] + "d"
+		}
+		return fmt.Sprintf(spec, integer), nil
+	case 'o', 'u', 'x', 'X':
+		integer, err := formatIntegerValue(value)
+		if err != nil {
+			return "", err
+		}
+		unsigned := uint64(integer)
+		if verb == 'u' {
+			spec = spec[:len(spec)-1] + "d"
+		}
+		return fmt.Sprintf(spec, unsigned), nil
+	case 'e', 'E', 'f', 'g', 'G':
+		if !value.IsNumber() {
+			return "", fmt.Errorf("string.format %%%c expects number", verb)
+		}
+		return fmt.Sprintf(spec, value.Number()), nil
+	case 'c':
+		integer, err := formatIntegerValue(value)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf(spec, rune(integer)), nil
+	case 'q':
+		text, err := plainString(runtime, value)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf(spec, text), nil
+	case 's':
+		text, err := plainString(runtime, value)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf(spec, text), nil
+	default:
+		return "", fmt.Errorf("unsupported string.format conversion %%%c", verb)
+	}
+}
+
+func formatIntegerValue(value rt.Value) (int64, error) {
+	if !value.IsNumber() {
+		return 0, fmt.Errorf("integer format expects number")
+	}
+	return int64(value.Number()), nil
+}

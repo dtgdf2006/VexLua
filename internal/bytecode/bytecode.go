@@ -1,0 +1,231 @@
+package bytecode
+
+import (
+	"fmt"
+
+	rt "vexlua/internal/runtime"
+)
+
+type Op uint8
+
+const (
+	OpNoop Op = iota
+	OpLoadConst
+	OpMove
+	OpLoadUpvalue
+	OpStoreUpvalue
+	OpClosure
+	OpNewTable
+	OpLoadGlobal
+	OpStoreGlobal
+	OpGetField
+	OpGetFieldIC
+	OpSetField
+	OpGetTable
+	OpSetTable
+	OpAppendTable
+	OpAdd
+	OpAddNum
+	OpAddConst
+	OpSub
+	OpMul
+	OpDiv
+	OpMod
+	OpPow
+	OpLen
+	OpConcat
+	OpEqual
+	OpLess
+	OpLessEqual
+	OpNot
+	OpCall
+	OpCallMulti
+	OpVararg
+	OpYield
+	OpReturn
+	OpReturnMulti
+	OpReturnAppendPending
+	OpJump
+	OpJumpIfFalse
+	OpJumpIfTrue
+	OpLessEqualJump
+	OpSelf
+	OpSelfIC
+	OpIterPairs
+	OpIterIPairs
+)
+
+type UpvalueDesc struct {
+	InParentLocal bool
+	Index         uint16
+}
+
+type Instr struct {
+	Op Op
+	A  uint16
+	B  uint16
+	C  uint16
+	D  int32
+}
+
+type Proto struct {
+	Name         string
+	MaxStack     int
+	InlineCaches int
+	NumParams    int
+	Vararg       bool
+	Scripted     bool
+	Constants    []rt.Value
+	Children     []*Proto
+	Upvalues     []UpvalueDesc
+	Code         []Instr
+}
+
+func NewProto(name string, maxStack int, inlineCaches int) *Proto {
+	return &Proto{
+		Name:         name,
+		MaxStack:     maxStack,
+		InlineCaches: inlineCaches,
+		Children:     make([]*Proto, 0, 2),
+		Upvalues:     make([]UpvalueDesc, 0, 2),
+		Constants:    make([]rt.Value, 0, 8),
+		Code:         make([]Instr, 0, 16),
+	}
+}
+
+func (p *Proto) AddChild(child *Proto) int {
+	p.Children = append(p.Children, child)
+	return len(p.Children) - 1
+}
+
+func (p *Proto) AddConstant(v rt.Value) int {
+	p.Constants = append(p.Constants, v)
+	return len(p.Constants) - 1
+}
+
+func (p *Proto) Emit(op Op, a, b, c uint16, d int32) {
+	p.Code = append(p.Code, Instr{Op: op, A: a, B: b, C: c, D: d})
+}
+
+func (op Op) String() string {
+	switch op {
+	case OpNoop:
+		return "NOOP"
+	case OpLoadConst:
+		return "LOAD_CONST"
+	case OpMove:
+		return "MOVE"
+	case OpLoadUpvalue:
+		return "LOAD_UPVALUE"
+	case OpStoreUpvalue:
+		return "STORE_UPVALUE"
+	case OpClosure:
+		return "CLOSURE"
+	case OpNewTable:
+		return "NEW_TABLE"
+	case OpLoadGlobal:
+		return "LOAD_GLOBAL"
+	case OpStoreGlobal:
+		return "STORE_GLOBAL"
+	case OpGetField:
+		return "GET_FIELD"
+	case OpGetFieldIC:
+		return "GET_FIELD_IC"
+	case OpSetField:
+		return "SET_FIELD"
+	case OpGetTable:
+		return "GET_TABLE"
+	case OpSetTable:
+		return "SET_TABLE"
+	case OpAppendTable:
+		return "APPEND_TABLE"
+	case OpAdd:
+		return "ADD"
+	case OpAddNum:
+		return "ADD_NUM"
+	case OpAddConst:
+		return "ADD_CONST"
+	case OpSub:
+		return "SUB"
+	case OpMul:
+		return "MUL"
+	case OpDiv:
+		return "DIV"
+	case OpMod:
+		return "MOD"
+	case OpPow:
+		return "POW"
+	case OpLen:
+		return "LEN"
+	case OpConcat:
+		return "CONCAT"
+	case OpEqual:
+		return "EQ"
+	case OpLess:
+		return "LT"
+	case OpLessEqual:
+		return "LE"
+	case OpNot:
+		return "NOT"
+	case OpCall:
+		return "CALL"
+	case OpCallMulti:
+		return "CALL_MULTI"
+	case OpVararg:
+		return "VARARG"
+	case OpYield:
+		return "YIELD"
+	case OpReturn:
+		return "RETURN"
+	case OpReturnMulti:
+		return "RETURN_MULTI"
+	case OpReturnAppendPending:
+		return "RETURN_APPEND_PENDING"
+	case OpJump:
+		return "JUMP"
+	case OpJumpIfFalse:
+		return "JUMP_IF_FALSE"
+	case OpJumpIfTrue:
+		return "JUMP_IF_TRUE"
+	case OpLessEqualJump:
+		return "LE_JUMP"
+	case OpSelf:
+		return "SELF"
+	case OpSelfIC:
+		return "SELF_IC"
+	case OpIterPairs:
+		return "ITER_PAIRS"
+	case OpIterIPairs:
+		return "ITER_IPAIRS"
+	default:
+		return fmt.Sprintf("OP_%d", op)
+	}
+}
+
+const callAppendPendingFlag = 1 << 15
+
+func PackCallCounts(argCount int, resultCount int) int32 {
+	return PackCallCountsWithPending(argCount, resultCount, false)
+}
+
+func PackCallCountsWithPending(argCount int, resultCount int, appendPending bool) int32 {
+	encodedArgs := argCount &^ callAppendPendingFlag
+	if appendPending {
+		encodedArgs |= callAppendPendingFlag
+	}
+	return int32((resultCount&0xffff)<<16 | (encodedArgs & 0xffff))
+}
+
+func UnpackCallCounts(v int32) (int, int) {
+	argCount, resultCount, _ := UnpackCallSpec(v)
+	return argCount, resultCount
+}
+
+func UnpackCallSpec(v int32) (int, int, bool) {
+	uv := uint32(v)
+	rawArgs := int(uv & 0xffff)
+	appendPending := rawArgs&callAppendPendingFlag != 0
+	argCount := rawArgs &^ callAppendPendingFlag
+	resultCount := int((uv >> 16) & 0xffff)
+	return argCount, resultCount, appendPending
+}
