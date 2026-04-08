@@ -2,7 +2,9 @@ package vexlua
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -10,6 +12,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"vexlua/internal/bytecode"
+	"vexlua/internal/jit"
+	amd64jit "vexlua/internal/jit/amd64"
 )
 
 type benchBox struct {
@@ -18,6 +24,42 @@ type benchBox struct {
 
 func (b *benchBox) Scale(v float64) float64 {
 	return v + b.Bias
+}
+
+func compileNamedForTest(t *testing.T, engine *Engine, name string, source string) *bytecode.Proto {
+	t.Helper()
+	proto, err := engine.CompileStringNamed(source, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return proto
+}
+
+func runProtoRepeated(t *testing.T, engine *Engine, proto *bytecode.Proto, runs int) Value {
+	t.Helper()
+	var result Value
+	var err error
+	for i := 0; i < runs; i++ {
+		result, err = engine.Run(proto)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return result
+}
+
+func protoJITSupportForTest(t *testing.T, proto *bytecode.Proto) bool {
+	t.Helper()
+	compiler := amd64jit.NewCompiler()
+	_, err := compiler.Compile(proto)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, jit.ErrUnsupported) {
+		return false
+	}
+	t.Fatalf("jit compile probe for %q failed: %v", proto.Name, err)
+	return false
 }
 
 func TestBridgeAndProxy(t *testing.T) {
@@ -118,6 +160,209 @@ return sum
 	stats := engine.Stats(proto)
 	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" && !stats.JITCompiled {
 		t.Fatalf("expected scripted proto to reach JIT on windows amd64, got %+v", stats)
+	}
+}
+
+func TestScriptedWhileLoopCanJIT(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 2})
+	proto := compileNamedForTest(t, engine, "@jit_while.lua", `
+local i = 1
+local sum = 0
+while i <= 1000 do
+	sum = sum + i
+	i = i + 1
+end
+return sum
+`)
+	result := runProtoRepeated(t, engine, proto, 4)
+	if got := result.Number(); got != 500500 {
+		t.Fatalf("scripted while result = %v, want 500500", got)
+	}
+	stats := engine.Stats(proto)
+	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" && !stats.JITCompiled {
+		t.Fatalf("expected while-loop proto to reach JIT on windows amd64, got %+v", stats)
+	}
+}
+
+func TestDoStringCachedNumericForCanJIT(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 2})
+	source := `
+local sum = 0
+for i = 1, 1000 do
+	sum = sum + i
+end
+return sum
+`
+	for i := 0; i < 4; i++ {
+		result, err := engine.DoString(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := result.Number(); got != 500500 {
+			t.Fatalf("DoString numeric-for result = %v, want 500500", got)
+		}
+	}
+	proto := engine.sources[source]
+	if proto == nil {
+		t.Fatal("expected DoString numeric-for source to be cached")
+	}
+	stats := engine.Stats(proto)
+	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" && !stats.JITCompiled {
+		t.Fatalf("expected cached DoString proto to reach JIT on windows amd64, got %+v", stats)
+	}
+}
+
+func TestJITFallbackPreservesUnsupportedScriptSemantics(t *testing.T) {
+	testCases := []struct {
+		name   string
+		source string
+		want   string
+	}{
+		{
+			name: "closure_upvalues",
+			source: `
+local seed = 40
+local function make()
+	local offset = 2
+	return function(v)
+		return v + seed + offset
+	end
+end
+local fn = make()
+return fn(0)
+`,
+			want: "42",
+		},
+		{
+			name: "method_call",
+			source: `
+local box = {base = 40}
+function box:inc(v)
+	return self.base + v + 1
+end
+return box:inc(1)
+`,
+			want: "42",
+		},
+		{
+			name: "coroutine_resume",
+			source: `
+local co = coroutine.create(function(v)
+	local next = coroutine.yield(v + 1)
+	return next + 2
+end)
+local ok1, first = coroutine.resume(co, 40)
+local ok2, second = coroutine.resume(co, 40)
+return (ok1 and 1 or 0) + first + (ok2 and 1 or 0) + second
+`,
+			want: "85",
+		},
+		{
+			name: "debug_hook",
+			source: `
+local fn = assert(loadstring("local a = 1\nlocal b = 2\nreturn a + b\n", "@jit_hook.lua"))
+local info = debug.getinfo(fn, "SL")
+
+local function localDemo()
+	local first = 10
+	local second = 20
+	local name1, value1 = debug.getlocal(1, 1)
+	local changed = debug.setlocal(1, 2, 99)
+	return name1 == "first" and value1 == 10 and changed == "second" and second == 99
+end
+
+local lines = {}
+local counts = 0
+local function hook(event, line)
+	if event == "line" and type(line) == "number" then
+		lines[#lines + 1] = line
+	elseif event == "count" then
+		counts = counts + 1
+	end
+end
+
+debug.sethook(hook, "l", 2)
+local function hooked()
+	local sum = 0
+	sum = sum + 1
+	sum = sum + 2
+	return sum
+end
+local hookResult = hooked()
+local hookFn, hookMask, hookCount = debug.gethook()
+debug.sethook()
+local clearedFn, clearedMask, clearedCount = debug.gethook()
+
+return (localDemo() and 1 or 0)
+	+ (((info.activelines[1] == true) and (info.activelines[2] == true) and (info.activelines[3] == true)) and 10 or 0)
+	+ ((hookResult == 3) and 100 or 0)
+	+ ((type(hookFn) == "function" and hookMask == "l" and hookCount == 2) and 1000 or 0)
+	+ ((#lines > 0 and counts > 0) and 10000 or 0)
+	+ (((clearedFn == nil) and clearedMask == "" and clearedCount == 0) and 100000 or 0)
+`,
+			want: "111111",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			interp := NewWithOptions(Options{EnableJIT: false, HotThreshold: 1024})
+			jitEngine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 1})
+			interpProto := compileNamedForTest(t, interp, "@jit_fallback_"+testCase.name+".lua", testCase.source)
+			jitProto := compileNamedForTest(t, jitEngine, "@jit_fallback_"+testCase.name+".lua", testCase.source)
+
+			interpResult := runProtoRepeated(t, interp, interpProto, 1)
+			jitResult := runProtoRepeated(t, jitEngine, jitProto, 4)
+			interpFormatted := interp.FormatValue(interpResult)
+			jitFormatted := jitEngine.FormatValue(jitResult)
+			if interpFormatted != testCase.want {
+				t.Fatalf("interpreter result for %s = %q, want %q", testCase.name, interpFormatted, testCase.want)
+			}
+			if jitFormatted != interpFormatted {
+				t.Fatalf("jit-enabled result for %s = %q, want %q", testCase.name, jitFormatted, interpFormatted)
+			}
+			stats := jitEngine.Stats(jitProto)
+			if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" && !protoJITSupportForTest(t, jitProto) && stats.JITCompiled {
+				t.Fatalf("unsupported proto %s unexpectedly reached JIT: %+v", testCase.name, stats)
+			}
+		})
+	}
+}
+
+func TestUnsupportedProtoDoesNotBlockLaterJITCompilation(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 1})
+	unsupported := compileNamedForTest(t, engine, "@jit_unsupported_closure.lua", `
+local seed = 40
+local function make()
+	local offset = 2
+	return function(v)
+		return v + seed + offset
+	end
+end
+local fn = make()
+return fn(0)
+`)
+	supported := compileNamedForTest(t, engine, "@jit_supported_while.lua", `
+local i = 1
+local sum = 0
+while i <= 1000 do
+	sum = sum + i
+	i = i + 1
+end
+return sum
+`)
+
+	unsupportedResult := runProtoRepeated(t, engine, unsupported, 3)
+	if got := engine.FormatValue(unsupportedResult); got != "42" {
+		t.Fatalf("unsupported proto result = %q, want 42", got)
+	}
+	supportedResult := runProtoRepeated(t, engine, supported, 4)
+	if got := supportedResult.Number(); got != 500500 {
+		t.Fatalf("supported proto result = %v, want 500500", got)
+	}
+	stats := engine.Stats(supported)
+	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" && !stats.JITCompiled {
+		t.Fatalf("expected supported proto to still reach JIT after unsupported proto, got %+v", stats)
 	}
 }
 
@@ -557,6 +802,64 @@ return rawget(t, "x")
 	}
 }
 
+func TestBaseLibraryDocumentedIterationAndConversion(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local pgen, pstate, pkey = pairs({alpha = 11})
+local igen, istate, ikey = ipairs({7, 8, nil, 9})
+local pk, pv = pgen(pstate, pkey)
+local i1, v1 = igen(istate, ikey)
+local i2, v2 = igen(istate, i1)
+local i3 = igen(istate, i2)
+local nk1, nv1 = next({x = 5})
+local nk2 = next({}, nil)
+local n1 = tonumber(10, 10)
+local n2 = tonumber(" FF ", 16)
+local n3 = tonumber("101", 2)
+local n4 = tonumber("12.5")
+local n5 = tonumber("xyz", 16)
+local s1, s2 = select(-2, "a", "b", "c")
+local u1, u2 = unpack({40, 2}, 1, 2)
+return ((type(pgen) == "function") and 1 or 0)
+	+ ((pstate.alpha == 11 and pkey == nil) and 10 or 0)
+	+ (((pk == "alpha") and (pv == 11)) and 100 or 0)
+	+ (((i1 == 1) and (v1 == 7) and (i2 == 2) and (v2 == 8) and (i3 == nil)) and 1000 or 0)
+	+ ((nk2 == nil) and 10000 or 0)
+	+ ((nk1 ~= nil and nv1 == 5) and 100000 or 0)
+	+ ((n1 == 10 and n2 == 255 and n3 == 5 and n4 == 12.5 and n5 == nil) and 1000000 or 0)
+	+ (((s1 == "b") and (s2 == "c") and (u1 == 40) and (u2 == 2)) and 10000000 or 0)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 11111111 {
+		t.Fatalf("base documented semantics result = %v, want 11111111", got)
+	}
+}
+
+func TestPrintUsesGlobalTostring(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	output, err := captureStdout(func() error {
+		_, err := engine.DoString(`
+tostring = function(v)
+	local body = v
+	if type(v) == "table" then
+		body = v.tag
+	end
+	return "[" .. type(v) .. ":" .. body .. "]"
+end
+print({tag = "obj"}, 12, "ok")
+`)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := normalizeStdout(output); got != "[table:obj]\t[number:12]\t[string:ok]" {
+		t.Fatalf("print output = %q, want %q", got, "[table:obj]\t[number:12]\t[string:ok]")
+	}
+}
+
 func TestPCallXpcallAndCoroutineMultiReturn(t *testing.T) {
 	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
 	result, err := engine.DoString(`
@@ -829,6 +1132,29 @@ return ((type(mt) == "table") and 1 or 0)
 	}
 	if got := result.Number(); got != 111111 {
 		t.Fatalf("string metatable/format result = %v, want 111111", got)
+	}
+}
+
+func TestStringLibraryDocumentedIndexSemantics(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local s1 = string.sub("abcdef", -3, -1)
+local s2 = string.sub("abcdef", -2)
+local s3 = string.sub("abcdef", 1, 0)
+local b1, b2 = string.byte("ABC", -2, -1)
+local c = select("#", string.byte("ABC", 4))
+local d = select("#", string.byte("ABC", 2, 1))
+return ((s1 == "def") and 1 or 0)
+	+ ((s2 == "ef") and 10 or 0)
+	+ ((s3 == "") and 100 or 0)
+	+ (((b1 == 66) and (b2 == 67)) and 1000 or 0)
+	+ ((c == 0 and d == 0) and 10000 or 0)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 11111 {
+		t.Fatalf("string documented index result = %v, want 11111", got)
 	}
 }
 
@@ -1769,4 +2095,41 @@ func withTestStdin(t *testing.T, content string, fn func()) {
 		os.Stdin = oldStdin
 	}()
 	fn()
+}
+
+func captureStdout(run func() error) (string, error) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return "", err
+	}
+	oldStdout := os.Stdout
+	os.Stdout = writer
+	defer func() {
+		os.Stdout = oldStdout
+	}()
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	readDone := make(chan readResult, 1)
+	go func() {
+		data, readErr := io.ReadAll(reader)
+		_ = reader.Close()
+		readDone <- readResult{data: data, err: readErr}
+	}()
+	runErr := run()
+	_ = writer.Close()
+	dataResult := <-readDone
+	if runErr != nil {
+		return "", runErr
+	}
+	if dataResult.err != nil {
+		return "", dataResult.err
+	}
+	return string(dataResult.data), nil
+}
+
+func normalizeStdout(output string) string {
+	normalized := strings.ReplaceAll(output, "\r\n", "\n")
+	return strings.TrimRight(normalized, "\r\n")
 }

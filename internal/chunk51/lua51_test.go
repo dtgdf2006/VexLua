@@ -2,6 +2,11 @@ package chunk51
 
 import (
 	"bytes"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"vexlua/internal/bytecode"
@@ -67,6 +72,180 @@ func findLuaOp(code []uint32, op int) (uint32, bool) {
 		}
 	}
 	return 0, false
+}
+
+func compileLua51SourceForTest(t *testing.T, source string) *lua51Proto {
+	t.Helper()
+	runtime := rt.NewRuntime()
+	proto, err := bccompiler.New(runtime).CompileSource(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := encodeLua51Proto(runtime, proto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func luaOp(instr uint32) int {
+	return int(instr & 0x3F)
+}
+
+func luaB(instr uint32) int {
+	return int((instr >> 23) & 0x1FF)
+}
+
+func luaC(instr uint32) int {
+	return int((instr >> 14) & 0x1FF)
+}
+
+func detectLuac51ForTest(t *testing.T) string {
+	t.Helper()
+	candidates := make([]string, 0, 8)
+	if env := strings.TrimSpace(os.Getenv("VEXLUA_LUAC51_BIN")); env != "" {
+		candidates = append(candidates, env)
+	}
+	if env := strings.TrimSpace(os.Getenv("VEXLUA_LUA51_BIN")); env != "" {
+		dir := filepath.Dir(env)
+		candidates = append(candidates,
+			filepath.Join(dir, "luac5.1.exe"),
+			filepath.Join(dir, "luac.exe"),
+			filepath.Join(dir, "luac5.1"),
+			filepath.Join(dir, "luac"),
+		)
+	}
+	candidates = append(candidates, "luac5.1", "luac51", "luac5_1", "luac")
+	for _, candidate := range candidates {
+		path := candidate
+		if _, err := os.Stat(candidate); err != nil {
+			resolved, lookErr := exec.LookPath(candidate)
+			if lookErr != nil {
+				continue
+			}
+			path = resolved
+		}
+		cmd := exec.Command(path, "-v")
+		output, err := cmd.CombinedOutput()
+		version := strings.TrimSpace(string(output))
+		if err != nil && version == "" {
+			continue
+		}
+		if strings.Contains(version, "Lua 5.1") {
+			return path
+		}
+	}
+	t.Skip("skipping luac golden test: no Lua 5.1 luac executable found")
+	return ""
+}
+
+func disassembleWithLuacForTest(t *testing.T, luacBin string, filePath string) string {
+	t.Helper()
+	cmd := exec.Command(luacBin, "-l", filePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("luac disassembly failed for %s: %v\n%s", filePath, err, strings.TrimSpace(string(output)))
+	}
+	return strings.ReplaceAll(string(output), "\r\n", "\n")
+}
+
+func extractLuacFunctionSignatures(listing string) [][]string {
+	lines := strings.Split(listing, "\n")
+	signatures := make([][]string, 0, 4)
+	var current []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "main <") || strings.HasPrefix(trimmed, "function <") {
+			if current != nil {
+				signatures = append(signatures, current)
+			}
+			current = []string{}
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 3 || current == nil {
+			continue
+		}
+		opcode := fields[2]
+		switch opcode {
+		case "CALL":
+			if len(fields) >= 6 {
+				current = append(current, "CALL B="+fields[4]+" C="+fields[5])
+			}
+		case "TAILCALL":
+			if len(fields) >= 6 {
+				current = append(current, "TAILCALL B="+fields[4]+" C="+fields[5])
+			}
+		case "RETURN":
+			if len(fields) >= 5 {
+				current = append(current, "RETURN B="+fields[4])
+			}
+		case "SETLIST":
+			if len(fields) >= 6 {
+				current = append(current, "SETLIST B="+fields[4]+" C="+fields[5])
+			}
+		case "VARARG":
+			if len(fields) >= 5 {
+				current = append(current, "VARARG B="+fields[4])
+			}
+		}
+	}
+	if current != nil {
+		signatures = append(signatures, current)
+	}
+	for i := range signatures {
+		signatures[i] = normalizeLuacSignatureForCompare(signatures[i])
+	}
+	return signatures
+}
+
+func normalizeLuacSignatureForCompare(signature []string) []string {
+	if len(signature) > 1 && signature[len(signature)-1] == "RETURN B=1" {
+		trimmed := append([]string(nil), signature[:len(signature)-1]...)
+		return trimmed
+	}
+	return signature
+}
+
+func pickLuacSignatureForTest(t *testing.T, signatures [][]string, predicate func([]string) bool, label string) []string {
+	t.Helper()
+	for _, signature := range signatures {
+		if predicate(signature) {
+			return signature
+		}
+	}
+	t.Fatalf("no matching luac signature found for %s: %#v", label, signatures)
+	return nil
+}
+
+func containsSignatureEntry(signature []string, entry string) bool {
+	for _, item := range signature {
+		if item == entry {
+			return true
+		}
+	}
+	return false
+}
+
+func dumpLua51SourceForGoldenTest(t *testing.T, source string, chunkPath string) {
+	t.Helper()
+	runtime := rt.NewRuntime()
+	proto, err := bccompiler.New(runtime).CompileSource(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proto.Name = "@golden.lua"
+	proto.SetSourceRecursive("@golden.lua")
+	data, err := Dump(runtime, proto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(chunkPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestLoadLua51SupportsOpcodeGaps(t *testing.T) {
@@ -231,6 +410,88 @@ func TestEncodeLua51SupportsInternalOpcodeGaps(t *testing.T) {
 			t.Fatal("expected exported proto to contain OP_CLOSE")
 		}
 	})
+
+	t.Run("table tail multret keeps open setlist adjacency", func(t *testing.T) {
+		encoded := compileLua51SourceForTest(t, `
+return function()
+	local function triple()
+		return 2, 3, 4
+	end
+	local t = {x = 5, 1, triple()}
+	return t.x + t[1] * 10000 + t[2] * 1000 + t[3] * 100 + t[4] * 10
+end
+`)
+		if len(encoded.Children) == 0 {
+			t.Fatal("expected encoded root proto to contain child function")
+		}
+		code := encoded.Children[0].Code
+		found := false
+		for i := 0; i+1 < len(code); i++ {
+			if luaOp(code[i]) == lOpCall && luaC(code[i]) == 0 && luaOp(code[i+1]) == lOpSetList && luaB(code[i+1]) == 0 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatal("expected exported table multret lowering to keep CALL followed immediately by open SETLIST")
+		}
+	})
+
+	t.Run("call arg multret keeps open tailcall adjacency", func(t *testing.T) {
+		encoded := compileLua51SourceForTest(t, `
+return function()
+	local function triple()
+		return 2, 3, 4
+	end
+	local function pack(a, b, c, d)
+		return a * 1000 + b * 100 + c * 10 + d
+	end
+	return pack(1, triple())
+end
+`)
+		if len(encoded.Children) == 0 {
+			t.Fatal("expected encoded root proto to contain child function")
+		}
+		code := encoded.Children[0].Code
+		found := false
+		for i := 0; i+2 < len(code); i++ {
+			if luaOp(code[i]) == lOpCall && luaC(code[i]) == 0 && luaOp(code[i+1]) == lOpTailCall && luaB(code[i+1]) == 0 && luaOp(code[i+2]) == lOpReturn && luaB(code[i+2]) == 0 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatal("expected exported call multret lowering to keep CALL, TAILCALL, RETURN as one open-call chain")
+		}
+	})
+
+	t.Run("vararg spread keeps open vararg call chain", func(t *testing.T) {
+		encoded := compileLua51SourceForTest(t, `
+return function(...)
+	local function spread(...)
+		return ...
+	end
+	local function pack(a, b, c, d)
+		return a * 1000 + b * 100 + c * 10 + d
+	end
+	return pack(1, spread(...))
+end
+`)
+		if len(encoded.Children) == 0 {
+			t.Fatal("expected encoded root proto to contain child function")
+		}
+		code := encoded.Children[0].Code
+		found := false
+		for i := 0; i+3 < len(code); i++ {
+			if luaOp(code[i]) == lOpVararg && luaB(code[i]) == 0 && luaOp(code[i+1]) == lOpCall && luaB(code[i+1]) == 0 && luaC(code[i+1]) == 0 && luaOp(code[i+2]) == lOpTailCall && luaB(code[i+2]) == 0 && luaOp(code[i+3]) == lOpReturn && luaB(code[i+3]) == 0 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatal("expected exported vararg spread lowering to keep VARARG, CALL, TAILCALL, RETURN contiguous")
+		}
+	})
 }
 
 func TestDumpLua51MatchesLuacSample(t *testing.T) {
@@ -283,5 +544,83 @@ func TestDumpLua51MatchesLuacSample(t *testing.T) {
 			len(wantChild.Locals),
 			len(wantChild.UpNames),
 		)
+	}
+}
+
+func TestDumpLua51MatchesOfficialLuacGoldenSignatures(t *testing.T) {
+	luacBin := detectLuac51ForTest(t)
+	cases := []struct {
+		name      string
+		source    string
+		predicate func([]string) bool
+	}{
+		{
+			name: "table_tail_multret",
+			source: `
+return function()
+	local function triple()
+		return 2, 3, 4
+	end
+	local t = {x = 5, 1, triple()}
+	return t.x + t[1] * 10000 + t[2] * 1000 + t[3] * 100 + t[4] * 10
+end
+`,
+			predicate: func(signature []string) bool {
+				return containsSignatureEntry(signature, "SETLIST B=0 C=1")
+			},
+		},
+		{
+			name: "call_arg_multret",
+			source: `
+return function()
+	local function triple()
+		return 2, 3, 4
+	end
+	local function pack(a, b, c, d)
+		return a * 1000 + b * 100 + c * 10 + d
+	end
+	return pack(1, triple())
+end
+`,
+			predicate: func(signature []string) bool {
+				return containsSignatureEntry(signature, "CALL B=1 C=0") && containsSignatureEntry(signature, "TAILCALL B=0 C=0")
+			},
+		},
+		{
+			name: "vararg_spread",
+			source: `
+return function(...)
+	local function spread(...)
+		return ...
+	end
+	local function pack(a, b, c, d)
+		return a * 1000 + b * 100 + c * 10 + d
+	end
+	return pack(1, spread(...))
+end
+`,
+			predicate: func(signature []string) bool {
+				return containsSignatureEntry(signature, "VARARG B=0") && containsSignatureEntry(signature, "CALL B=0 C=0") && containsSignatureEntry(signature, "TAILCALL B=0 C=0")
+			},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			sourcePath := filepath.Join(tempDir, testCase.name+".lua")
+			chunkPath := filepath.Join(tempDir, testCase.name+".luac")
+			if err := os.WriteFile(sourcePath, []byte(testCase.source), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			officialListing := disassembleWithLuacForTest(t, luacBin, sourcePath)
+			dumpLua51SourceForGoldenTest(t, testCase.source, chunkPath)
+			vexListing := disassembleWithLuacForTest(t, luacBin, chunkPath)
+			officialSignature := pickLuacSignatureForTest(t, extractLuacFunctionSignatures(officialListing), testCase.predicate, testCase.name+" official")
+			vexSignature := pickLuacSignatureForTest(t, extractLuacFunctionSignatures(vexListing), testCase.predicate, testCase.name+" vex")
+			if !reflect.DeepEqual(vexSignature, officialSignature) {
+				t.Fatalf("luac golden signature mismatch\nofficial=%v\nvex=%v\n--- official ---\n%s\n--- vex ---\n%s", officialSignature, vexSignature, strings.TrimSpace(officialListing), strings.TrimSpace(vexListing))
+			}
+		})
 	}
 }

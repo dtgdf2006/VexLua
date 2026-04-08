@@ -17,11 +17,19 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 	runtime.SetGlobal("_G", rt.HandleValue(runtime.GlobalsHandle()))
 	runtime.SetGlobal("_VERSION", runtime.StringValue("Lua 5.1"))
 	runtime.SetGlobal("print", runtime.NewHostFunction("print", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		toString, _ := runtime.GetGlobalSymbol(runtime.InternSymbol("tostring"))
 		parts := make([]string, 0, len(args))
 		for _, arg := range args {
-			text, err := luaToString(runtime, machine, arg)
+			results, err := machine.CallValue(toString, []rt.Value{arg})
 			if err != nil {
 				return rt.NilValue, err
+			}
+			if len(results) == 0 {
+				return rt.NilValue, fmt.Errorf("'tostring' must return a string to 'print'")
+			}
+			text, ok := runtime.ToString(results[0])
+			if !ok {
+				return rt.NilValue, fmt.Errorf("'tostring' must return a string to 'print'")
 			}
 			parts = append(parts, text)
 		}
@@ -53,33 +61,39 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		}
 		return runtime.StringValue(text), nil
 	}))
+	standardTonumber := func(value rt.Value) rt.Value {
+		if value.IsNumber() {
+			return value
+		}
+		s, ok := runtime.ToString(value)
+		if !ok {
+			return rt.NilValue
+		}
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+		if err != nil {
+			return rt.NilValue
+		}
+		return rt.NumberValue(parsed)
+	}
 	runtime.SetGlobal("tonumber", runtime.NewHostFunction("tonumber", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		if len(args) == 0 || len(args) > 2 {
 			return rt.NilValue, fmt.Errorf("tonumber expects 1 or 2 arguments")
 		}
 		if len(args) == 1 {
-			if args[0].IsNumber() {
-				return args[0], nil
-			}
-			s, ok := runtime.ToString(args[0])
-			if !ok {
-				return rt.NilValue, nil
-			}
-			parsed, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-			if err != nil {
-				return rt.NilValue, nil
-			}
-			return rt.NumberValue(parsed), nil
+			return standardTonumber(args[0]), nil
 		}
 		if !args[1].IsNumber() {
 			return rt.NilValue, fmt.Errorf("tonumber base expects number")
 		}
 		base := int(args[1].Number())
+		if base == 10 {
+			return standardTonumber(args[0]), nil
+		}
 		if base < 2 || base > 36 {
 			return rt.NilValue, fmt.Errorf("base out of range")
 		}
 		s, ok := runtime.ToString(args[0])
-		if !ok || args[0].IsNumber() {
+		if !ok {
 			return rt.NilValue, nil
 		}
 		parsed, err := strconv.ParseInt(strings.TrimSpace(s), base, 64)

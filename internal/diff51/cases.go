@@ -159,6 +159,29 @@ return loaded(40)`,
 			Expectation: ExpectMatch,
 		},
 		{
+			Name:  "base_iteration_and_conversion_edges",
+			Notes: "pairs/ipairs/next/select/unpack 与 tonumber(base) 的文档/源码边界",
+			Source: `local pgen, pstate, pkey = pairs({alpha = 11})
+local igen, istate, ikey = ipairs({7, 8, nil, 9})
+local pk, pv = pgen(pstate, pkey)
+local i1, v1 = igen(istate, ikey)
+local i2, v2 = igen(istate, i1)
+local i3 = igen(istate, i2)
+local nk1, nv1 = next({x = 5})
+local nk2 = next({}, nil)
+local s1, s2 = select(-2, "a", "b", "c")
+local u1, u2 = unpack({40, 2}, 1, 2)
+return type(pgen), pstate.alpha, pkey == nil, pk, pv, i1, v1, i2, v2, i3 == nil, nk1 ~= nil, nv1, nk2 == nil, tonumber(10, 10), tonumber(" FF ", 16), tonumber("101", 2), tonumber("12.5"), tonumber("xyz", 16), s1, s2, u1, u2`,
+			Expectation: ExpectMatch,
+		},
+		{
+			Name:          "print_uses_global_tostring",
+			Notes:         "print 应该调用全局 tostring，而不是内部固定格式化",
+			Source:        "tostring = function(v) local body = v; if type(v) == \"table\" then body = v.tag end; return \"[\" .. type(v) .. \":\" .. body .. \"]\" end\nprint({tag = \"obj\"}, 12, \"ok\")",
+			CaptureStdout: true,
+			Expectation:   ExpectMatch,
+		},
+		{
 			Name:  "string_metatable_method_call",
 			Notes: "string metatable 的 __index 应该指向 string 库",
 			Source: `local mt = getmetatable("")
@@ -170,6 +193,12 @@ return ("vexlua"):sub(2, 4), type(mt), mt.__index == string`,
 			Notes: "%q quoting 和 string 库对 number -> string 的兼容",
 			Source: `local quoted = string.format("%q", string.char(65, 0, 66, 10, 67, 13, 34, 92))
 return string.len(10), string.sub(12345, 2, 4), quoted`,
+			Expectation: ExpectMatch,
+		},
+		{
+			Name:        "string_negative_indices_and_empty_ranges",
+			Notes:       "string.sub/string.byte 的负索引与空区间语义",
+			Source:      `return string.sub("abcdef", -3, -1), string.sub("abcdef", -2), string.sub("abcdef", 1, 0), string.byte("ABC", -2, -1), select("#", string.byte("ABC", 4)), select("#", string.byte("ABC", 2, 1))`,
 			Expectation: ExpectMatch,
 		},
 		{

@@ -126,6 +126,8 @@ type lua51Builder struct {
 	maxStack    int
 	scratchMin  int
 	pendingBase int
+	openTailRet int
+	tailRetOpen bool
 }
 
 type lua51Patch struct {
@@ -245,7 +247,12 @@ func encodeLua51Proto(runtime *rt.Runtime, proto *bytecode.Proto) (*lua51Proto, 
 func (b *lua51Builder) emitInstr(pc int, instr bytecode.Instr) error {
 	line := b.proto.CurrentLine(pc)
 	prevPending := b.pendingBase
+	prevTailRet := b.openTailRet
+	prevTailOpen := b.tailRetOpen
 	b.pendingBase = -1
+	if instr.Op != bytecode.OpReturnMulti {
+		b.tailRetOpen = false
+	}
 	switch instr.Op {
 	case bytecode.OpNoop:
 		return nil
@@ -284,7 +291,11 @@ func (b *lua51Builder) emitInstr(pc int, instr bytecode.Instr) error {
 		b.emitLua(line, encodeABC(lOpGetTable, int(instr.A), int(instr.B), rkConst(key)))
 	case bytecode.OpSelf, bytecode.OpSelfIC:
 		key := b.constantFromString(b.runtime.SymbolName(uint32(instr.D)))
-		b.emitLua(line, encodeABC(lOpSelf, int(instr.A), int(instr.B), rkConst(key)))
+		if int(instr.A)+2 > b.maxStack {
+			b.maxStack = int(instr.A) + 2
+		}
+		b.emitLua(line, encodeABC(lOpMove, int(instr.A)+1, int(instr.B), 0))
+		b.emitLua(line, encodeABC(lOpGetTable, int(instr.A), int(instr.B), rkConst(key)))
 	case bytecode.OpSetField:
 		key := b.constantFromString(b.runtime.SymbolName(uint32(instr.D)))
 		b.emitLua(line, encodeABC(lOpSetTable, int(instr.A), rkConst(key), int(instr.B)))
@@ -305,34 +316,11 @@ func (b *lua51Builder) emitInstr(pc int, instr bytecode.Instr) error {
 		if prefix == 0 {
 			prefix = (start - 1) % lua51FieldsPerFlush
 		}
-		consumerBase := prevPending - 1 - prefix
-		if consumerBase < 0 {
+		expectedPending := int(instr.A) + 1 + prefix
+		if prevPending != expectedPending {
 			return errLua51Unsupported
 		}
-		if consumerBase != int(instr.A) {
-			b.emitLua(line, encodeABC(lOpMove, consumerBase, int(instr.A), 0))
-		}
-		if prefixInRegs > 0 {
-			for i := 0; i < prefix; i++ {
-				src := int(instr.A) + 1 + i
-				dst := consumerBase + 1 + i
-				if src != dst {
-					b.emitLua(line, encodeABC(lOpMove, dst, src, 0))
-				}
-			}
-		} else {
-			blockStart := ((start - 1) / lua51FieldsPerFlush) * lua51FieldsPerFlush
-			for i := 0; i < prefix; i++ {
-				idx, err := b.constantFromValue(rt.NumberValue(float64(blockStart + i + 1)))
-				if err != nil {
-					return err
-				}
-				reg := consumerBase + 1 + i
-				b.emitLua(line, encodeABx(lOpLoadK, reg, idx))
-				b.emitLua(line, encodeABC(lOpGetTable, reg, consumerBase, reg))
-			}
-		}
-		return b.emitSetList(line, consumerBase, ((start-1)/lua51FieldsPerFlush)+1)
+		return b.emitSetList(line, int(instr.A), ((start-1)/lua51FieldsPerFlush)+1)
 	case bytecode.OpAdd, bytecode.OpAddNum:
 		b.emitLua(line, encodeABC(lOpAdd, int(instr.A), int(instr.B), int(instr.C)))
 	case bytecode.OpAddConst:
@@ -435,37 +423,51 @@ func (b *lua51Builder) emitInstr(pc int, instr bytecode.Instr) error {
 		}
 	case bytecode.OpTailCall:
 		argCount, _, appendPending := bytecode.UnpackCallSpec(instr.D)
-		base := 0
 		if appendPending {
-			var err error
-			base, err = b.pendingCallBase(prevPending, argCount)
-			if err != nil {
-				return err
+			base, ok := b.directPendingCallBase(prevPending, int(instr.B), int(instr.C), argCount)
+			if !ok {
+				return errLua51Unsupported
 			}
-		} else {
-			base = b.scratch(argCount + 1)
+			b.emitLua(line, encodeABC(lOpTailCall, base, 0, 0))
+			b.openTailRet = base
+			b.tailRetOpen = true
+			return nil
 		}
+		base := b.scratch(argCount + 1)
 		b.emitLua(line, encodeABC(lOpMove, base, int(instr.B), 0))
 		for i := 0; i < argCount; i++ {
 			b.emitLua(line, encodeABC(lOpMove, base+1+i, int(instr.C)+i, 0))
 		}
-		bVal := argCount + 1
-		if appendPending {
-			bVal = 0
-		}
-		b.emitLua(line, encodeABC(lOpTailCall, base, bVal, 0))
+		b.emitLua(line, encodeABC(lOpTailCall, base, argCount+1, 0))
+		b.openTailRet = base
+		b.tailRetOpen = true
 	case bytecode.OpCallMulti:
 		argCount, resultCount, appendPending := bytecode.UnpackCallSpec(instr.D)
 		base := 0
 		if appendPending {
-			var err error
-			base, err = b.pendingCallBase(prevPending, argCount)
-			if err != nil {
-				return err
+			directBase, ok := b.directPendingCallBase(prevPending, int(instr.B), int(instr.C), argCount)
+			if !ok {
+				return errLua51Unsupported
 			}
-		} else if resultCount == 0 {
+			cVal := 0
+			if resultCount > 0 {
+				cVal = resultCount + 1
+			}
+			b.emitLua(line, encodeABC(lOpCall, directBase, 0, cVal))
+			if resultCount == 0 {
+				b.pendingBase = directBase
+				return nil
+			}
+			for i := 0; i < resultCount; i++ {
+				if int(instr.A)+i != directBase+i {
+					b.emitLua(line, encodeABC(lOpMove, int(instr.A)+i, directBase+i, 0))
+				}
+			}
+			return nil
+		}
+		if resultCount == 0 {
 			var err error
-			base, err = b.pendingOutputBase(pc)
+			base, err = b.pendingOutputBase(pc, line)
 			if err != nil {
 				return err
 			}
@@ -480,11 +482,7 @@ func (b *lua51Builder) emitInstr(pc int, instr bytecode.Instr) error {
 		if resultCount > 0 {
 			cVal = resultCount + 1
 		}
-		bVal := argCount + 1
-		if appendPending {
-			bVal = 0
-		}
-		b.emitLua(line, encodeABC(lOpCall, base, bVal, cVal))
+		b.emitLua(line, encodeABC(lOpCall, base, argCount+1, cVal))
 		if resultCount == 0 {
 			b.pendingBase = base
 			return nil
@@ -500,7 +498,7 @@ func (b *lua51Builder) emitInstr(pc int, instr bytecode.Instr) error {
 		base := int(instr.A)
 		if count == 0 {
 			var err error
-			base, err = b.pendingOutputBase(pc)
+			base, err = b.pendingOutputBase(pc, line)
 			if err != nil {
 				return err
 			}
@@ -523,7 +521,7 @@ func (b *lua51Builder) emitInstr(pc int, instr bytecode.Instr) error {
 			}
 		} else if resumeCount == 0 {
 			var err error
-			base, err = b.pendingOutputBase(pc)
+			base, err = b.pendingOutputBase(pc, line)
 			if err != nil {
 				return err
 			}
@@ -560,6 +558,11 @@ func (b *lua51Builder) emitInstr(pc int, instr bytecode.Instr) error {
 	case bytecode.OpReturnMulti:
 		count := int(instr.B)
 		if count == 0 {
+			if prevTailOpen {
+				b.emitLua(line, encodeABC(lOpReturn, prevTailRet, 0, 0))
+				b.tailRetOpen = false
+				return nil
+			}
 			b.emitLua(line, encodeABC(lOpReturn, 0, 1, 0))
 		} else {
 			b.emitLua(line, encodeABC(lOpReturn, int(instr.A), count+1, 0))
@@ -568,17 +571,9 @@ func (b *lua51Builder) emitInstr(pc int, instr bytecode.Instr) error {
 		if prevPending < 0 {
 			return errLua51Unsupported
 		}
-		prefixCount := int(instr.B)
-		returnBase := prevPending - prefixCount
-		if returnBase < 0 {
+		returnBase := int(instr.A)
+		if prevPending != returnBase+int(instr.B) {
 			return errLua51Unsupported
-		}
-		for i := 0; i < prefixCount; i++ {
-			src := int(instr.A) + i
-			dst := returnBase + i
-			if src != dst {
-				b.emitLua(line, encodeABC(lOpMove, dst, src, 0))
-			}
 		}
 		b.emitLua(line, encodeABC(lOpReturn, returnBase, 0, 0))
 	case bytecode.OpJump:
@@ -617,7 +612,8 @@ func (b *lua51Builder) emitLua(line int, instr uint32) {
 }
 
 func (b *lua51Builder) emitCompareBool(line int, op int, target int, left int, right int) {
-	b.emitLua(line, encodeABC(op, 0, left, right))
+	b.emitLua(line, encodeABC(op, 1, left, right))
+	b.emitLua(line, encodeAsBx(lOpJmp, 0, 1))
 	b.emitLua(line, encodeABC(lOpLoadBool, target, 0, 1))
 	b.emitLua(line, encodeABC(lOpLoadBool, target, 1, 0))
 }
@@ -630,28 +626,44 @@ func (b *lua51Builder) scratch(need int) int {
 	return base
 }
 
-func (b *lua51Builder) pendingOutputBase(pc int) (int, error) {
+func (b *lua51Builder) pendingOutputBase(pc int, line int) (int, error) {
 	if pc+1 >= len(b.proto.Code) {
 		return b.scratch(1), nil
 	}
 	next := b.proto.Code[pc+1]
 	switch next.Op {
 	case bytecode.OpReturnAppendPending:
-		return int(next.A) + int(next.B), nil
+		pendingBase := int(next.A) + int(next.B)
+		if pendingBase+1 > b.maxStack {
+			b.maxStack = pendingBase + 1
+		}
+		return pendingBase, nil
 	case bytecode.OpTailCall:
 		argCount, _, appendPending := bytecode.UnpackCallSpec(next.D)
 		if !appendPending {
 			return b.scratch(1), nil
 		}
-		consumerBase := b.scratch(argCount + 1)
-		return consumerBase + 1 + argCount, nil
+		if int(next.C) != int(next.B)+1 {
+			return 0, errLua51Unsupported
+		}
+		pendingBase := int(next.C) + argCount
+		if pendingBase+1 > b.maxStack {
+			b.maxStack = pendingBase + 1
+		}
+		return pendingBase, nil
 	case bytecode.OpCallMulti:
 		argCount, _, appendPending := bytecode.UnpackCallSpec(next.D)
 		if !appendPending {
 			return b.scratch(1), nil
 		}
-		consumerBase := b.scratch(argCount + 1)
-		return consumerBase + 1 + argCount, nil
+		if int(next.C) != int(next.B)+1 {
+			return 0, errLua51Unsupported
+		}
+		pendingBase := int(next.C) + argCount
+		if pendingBase+1 > b.maxStack {
+			b.maxStack = pendingBase + 1
+		}
+		return pendingBase, nil
 	case bytecode.OpYield:
 		yieldCount, _, appendPending := bytecode.UnpackCallSpec(next.D)
 		if !appendPending {
@@ -666,12 +678,35 @@ func (b *lua51Builder) pendingOutputBase(pc int) (int, error) {
 				return 0, errLua51Unsupported
 			}
 			prefix = (int(next.B) - 1) % lua51FieldsPerFlush
+			blockStart := ((int(next.B) - 1) / lua51FieldsPerFlush) * lua51FieldsPerFlush
+			for i := 0; i < prefix; i++ {
+				idx, err := b.constantFromValue(rt.NumberValue(float64(blockStart + i + 1)))
+				if err != nil {
+					return 0, err
+				}
+				reg := int(next.A) + 1 + i
+				b.emitLua(line, encodeABx(lOpLoadK, reg, idx))
+				b.emitLua(line, encodeABC(lOpGetTable, reg, int(next.A), reg))
+			}
 		}
-		consumerBase := b.scratch(prefix + 1)
-		return consumerBase + 1 + prefix, nil
+		pendingBase := int(next.A) + 1 + prefix
+		if pendingBase+1 > b.maxStack {
+			b.maxStack = pendingBase + 1
+		}
+		return pendingBase, nil
 	default:
 		return b.scratch(1), nil
 	}
+}
+
+func (b *lua51Builder) directPendingCallBase(prevPending int, calleeReg int, argStart int, fixedArgs int) (int, bool) {
+	if prevPending < 0 || argStart != calleeReg+1 {
+		return 0, false
+	}
+	if prevPending != argStart+fixedArgs {
+		return 0, false
+	}
+	return calleeReg, true
 }
 
 func (b *lua51Builder) pendingCallBase(pendingBase int, fixedArgs int) (int, error) {
@@ -1320,9 +1355,13 @@ func (t *lua51Translator) translateInstr(proto *lua51Proto, pc int) (int, error)
 		t.proto.Emit(bytecode.OpJumpIfTrue, uint16(condReg), 0, 0, 0)
 		t.patches = append(t.patches, lua51Patch{codeIndex: exitIndex, targetPC: pc + 2})
 		t.proto.Emit(bytecode.OpMove, uint16(a+2), uint16(a+3), 0, 0)
+		targetPC := pc + 2 + decodeSBx(proto.Code[pc+1])
+		if targetPC == pc+1 {
+			targetPC = pc
+		}
 		loopIndex := len(t.proto.Code)
 		t.proto.Emit(bytecode.OpJump, 0, 0, 0, 0)
-		t.patches = append(t.patches, lua51Patch{codeIndex: loopIndex, targetPC: pc + 1 + decodeSBx(proto.Code[pc+1])})
+		t.patches = append(t.patches, lua51Patch{codeIndex: loopIndex, targetPC: targetPC})
 		return 1, nil
 	case lOpSetList:
 		block := cVal
