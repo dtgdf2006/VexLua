@@ -3,17 +3,24 @@ package stdlib
 import (
 	"fmt"
 	"os"
-	"os/exec"
+	goruntime "runtime"
 	"strings"
 	"time"
 
 	rt "vexlua/internal/runtime"
 )
 
+type localeState struct {
+	system   string
+	values   map[string]string
+	category []string
+}
+
 func registerOS(runtime *rt.Runtime) error {
 	handle := runtime.Heap().NewTable(12)
 	table := runtime.Heap().Table(handle)
 	startedAt := time.Now()
+	locales := newLocaleState()
 
 	table.SetSymbol(runtime.InternSymbol("clock"), runtime.NewHostFunction("os.clock", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		if len(args) != 0 {
@@ -49,18 +56,29 @@ func registerOS(runtime *rt.Runtime) error {
 		if !ok {
 			return rt.NilValue, fmt.Errorf("os.execute expects string command")
 		}
-		cmd := exec.Command("cmd", "/C", command)
+		cmd := shellCommand(command)
 		err := cmd.Run()
 		if err == nil {
 			return rt.NumberValue(0), nil
 		}
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return rt.NumberValue(float64(exitErr.ExitCode())), nil
+		if code, ok := failureCode(err); ok {
+			return rt.NumberValue(float64(code)), nil
 		}
 		return rt.NumberValue(-1), nil
 	}))
 	table.SetSymbol(runtime.InternSymbol("exit"), runtime.NewHostFunction("os.exit", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
-		return rt.NilValue, fmt.Errorf("os.exit is not supported inside vexlua")
+		if len(args) > 1 {
+			return rt.NilValue, fmt.Errorf("os.exit expects 0 or 1 argument")
+		}
+		code := 0
+		if len(args) == 1 && args[0].Kind() != rt.KindNil {
+			if !args[0].IsNumber() {
+				return rt.NilValue, fmt.Errorf("os.exit expects numeric code")
+			}
+			code = int(args[0].Number())
+		}
+		raiseExit(code)
+		return rt.NilValue, nil
 	}))
 	table.SetSymbol(runtime.InternSymbol("getenv"), runtime.NewHostFunction("os.getenv", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		if len(args) != 1 {
@@ -110,17 +128,29 @@ func registerOS(runtime *rt.Runtime) error {
 		if len(args) > 2 {
 			return rt.NilValue, fmt.Errorf("os.setlocale expects up to 2 arguments")
 		}
+		category := "all"
+		if len(args) > 1 && args[1].Kind() != rt.KindNil {
+			text, ok := runtime.ToString(args[1])
+			if !ok {
+				return rt.NilValue, fmt.Errorf("os.setlocale expects string category")
+			}
+			if !locales.validCategory(text) {
+				return rt.NilValue, fmt.Errorf("invalid locale category %q", text)
+			}
+			category = text
+		}
 		if len(args) == 0 || args[0].Kind() == rt.KindNil {
-			return runtime.StringValue("C"), nil
+			return runtime.StringValue(locales.query(category)), nil
 		}
 		locale, ok := runtime.ToString(args[0])
 		if !ok {
 			return rt.NilValue, fmt.Errorf("os.setlocale expects string locale")
 		}
-		if locale == "C" || locale == "POSIX" || locale == "" {
-			return runtime.StringValue(locale), nil
+		value, changed := locales.apply(locale, category)
+		if !changed {
+			return rt.NilValue, nil
 		}
-		return rt.NilValue, nil
+		return runtime.StringValue(value), nil
 	}))
 	table.SetSymbol(runtime.InternSymbol("time"), runtime.NewHostFunction("os.time", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		if len(args) > 1 {
@@ -247,6 +277,174 @@ func intField(runtime *rt.Runtime, table *rt.Table, name string, required bool, 
 	return int(value.Number()), true, nil
 }
 
+func newLocaleState() *localeState {
+	return &localeState{
+		system: detectSystemLocale(),
+		values: map[string]string{
+			"collate":  "C",
+			"ctype":    "C",
+			"monetary": "C",
+			"numeric":  "C",
+			"time":     "C",
+		},
+		category: []string{"collate", "ctype", "monetary", "numeric", "time"},
+	}
+}
+
+func (s *localeState) validCategory(category string) bool {
+	if category == "all" {
+		return true
+	}
+	for _, name := range s.category {
+		if category == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *localeState) query(category string) string {
+	if category != "all" {
+		return s.values[category]
+	}
+	first := s.values[s.category[0]]
+	for _, name := range s.category[1:] {
+		if s.values[name] != first {
+			parts := make([]string, 0, len(s.category))
+			for _, item := range s.category {
+				parts = append(parts, item+"="+s.values[item])
+			}
+			return strings.Join(parts, ";")
+		}
+	}
+	return first
+}
+
+func (s *localeState) apply(locale string, category string) (string, bool) {
+	resolved, ok := s.resolve(locale)
+	if !ok {
+		return "", false
+	}
+	if category == "all" {
+		for _, name := range s.category {
+			s.values[name] = resolved
+		}
+		return resolved, true
+	}
+	s.values[category] = resolved
+	return resolved, true
+}
+
+func (s *localeState) resolve(locale string) (string, bool) {
+	switch locale {
+	case "C":
+		return "C", true
+	case "POSIX":
+		if goruntime.GOOS == "windows" {
+			return "", false
+		}
+		return "C", true
+	case "":
+		return s.system, true
+	}
+	if locale == s.system || looksLikeLocaleName(locale) {
+		return locale, true
+	}
+	return "", false
+}
+
+func detectSystemLocale() string {
+	for _, key := range []string{"LC_ALL", "LC_TIME", "LANG"} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return "C"
+}
+
+func looksLikeLocaleName(locale string) bool {
+	if strings.ContainsAny(locale, " ()") {
+		return looksLikeWindowsLocaleName(locale)
+	}
+	normalized := locale
+	if dot := strings.IndexByte(normalized, '.'); dot >= 0 {
+		normalized = normalized[:dot]
+	}
+	if at := strings.IndexByte(normalized, '@'); at >= 0 {
+		normalized = normalized[:at]
+	}
+	normalized = strings.ReplaceAll(normalized, "_", "-")
+	parts := strings.Split(normalized, "-")
+	if len(parts) == 0 || !isAlphaPart(parts[0], 2, 3) {
+		return false
+	}
+	for index, part := range parts[1:] {
+		switch {
+		case index == 0 && isAlphaPart(part, 4, 4):
+		case index == 0 && (isAlphaPart(part, 2, 2) || isDigitPart(part, 3, 3)):
+		case isAlphaNumPart(part, 4, 8):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func looksLikeWindowsLocaleName(locale string) bool {
+	if !strings.Contains(locale, "_") {
+		return false
+	}
+	for i := 0; i < len(locale); i++ {
+		ch := locale[i]
+		if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') {
+			continue
+		}
+		switch ch {
+		case ' ', '(', ')', '_', '-', '.':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isAlphaPart(text string, minLen int, maxLen int) bool {
+	if len(text) < minLen || len(text) > maxLen {
+		return false
+	}
+	for i := 0; i < len(text); i++ {
+		if (text[i] < 'A' || text[i] > 'Z') && (text[i] < 'a' || text[i] > 'z') {
+			return false
+		}
+	}
+	return true
+}
+
+func isDigitPart(text string, minLen int, maxLen int) bool {
+	if len(text) < minLen || len(text) > maxLen {
+		return false
+	}
+	for i := 0; i < len(text); i++ {
+		if text[i] < '0' || text[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isAlphaNumPart(text string, minLen int, maxLen int) bool {
+	if len(text) < minLen || len(text) > maxLen {
+		return false
+	}
+	for i := 0; i < len(text); i++ {
+		if (text[i] < 'A' || text[i] > 'Z') && (text[i] < 'a' || text[i] > 'z') && (text[i] < '0' || text[i] > '9') {
+			return false
+		}
+	}
+	return true
+}
+
 func formatDate(when time.Time, format string) string {
 	var builder strings.Builder
 	for i := 0; i < len(format); i++ {
@@ -255,55 +453,121 @@ func formatDate(when time.Time, format string) string {
 			continue
 		}
 		i++
-		switch format[i] {
-		case 'a':
-			builder.WriteString(when.Format("Mon"))
-		case 'A':
-			builder.WriteString(when.Format("Monday"))
-		case 'b':
-			builder.WriteString(when.Format("Jan"))
-		case 'B':
-			builder.WriteString(when.Format("January"))
-		case 'c':
-			builder.WriteString(when.Format("Mon Jan _2 15:04:05 2006"))
-		case 'd':
-			builder.WriteString(fmt.Sprintf("%02d", when.Day()))
-		case 'H':
-			builder.WriteString(fmt.Sprintf("%02d", when.Hour()))
-		case 'I':
-			hour := when.Hour() % 12
-			if hour == 0 {
-				hour = 12
-			}
-			builder.WriteString(fmt.Sprintf("%02d", hour))
-		case 'j':
-			builder.WriteString(fmt.Sprintf("%03d", when.YearDay()))
-		case 'm':
-			builder.WriteString(fmt.Sprintf("%02d", when.Month()))
-		case 'M':
-			builder.WriteString(fmt.Sprintf("%02d", when.Minute()))
-		case 'p':
-			builder.WriteString(when.Format("PM"))
-		case 'S':
-			builder.WriteString(fmt.Sprintf("%02d", when.Second()))
-		case 'w':
-			builder.WriteString(fmt.Sprintf("%d", when.Weekday()))
-		case 'x':
-			builder.WriteString(when.Format("01/02/06"))
-		case 'X':
-			builder.WriteString(when.Format("15:04:05"))
-		case 'y':
-			builder.WriteString(fmt.Sprintf("%02d", when.Year()%100))
-		case 'Y':
-			builder.WriteString(fmt.Sprintf("%04d", when.Year()))
-		case 'Z':
-			builder.WriteString(when.Format("MST"))
-		case '%':
-			builder.WriteByte('%')
-		default:
-			builder.WriteByte('%')
-			builder.WriteByte(format[i])
-		}
+		builder.WriteString(formatDateDirective(when, format[i]))
 	}
 	return builder.String()
+}
+
+func formatDateDirective(when time.Time, directive byte) string {
+	shortWeekday := [...]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+	fullWeekday := [...]string{"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"}
+	shortMonth := [...]string{"", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+	fullMonth := [...]string{"", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"}
+	switch directive {
+	case 'a':
+		return shortWeekday[when.Weekday()]
+	case 'A':
+		return fullWeekday[when.Weekday()]
+	case 'b':
+		return shortMonth[int(when.Month())]
+	case 'B':
+		return fullMonth[int(when.Month())]
+	case 'c':
+		return formatDate(when, "%x %X")
+	case 'C':
+		return fmt.Sprintf("%02d", when.Year()/100)
+	case 'd':
+		return fmt.Sprintf("%02d", when.Day())
+	case 'D':
+		return formatDate(when, "%m/%d/%y")
+	case 'e':
+		return fmt.Sprintf("%2d", when.Day())
+	case 'g':
+		isoYear, _ := when.ISOWeek()
+		return fmt.Sprintf("%02d", isoYear%100)
+	case 'G':
+		isoYear, _ := when.ISOWeek()
+		return fmt.Sprintf("%04d", isoYear)
+	case 'h':
+		return shortMonth[int(when.Month())]
+	case 'H':
+		return fmt.Sprintf("%02d", when.Hour())
+	case 'I':
+		hour := when.Hour() % 12
+		if hour == 0 {
+			hour = 12
+		}
+		return fmt.Sprintf("%02d", hour)
+	case 'j':
+		return fmt.Sprintf("%03d", when.YearDay())
+	case 'm':
+		return fmt.Sprintf("%02d", when.Month())
+	case 'M':
+		return fmt.Sprintf("%02d", when.Minute())
+	case 'n':
+		return "\n"
+	case 'p':
+		if when.Hour() < 12 {
+			return "AM"
+		}
+		return "PM"
+	case 'r':
+		return formatDate(when, "%I:%M:%S %p")
+	case 'R':
+		return formatDate(when, "%H:%M")
+	case 'S':
+		return fmt.Sprintf("%02d", when.Second())
+	case 't':
+		return "\t"
+	case 'T':
+		return formatDate(when, "%H:%M:%S")
+	case 'u':
+		weekday := int(when.Weekday())
+		if weekday == 0 {
+			weekday = 7
+		}
+		return fmt.Sprintf("%d", weekday)
+	case 'U':
+		return fmt.Sprintf("%02d", weekNumber(when, time.Sunday))
+	case 'V':
+		_, isoWeek := when.ISOWeek()
+		return fmt.Sprintf("%02d", isoWeek)
+	case 'w':
+		return fmt.Sprintf("%d", when.Weekday())
+	case 'W':
+		return fmt.Sprintf("%02d", weekNumber(when, time.Monday))
+	case 'x':
+		return fmt.Sprintf("%02d/%02d/%02d", int(when.Month()), when.Day(), when.Year()%100)
+	case 'X':
+		return formatDate(when, "%H:%M:%S")
+	case 'y':
+		return fmt.Sprintf("%02d", when.Year()%100)
+	case 'Y':
+		return fmt.Sprintf("%04d", when.Year())
+	case 'z':
+		_, offset := when.Zone()
+		sign := '+'
+		if offset < 0 {
+			sign = '-'
+			offset = -offset
+		}
+		return fmt.Sprintf("%c%02d%02d", sign, offset/3600, (offset%3600)/60)
+	case 'Z':
+		name, _ := when.Zone()
+		return name
+	case '%':
+		return "%"
+	default:
+		return "%" + string(directive)
+	}
+}
+
+func weekNumber(when time.Time, firstWeekday time.Weekday) int {
+	jan1 := time.Date(when.Year(), time.January, 1, 0, 0, 0, 0, when.Location())
+	firstOffset := (7 + int(firstWeekday) - int(jan1.Weekday())) % 7
+	yday := when.YearDay() - 1
+	if yday < firstOffset {
+		return 0
+	}
+	return 1 + (yday-firstOffset)/7
 }

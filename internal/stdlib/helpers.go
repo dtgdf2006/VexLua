@@ -4,6 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -151,6 +154,10 @@ type luaError struct {
 	text  string
 }
 
+type exitSignal struct {
+	code int
+}
+
 func (e *luaError) Error() string {
 	return e.text
 }
@@ -180,6 +187,13 @@ func failureValues(runtime *rt.Runtime, err error) []rt.Value {
 }
 
 func failureCode(err error) (int, bool) {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if exitErr.ProcessState != nil {
+			return exitErr.ProcessState.ExitCode(), true
+		}
+		return 1, true
+	}
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
 		return int(errno), true
@@ -200,6 +214,24 @@ func errorAs(err error, target **luaError) bool {
 		return true
 	}
 	return false
+}
+
+func raiseExit(code int) {
+	panic(exitSignal{code: code})
+}
+
+func RecoverExitCode(value any) (int, bool) {
+	switch sig := value.(type) {
+	case exitSignal:
+		return sig.code, true
+	case *exitSignal:
+		if sig == nil {
+			return 0, false
+		}
+		return sig.code, true
+	default:
+		return 0, false
+	}
 }
 
 func luaToString(runtime *rt.Runtime, machine *vm.VM, value rt.Value) (string, error) {
@@ -376,4 +408,79 @@ func modulePackageName(name string) string {
 		return ""
 	}
 	return name[:idx+1]
+}
+
+const (
+	packagePathSeparator = ";"
+	packagePathMark      = "?"
+	packageExecDirMark   = "!"
+	packageIgnoreMark    = "-"
+)
+
+func defaultLuaPackagePath() string {
+	sep := string(os.PathSeparator)
+	return "." + sep + packagePathMark + ".lua" + packagePathSeparator + "." + sep + packagePathMark + sep + "init.lua"
+}
+
+func defaultCPackagePath() string {
+	sep := string(os.PathSeparator)
+	ext := ".so"
+	if os.PathSeparator == '\\' {
+		ext = ".dll"
+	}
+	return "." + sep + packagePathMark + ext + packagePathSeparator + "." + sep + "loadall" + ext
+}
+
+func packageConfigString() string {
+	return string(os.PathSeparator) + "\n" + packagePathSeparator + "\n" + packagePathMark + "\n" + packageExecDirMark + "\n" + packageIgnoreMark
+}
+
+func configuredPackagePath(envName string, defaultValue string) string {
+	value := os.Getenv(envName)
+	if value == "" {
+		value = defaultValue
+	} else {
+		value = strings.ReplaceAll(value, packagePathSeparator+packagePathSeparator, packagePathSeparator+defaultValue+packagePathSeparator)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return value
+	}
+	execDir := filepath.Dir(executable)
+	return strings.ReplaceAll(value, packageExecDirMark, execDir)
+}
+
+func packageSearchPath(pathValue string, moduleName string) (string, string) {
+	modulePath := strings.ReplaceAll(moduleName, ".", string(os.PathSeparator))
+	var messages strings.Builder
+	for _, template := range strings.Split(pathValue, packagePathSeparator) {
+		template = strings.TrimSpace(template)
+		if template == "" {
+			continue
+		}
+		filename := strings.ReplaceAll(template, packagePathMark, modulePath)
+		if isReadableFile(filename) {
+			return filename, messages.String()
+		}
+		messages.WriteString("\n\tno file '")
+		messages.WriteString(filename)
+		messages.WriteString("'")
+	}
+	return "", messages.String()
+}
+
+func isReadableFile(filename string) bool {
+	info, err := os.Stat(filename)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func packageLoaderFuncName(moduleName string) string {
+	if index := strings.Index(moduleName, packageIgnoreMark); index >= 0 {
+		moduleName = moduleName[index+1:]
+	}
+	moduleName = strings.ReplaceAll(moduleName, ".", "_")
+	return "luaopen_" + moduleName
 }

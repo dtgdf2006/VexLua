@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"vexlua/internal/bytecode"
 	rt "vexlua/internal/runtime"
 )
 
@@ -18,6 +19,7 @@ type DebugInfo struct {
 	LineDefined     int
 	LastLineDefined int
 	NumUpvalues     int
+	ActiveLines     []int
 }
 
 func (m *VM) DebugInfoForFunction(value rt.Value) (DebugInfo, error) {
@@ -68,15 +70,45 @@ func (m *VM) DebugInfoForLevel(co *Coroutine, level int) (DebugInfo, bool) {
 			return DebugInfo{}, false
 		}
 	}
-	if co == nil || level > len(co.frames) {
+	frame, tailCall, ok := m.debugFrameForLevel(co, level)
+	if !ok {
 		return DebugInfo{}, false
 	}
-	frame := co.frames[len(co.frames)-level]
+	if tailCall {
+		return tailCallDebugInfo(), true
+	}
 	info := m.debugInfoForFrame(frame)
 	if value, ok := m.runtime.FindLuaClosureValue(frame.closure); ok {
 		info.Function = value
 	}
 	return info, true
+}
+
+func (m *VM) debugFrameForLevel(co *Coroutine, level int) (*callFrame, bool, bool) {
+	if level < 1 {
+		return nil, false, false
+	}
+	if co == nil {
+		co = m.currentCoroutine()
+	}
+	if co == nil {
+		return nil, false, false
+	}
+	remaining := level
+	for index := len(co.frames) - 1; index >= 0; index-- {
+		frame := co.frames[index]
+		remaining--
+		if remaining == 0 {
+			return frame, false, true
+		}
+		if frame.tailCalls > 0 {
+			if remaining <= frame.tailCalls {
+				return nil, true, true
+			}
+			remaining -= frame.tailCalls
+		}
+	}
+	return nil, false, false
 }
 
 func (m *VM) DebugTraceback(co *Coroutine, message string, level int) string {
@@ -113,6 +145,28 @@ func (m *VM) DebugTraceback(co *Coroutine, message string, level int) string {
 		builder.WriteString("'")
 	}
 	return builder.String()
+}
+
+func (m *VM) GetLocal(co *Coroutine, level int, index int) (string, rt.Value, bool, error) {
+	frame, _, ok := m.debugFrameForLevel(co, level)
+	if !ok || frame == nil {
+		return "", rt.NilValue, false, fmt.Errorf("level out of range")
+	}
+	name, value, found := localAtFrame(frame, index)
+	return name, value, found, nil
+}
+
+func (m *VM) SetLocal(co *Coroutine, level int, index int, value rt.Value) (string, bool, error) {
+	frame, _, ok := m.debugFrameForLevel(co, level)
+	if !ok || frame == nil {
+		return "", false, fmt.Errorf("level out of range")
+	}
+	name, slot, found := localSlotAtFrame(frame, index)
+	if !found {
+		return "", false, nil
+	}
+	frame.regs[slot] = value
+	return name, true, nil
 }
 
 func (m *VM) GetUpvalue(value rt.Value, index int) (string, rt.Value, bool, error) {
@@ -195,6 +249,7 @@ func (m *VM) debugInfoForClosure(closure *LuaClosure) DebugInfo {
 		LineDefined:     proto.LineDefined,
 		LastLineDefined: proto.LastLineDefined,
 		NumUpvalues:     len(closure.Upvalues),
+		ActiveLines:     activeLinesForProto(proto),
 	}
 }
 
@@ -216,6 +271,96 @@ func currentLineForFrame(frame *callFrame) int {
 		return -1
 	}
 	return frame.closure.Proto.CurrentLine(pc)
+}
+
+func nextLineForFrame(frame *callFrame) int {
+	if frame == nil || frame.closure == nil || frame.closure.Proto == nil {
+		return -1
+	}
+	pc := frame.pc
+	if pc < 0 {
+		pc = 0
+	}
+	if pc >= len(frame.closure.Proto.Code) {
+		pc = len(frame.closure.Proto.Code) - 1
+	}
+	if pc < 0 {
+		return -1
+	}
+	return frame.closure.Proto.CurrentLine(pc)
+}
+
+func localPCForFrame(frame *callFrame) int {
+	if frame == nil || frame.closure == nil || frame.closure.Proto == nil {
+		return -1
+	}
+	pc := frame.pc
+	if pc < 0 {
+		return 0
+	}
+	if pc > len(frame.closure.Proto.Code) {
+		return len(frame.closure.Proto.Code)
+	}
+	return pc
+}
+
+func localAtFrame(frame *callFrame, index int) (string, rt.Value, bool) {
+	name, slot, ok := localSlotAtFrame(frame, index)
+	if !ok {
+		return "", rt.NilValue, false
+	}
+	if slot < 0 || slot >= len(frame.regs) {
+		return name, rt.NilValue, true
+	}
+	return name, frame.regs[slot], true
+}
+
+func localSlotAtFrame(frame *callFrame, index int) (string, int, bool) {
+	if frame == nil || frame.closure == nil || frame.closure.Proto == nil || index < 1 {
+		return "", -1, false
+	}
+	pc := localPCForFrame(frame)
+	count := 0
+	for _, local := range frame.closure.Proto.LocalsDebug {
+		if !localActiveAt(local, pc) {
+			continue
+		}
+		count++
+		if count == index {
+			return local.Name, local.Slot, true
+		}
+	}
+	return "", -1, false
+}
+
+func localActiveAt(local bytecode.LocalVar, pc int) bool {
+	if pc < 0 {
+		return false
+	}
+	endPC := local.EndPC
+	if endPC < 0 {
+		return local.StartPC <= pc
+	}
+	return local.StartPC <= pc && pc < endPC
+}
+
+func activeLinesForProto(proto *bytecode.Proto) []int {
+	if proto == nil || len(proto.LineInfo) == 0 {
+		return nil
+	}
+	seen := make(map[int]struct{}, len(proto.LineInfo))
+	lines := make([]int, 0, len(proto.LineInfo))
+	for _, line := range proto.LineInfo {
+		if line <= 0 {
+			continue
+		}
+		if _, ok := seen[line]; ok {
+			continue
+		}
+		seen[line] = struct{}{}
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 func shortSource(source string) string {
@@ -247,6 +392,17 @@ func cReturnDebugInfo() DebugInfo {
 		Source:          "=[C]",
 		ShortSource:     "[C]",
 		What:            "C",
+		CurrentLine:     -1,
+		LineDefined:     -1,
+		LastLineDefined: -1,
+	}
+}
+
+func tailCallDebugInfo() DebugInfo {
+	return DebugInfo{
+		Source:          "=(tail call)",
+		ShortSource:     "(tail call)",
+		What:            "tail",
 		CurrentLine:     -1,
 		LineDefined:     -1,
 		LastLineDefined: -1,

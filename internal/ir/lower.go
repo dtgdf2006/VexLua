@@ -74,7 +74,7 @@ func (r *resolver) lowerStmt(stmt frontend.Stmt) (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &LocalAssignStmt{Line: s.Line, Slots: slots, Values: values}, nil
+		return &LocalAssignStmt{Line: s.Line, Names: append([]string(nil), s.Names...), Slots: slots, Values: values}, nil
 	case *frontend.BreakStmt:
 		return &BreakStmt{Line: s.Line}, nil
 	case *frontend.AssignStmt:
@@ -161,7 +161,7 @@ func (r *resolver) lowerStmt(stmt frontend.Stmt) (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ForNumericStmt{Line: s.Line, Slot: slot, Start: start, Limit: limit, Step: step, Body: body}, nil
+		return &ForNumericStmt{Line: s.Line, Name: s.Name, Slot: slot, Start: start, Limit: limit, Step: step, Body: body}, nil
 	case *frontend.ForGenericStmt:
 		exprs, err := r.lowerExprList(s.Exprs)
 		if err != nil {
@@ -180,7 +180,19 @@ func (r *resolver) lowerStmt(stmt frontend.Stmt) (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ForGenericStmt{Line: s.Line, IteratorSlot: iterSlot, StateSlot: stateSlot, ControlSlot: controlSlot, VarSlots: varSlots, Exprs: exprs, Body: body}, nil
+		return &ForGenericStmt{
+			Line:         s.Line,
+			IteratorName: "(for generator)",
+			StateName:    "(for state)",
+			ControlName:  "(for control)",
+			VarNames:     append([]string(nil), s.Names...),
+			IteratorSlot: iterSlot,
+			StateSlot:    stateSlot,
+			ControlSlot:  controlSlot,
+			VarSlots:     varSlots,
+			Exprs:        exprs,
+			Body:         body,
+		}, nil
 	case *frontend.ReturnStmt:
 		values, err := r.lowerExprList(s.Values)
 		if err != nil {
@@ -220,7 +232,7 @@ func (r *resolver) lowerFunctionStmt(stmt *frontend.FunctionStmt) (Stmt, error) 
 		if err != nil {
 			return nil, err
 		}
-		return &AssignStmt{Line: stmt.Line, Targets: []AssignTarget{&VarTarget{Line: stmt.Line, Ref: VarRef{Name: stmt.Name, Kind: VarLocal, Index: slot}}}, Values: []Expr{&ClosureExpr{Fn: fn}}}, nil
+		return &LocalAssignStmt{Line: stmt.Line, Names: []string{stmt.Name}, Slots: []int{slot}, Values: []Expr{&ClosureExpr{Fn: fn}}}, nil
 	}
 	fn, err := r.lowerFunction("function", stmt.Params, stmt.Vararg, stmt.Body, stmt.Line, stmt.EndLine)
 	if err != nil {

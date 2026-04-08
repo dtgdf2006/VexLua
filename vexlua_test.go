@@ -2,10 +2,14 @@ package vexlua
 
 import (
 	"bytes"
+	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 type benchBox struct {
@@ -579,8 +583,8 @@ return (ok1 and 1 or 0)
 	+ (ok4 and 0 or 1)
 	+ (ok5 and 1 or 0)
 	+ y1 + y2 + r1 + r2
-	+ ((err1 == "boom") and 100 or 0)
-	+ ((err2 == "handled:x") and 1000 or 0)
+	+ (((type(err1) == "string") and string.find(err1, "boom", 1, true) ~= nil) and 100 or 0)
+	+ (((type(err2) == "string") and string.find(err2, "handled:", 1, true) == 1 and string.find(err2, "x", 1, true) ~= nil) and 1000 or 0)
 	+ ((value == "ok") and 10000 or 0)
 `)
 	if err != nil {
@@ -620,6 +624,80 @@ return ((first == second) and 1 or 0)
 	if got := result.Number(); got != 1346 {
 		t.Fatalf("require/string/table result = %v, want 1346", got)
 	}
+}
+
+func TestLoadAndPackageSearchers(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	tempDir := t.TempDir()
+	moduleDir := filepath.Join(tempDir, "demo")
+	if err := os.MkdirAll(moduleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	modulePath := filepath.Join(moduleDir, "tools.lua")
+	if err := os.WriteFile(modulePath, []byte("local name = ...\nreturn {name = name, answer = 42}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source := `
+package.path = [[` + filepath.ToSlash(filepath.Join(tempDir, "?.lua")) + `;` + filepath.ToSlash(filepath.Join(tempDir, "?", "init.lua")) + `]]
+local done = false
+local loader, loadErr = load(function()
+	if done then
+		return nil
+	end
+	done = true
+	return "return 40 + 2"
+end, "=(reader)")
+if loader == nil then
+	error(loadErr)
+end
+local badLoader, badErr = load(function()
+	return {}
+end)
+local mod = require("demo.tools")
+return loader()
+	+ mod.answer
+	+ ((require("demo.tools") == mod) and 100 or 0)
+	+ ((type(package.path) == "string" and type(package.cpath) == "string" and type(package.config) == "string" and type(package.loadlib) == "function") and 1000 or 0)
+	+ ((type(package.loaders[1]) == "function" and type(package.loaders[2]) == "function" and type(package.loaders[3]) == "function" and type(package.loaders[4]) == "function") and 10000 or 0)
+	+ ((mod.name == "demo.tools") and 100000 or 0)
+	+ ((badLoader == nil and badErr == "reader function must return a string") and 1000000 or 0)
+`
+	result, err := engine.DoString(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 1111184 {
+		t.Fatalf("load/package searcher result = %v, want 1111184", got)
+	}
+}
+
+func TestLoadfileFromStdin(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	withTestStdin(t, "return 40 + 2\n", func() {
+		result, err := engine.DoString(`
+local loader = assert(loadfile(nil))
+return loader()
+`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := result.Number(); got != 42 {
+			t.Fatalf("loadfile(stdin) result = %v, want 42", got)
+		}
+	})
+}
+
+func TestDofileFromStdin(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	withTestStdin(t, "return 20 + 22\n", func() {
+		result, err := engine.DoString(`return dofile(nil)`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := result.Number(); got != 42 {
+			t.Fatalf("dofile(stdin) result = %v, want 42", got)
+		}
+	})
 }
 
 func TestStringPatternAndTableSortLibraries(t *testing.T) {
@@ -803,6 +881,53 @@ return ((type(co) == "thread") and 1 or 0)
 	}
 }
 
+func TestNilMetatableDebugSupport(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local sink = {}
+local raw = {
+	__metatable = "nil-locked",
+	__index = function(value, key)
+		if value == nil and key == "answer" then
+			return 42
+		end
+	end,
+	__newindex = function(value, key, assigned)
+		sink[key] = assigned
+	end,
+	__tostring = function(value)
+		if value == nil then
+			return "nil-meta"
+		end
+		return "unexpected"
+	end,
+}
+debug.setmetatable(nil, raw)
+local probe = nil
+probe.written = 7
+local read = (function()
+	local value = nil
+	return value.answer
+end)()
+local visible = getmetatable(nil)
+local direct = debug.getmetatable(nil)
+local printed = tostring(nil)
+debug.setmetatable(nil, nil)
+return ((visible == "nil-locked") and 1 or 0)
+	+ ((direct == raw) and 10 or 0)
+	+ ((read == 42) and 100 or 0)
+	+ ((sink.written == 7) and 1000 or 0)
+	+ ((printed == "nil-meta") and 10000 or 0)
+	+ (((getmetatable(nil) == nil) and (debug.getmetatable(nil) == nil)) and 100000 or 0)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 111111 {
+		t.Fatalf("nil metatable debug result = %v, want 111111", got)
+	}
+}
+
 func TestDoBlockStatementAndScope(t *testing.T) {
 	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
 	result, err := engine.DoString(`
@@ -959,6 +1084,257 @@ return ((line1 == "alpha") and 1 or 0)
 	}
 	if got := result.Number(); got != 11111111 {
 		t.Fatalf("io/os/loadfile/gc result = %v, want 11111111", got)
+	}
+}
+
+func TestDebugHookLocalsAndActiveLines(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 1})
+	result, err := engine.DoString(`
+local fn = assert(loadstring("local a = 1\nlocal b = 2\nreturn a + b\n", "@debug_lines.lua"))
+local info = debug.getinfo(fn, "SL")
+
+local function localDemo()
+	local first = 10
+	local second = 20
+	local name1, value1 = debug.getlocal(1, 1)
+	local changed = debug.setlocal(1, 2, 99)
+	return name1 == "first" and value1 == 10 and changed == "second" and second == 99
+end
+
+local lines = {}
+local counts = 0
+local function hook(event, line)
+	if event == "line" and type(line) == "number" then
+		lines[#lines + 1] = line
+	elseif event == "count" then
+		counts = counts + 1
+	end
+end
+
+debug.sethook(hook, "l", 2)
+local function hooked()
+	local sum = 0
+	sum = sum + 1
+	sum = sum + 2
+	return sum
+end
+local hookResult = hooked()
+local hookFn, hookMask, hookCount = debug.gethook()
+debug.sethook()
+local clearedFn, clearedMask, clearedCount = debug.gethook()
+
+return (localDemo() and 1 or 0)
+	+ (((info.activelines[1] == true) and (info.activelines[2] == true) and (info.activelines[3] == true)) and 10 or 0)
+	+ ((hookResult == 3) and 100 or 0)
+	+ ((type(hookFn) == "function" and hookMask == "l" and hookCount == 2) and 1000 or 0)
+	+ ((#lines > 0 and counts > 0) and 10000 or 0)
+	+ (((clearedFn == nil) and clearedMask == "" and clearedCount == 0) and 100000 or 0)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 111111 {
+		t.Fatalf("debug hook/local result = %v, want 111111", got)
+	}
+}
+
+func TestErrorLevelAndBaseFenvSemantics(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local errfn = assert(loadstring([[local function inner(level)
+	error("boom", level)
+end
+local function outer(level)
+	inner(level)
+end
+return pcall(outer, ...)
+]], "@error_level.lua"))
+
+local ok0, msg0 = errfn(0)
+local ok1, msg1 = errfn(1)
+local ok2, msg2 = errfn(2)
+
+local function envCurrent()
+	local env = { value = 41 }
+	setmetatable(env, { __index = _G })
+	local function current()
+		setfenv(1, env)
+		return (getfenv(1) == env) and (getfenv(current) == env) and (getfenv() == env) and value == 41
+	end
+	return current()
+end
+
+local function envTarget()
+	local env = { value = 99 }
+	setmetatable(env, { __index = _G })
+	local function target()
+		return value
+	end
+	setfenv(target, env)
+	return getfenv(target) == env and target() == 99
+end
+
+local threadEnv = { marker = 7 }
+setmetatable(threadEnv, { __index = _G })
+local threadCount = select("#", setfenv(0, threadEnv))
+
+return ((not ok0 and msg0 == "boom") and 1 or 0)
+	+ ((not ok1 and string.find(msg1, ": boom", 1, true) ~= nil) and 10 or 0)
+	+ ((not ok2 and string.find(msg2, ": boom", 1, true) ~= nil and msg2 ~= msg1) and 100 or 0)
+	+ ((envCurrent() and envTarget()) and 1000 or 0)
+	+ (((threadCount == 0) and getfenv(0) == threadEnv) and 10000 or 0)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 11111 {
+		t.Fatalf("error/fenv result = %v, want 11111", got)
+	}
+}
+
+func TestIOPopenAndSetvbuf(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	tempDir := t.TempDir()
+	fullPath := filepath.ToSlash(filepath.Join(tempDir, "full.txt"))
+	linePath := filepath.ToSlash(filepath.Join(tempDir, "line.txt"))
+	noPath := filepath.ToSlash(filepath.Join(tempDir, "no.txt"))
+	source := `
+local fullPath = [[` + fullPath + `]]
+local linePath = [[` + linePath + `]]
+local noPath = [[` + noPath + `]]
+
+local readPipe = assert(io.popen([[` + popenReadCommand() + `]], "r"))
+local pipeLine = readPipe:read("*l")
+local closeOk = readPipe:close()
+
+local failPipe = assert(io.popen([[` + popenFailCommand(3) + `]], "r"))
+local failOk, failMsg, failCode = failPipe:close()
+
+local fullWriter = assert(io.open(fullPath, "w"))
+assert(fullWriter:setvbuf("full", 32))
+assert(fullWriter:write("buffered"))
+local fullReader = assert(io.open(fullPath, "r"))
+local beforeFull = fullReader:read("*a")
+assert(fullReader:close())
+assert(fullWriter:flush())
+fullReader = assert(io.open(fullPath, "r"))
+local afterFull = fullReader:read("*a")
+assert(fullReader:close())
+assert(fullWriter:close())
+
+local lineWriter = assert(io.open(linePath, "w"))
+assert(lineWriter:setvbuf("line", 32))
+assert(lineWriter:write("line"))
+local lineReader = assert(io.open(linePath, "r"))
+local beforeLine = lineReader:read("*a")
+assert(lineReader:close())
+assert(lineWriter:write("\n"))
+lineReader = assert(io.open(linePath, "r"))
+local afterLine = lineReader:read("*a")
+assert(lineReader:close())
+assert(lineWriter:close())
+
+local noWriter = assert(io.open(noPath, "w"))
+assert(noWriter:setvbuf("no", 1))
+assert(noWriter:write("n"))
+local noReader = assert(io.open(noPath, "r"))
+local afterNo = noReader:read("*a")
+assert(noReader:close())
+assert(noWriter:close())
+
+local pipeWriter = assert(io.popen([[` + popenWriteCommand() + `]], "w"))
+assert(pipeWriter:write("pipe out\n"))
+local pipeWriteOk = pipeWriter:close()
+
+return ((pipeLine == "popen-demo") and 1 or 0)
+	+ ((closeOk == true and failOk == nil and type(failMsg) == "string" and failCode == 3) and 10 or 0)
+	+ ((beforeFull == "" and afterFull == "buffered") and 100 or 0)
+	+ ((beforeLine == "" and afterLine == "line\n") and 1000 or 0)
+	+ ((afterNo == "n") and 10000 or 0)
+	+ ((pipeWriteOk == true) and 100000 or 0)
+`
+	result, err := engine.DoString(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 111111 {
+		t.Fatalf("io popen/setvbuf result = %v, want 111111", got)
+	}
+}
+
+func TestOSSetlocaleAndDate(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	assertNumberResult(t, engine, `return (type(os.setlocale(nil, "numeric")) == "string") and 1 or 0`, 1)
+	assertStringResult(t, engine, `return os.setlocale("en_US.UTF-8", "time")`, "en_US.UTF-8")
+	assertStringResult(t, engine, `return os.setlocale(nil, "time")`, "en_US.UTF-8")
+	assertNumberResult(t, engine, `local v = os.setlocale("", "time"); return (type(v) == "string" and string.len(v) > 0 and os.setlocale(nil, "time") == v) and 1 or 0`, 1)
+	assertStringResult(t, engine, `return os.setlocale("C", "time")`, "C")
+	assertNumberResult(t, engine, `return (os.setlocale("definitely_not_a_locale", "time") == nil) and 1 or 0`, 1)
+
+	stamp := time.Date(2006, time.January, 2, 15, 4, 5, 0, time.UTC).Unix()
+	dateCases := map[string]string{
+		"%a": "Mon",
+		"%A": "Monday",
+		"%b": "Jan",
+		"%B": "January",
+		"%c": "01/02/06 15:04:05",
+		"%C": "20",
+		"%d": "02",
+		"%D": "01/02/06",
+		"%e": " 2",
+		"%g": "06",
+		"%G": "2006",
+		"%h": "Jan",
+		"%H": "15",
+		"%I": "03",
+		"%j": "002",
+		"%m": "01",
+		"%M": "04",
+		"%n": "\n",
+		"%p": "PM",
+		"%r": "03:04:05 PM",
+		"%R": "15:04",
+		"%S": "05",
+		"%t": "\t",
+		"%T": "15:04:05",
+		"%u": "1",
+		"%U": "01",
+		"%V": "01",
+		"%w": "1",
+		"%W": "01",
+		"%x": "01/02/06",
+		"%X": "15:04:05",
+		"%y": "06",
+		"%Y": "2006",
+		"%z": "+0000",
+		"%Z": "UTC",
+		"%%": "%",
+	}
+	for format, want := range dateCases {
+		assertStringResult(t, engine, fmt.Sprintf(`return os.date(%q, %d)`, "!"+format, stamp), want)
+	}
+	assertNumberResult(t, engine, fmt.Sprintf(`
+local t = os.date("!*t", %d)
+return ((t.year == 2006) and (t.month == 1) and (t.day == 2) and (t.hour == 15) and (t.min == 4) and (t.sec == 5) and (t.wday == 2) and (t.yday == 2) and (t.isdst == false)) and 1 or 0
+`, stamp), 1)
+}
+
+func TestOSExit(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	if _, err := engine.DoString(`os.exit(7)`); err == nil {
+		t.Fatal("expected os.exit(7) to stop execution")
+	} else if code, ok := ExitCode(err); !ok || code != 7 {
+		t.Fatalf("os.exit(7) code = (%v, %v), want (7, true)", code, ok)
+	}
+	if _, err := engine.DoString(`return pcall(function() os.exit(3) end)`); err == nil {
+		t.Fatal("expected pcall(os.exit) to still stop execution")
+	} else if code, ok := ExitCode(err); !ok || code != 3 {
+		t.Fatalf("pcall(os.exit) code = (%v, %v), want (3, true)", code, ok)
+	}
+	if _, err := engine.DoString(`os.exit()`); err == nil {
+		t.Fatal("expected os.exit() to stop execution")
+	} else if code, ok := ExitCode(err); !ok || code != 0 {
+		t.Fatalf("os.exit() code = (%v, %v), want (0, true)", code, ok)
 	}
 }
 
@@ -1330,4 +1706,67 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func assertStringResult(t *testing.T, engine *Engine, source string, want string) {
+	t.Helper()
+	result, err := engine.DoString(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := engine.FormatValue(result); got != want {
+		t.Fatalf("source %q => %q, want %q", source, got, want)
+	}
+}
+
+func assertNumberResult(t *testing.T, engine *Engine, source string, want float64) {
+	t.Helper()
+	result, err := engine.DoString(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != want {
+		t.Fatalf("source %q => %v, want %v", source, got, want)
+	}
+}
+
+func popenReadCommand() string {
+	if runtime.GOOS == "windows" {
+		return "echo popen-demo"
+	}
+	return "printf 'popen-demo\\n'"
+}
+
+func popenFailCommand(code int) string {
+	return fmt.Sprintf("exit %d", code)
+}
+
+func popenWriteCommand() string {
+	if runtime.GOOS == "windows" {
+		return "more > nul"
+	}
+	return "cat > /dev/null"
+}
+
+func shQuote(text string) string {
+	return "'" + strings.ReplaceAll(text, "'", "'\"'\"'") + "'"
+}
+
+func withTestStdin(t *testing.T, content string, fn func()) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "stdin.lua")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	oldStdin := os.Stdin
+	os.Stdin = file
+	defer func() {
+		os.Stdin = oldStdin
+	}()
+	fn()
 }

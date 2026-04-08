@@ -12,6 +12,7 @@ type Runtime struct {
 	stringIDs    map[string]Handle
 	globals      Handle
 	registry     Handle
+	nilMeta      Value
 	stringMeta   Value
 	numberMeta   Value
 	boolMeta     Value
@@ -25,6 +26,7 @@ func NewRuntime() *Runtime {
 		symbolIDs:    make(map[string]uint32, 64),
 		symbolNames:  make([]string, 0, 64),
 		stringIDs:    make(map[string]Handle, 64),
+		nilMeta:      NilValue,
 		stringMeta:   NilValue,
 		numberMeta:   NilValue,
 		boolMeta:     NilValue,
@@ -125,6 +127,11 @@ func (rt *Runtime) ToString(v Value) (string, bool) {
 
 func (rt *Runtime) GetMetatable(target Value) (Value, bool) {
 	switch target.Kind() {
+	case KindNil:
+		if rt.nilMeta.Kind() == KindNil {
+			return NilValue, false
+		}
+		return rt.nilMeta, true
 	case KindNumber:
 		if rt.numberMeta.Kind() == KindNil {
 			return NilValue, false
@@ -212,6 +219,9 @@ func (rt *Runtime) SetAnyMetatable(target Value, meta Value) error {
 		return err
 	}
 	switch target.Kind() {
+	case KindNil:
+		rt.nilMeta = meta
+		return nil
 	case KindNumber:
 		rt.numberMeta = meta
 		return nil

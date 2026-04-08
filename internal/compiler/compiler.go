@@ -58,8 +58,9 @@ func (c *Compiler) CompileFunction(fn *ir.Function) (*bytecode.Proto, error) {
 	fc.proto.LastLineDefined = fn.LastLineDefined
 	fc.proto.NumParams = len(fn.Params)
 	fc.proto.Vararg = fn.Vararg
+	paramScope := make([]int, 0, len(fn.Params))
 	for _, param := range fn.Params {
-		fc.proto.LocalsDebug = append(fc.proto.LocalsDebug, bytecode.LocalVar{Name: param, StartPC: 0, EndPC: -1})
+		paramScope = append(paramScope, fc.openLocal(param, len(paramScope)))
 	}
 	fc.setLine(fn.LineDefined)
 	fc.nilConst = fc.proto.AddConstant(rt.NilValue)
@@ -67,20 +68,43 @@ func (c *Compiler) CompileFunction(fn *ir.Function) (*bytecode.Proto, error) {
 	for _, up := range fn.Upvalues {
 		fc.proto.Upvalues = append(fc.proto.Upvalues, bytecode.UpvalueDesc{Name: up.Name, InParentLocal: up.InParentLocal, Index: uint16(up.Index)})
 	}
-	for _, stmt := range fn.Body {
-		if err := fc.compileStmt(stmt); err != nil {
-			return nil, err
-		}
+	bodyScope, err := fc.compileBlock(fn.Body)
+	if err != nil {
+		return nil, err
 	}
 	fc.proto.Emit(bytecode.OpReturnMulti, 0, 0, 0, 0)
+	fc.closeLocalScope(bodyScope)
+	fc.closeLocalScope(paramScope)
 	for i := range fc.proto.LocalsDebug {
 		if fc.proto.LocalsDebug[i].EndPC < 0 {
-			fc.proto.LocalsDebug[i].EndPC = len(fc.proto.Code) - 1
+			fc.proto.LocalsDebug[i].EndPC = len(fc.proto.Code)
 		}
 	}
 	fc.proto.MaxStack = fc.maxStack
 	fc.proto.InlineCaches = fc.nextIC
 	return fc.proto, nil
+}
+
+func (c *funcCompiler) compileBlock(stmts []ir.Stmt) ([]int, error) {
+	scope := make([]int, 0, len(stmts))
+	for _, stmt := range stmts {
+		if err := c.compileStmt(stmt); err != nil {
+			return nil, err
+		}
+		if localStmt, ok := stmt.(*ir.LocalAssignStmt); ok {
+			scope = append(scope, c.openLocalAssign(localStmt)...)
+		}
+	}
+	return scope, nil
+}
+
+func (c *funcCompiler) compileScopedBlock(stmts []ir.Stmt) error {
+	scope, err := c.compileBlock(stmts)
+	if err != nil {
+		return err
+	}
+	c.closeLocalScope(scope)
+	return nil
 }
 
 func (c *funcCompiler) compileStmt(stmt ir.Stmt) error {
@@ -110,12 +134,7 @@ func (c *funcCompiler) compileStmt(stmt ir.Stmt) error {
 	case *ir.RepeatStmt:
 		return c.compileRepeatStmt(s)
 	case *ir.DoStmt:
-		for _, bodyStmt := range s.Body {
-			if err := c.compileStmt(bodyStmt); err != nil {
-				return err
-			}
-		}
-		return nil
+		return c.compileScopedBlock(s.Body)
 	case *ir.ForNumericStmt:
 		return c.compileForNumericStmt(s)
 	case *ir.ForGenericStmt:
@@ -132,18 +151,14 @@ func (c *funcCompiler) compileIfStmt(stmt *ir.IfStmt) error {
 			return err
 		}
 		jumpFalse := c.emit(bytecode.OpJumpIfFalse, uint16(condReg), 0, 0, 0)
-		for _, bodyStmt := range clause.Body {
-			if err := c.compileStmt(bodyStmt); err != nil {
-				return err
-			}
+		if err := c.compileScopedBlock(clause.Body); err != nil {
+			return err
 		}
 		endJumps = append(endJumps, c.emit(bytecode.OpJump, 0, 0, 0, 0))
 		c.patchJump(jumpFalse, len(c.proto.Code))
 	}
-	for _, bodyStmt := range stmt.ElseBody {
-		if err := c.compileStmt(bodyStmt); err != nil {
-			return err
-		}
+	if err := c.compileScopedBlock(stmt.ElseBody); err != nil {
+		return err
 	}
 	end := len(c.proto.Code)
 	for _, jump := range endJumps {
@@ -160,10 +175,8 @@ func (c *funcCompiler) compileWhileStmt(stmt *ir.WhileStmt) error {
 		return err
 	}
 	jumpFalse := c.emit(bytecode.OpJumpIfFalse, uint16(condReg), 0, 0, 0)
-	for _, bodyStmt := range stmt.Body {
-		if err := c.compileStmt(bodyStmt); err != nil {
-			return err
-		}
+	if err := c.compileScopedBlock(stmt.Body); err != nil {
+		return err
 	}
 	c.emit(bytecode.OpJump, 0, 0, 0, int32(loopStart))
 	loopEnd := len(c.proto.Code)
@@ -175,10 +188,8 @@ func (c *funcCompiler) compileWhileStmt(stmt *ir.WhileStmt) error {
 func (c *funcCompiler) compileRepeatStmt(stmt *ir.RepeatStmt) error {
 	loop := c.pushLoop()
 	loopStart := len(c.proto.Code)
-	for _, bodyStmt := range stmt.Body {
-		if err := c.compileStmt(bodyStmt); err != nil {
-			return err
-		}
+	if err := c.compileScopedBlock(stmt.Body); err != nil {
+		return err
 	}
 	condReg := c.allocTemp()
 	if err := c.compileExprTo(condReg, stmt.Cond); err != nil {
@@ -205,6 +216,7 @@ func (c *funcCompiler) compileForNumericStmt(stmt *ir.ForNumericStmt) error {
 	zeroReg := c.allocTemp()
 	c.proto.Emit(bytecode.OpLoadConst, uint16(zeroReg), 0, 0, int32(c.zeroConst))
 	condReg := c.allocTemp()
+	localScope := []int{c.openLocal(stmt.Name, stmt.Slot)}
 	loopStart := len(c.proto.Code)
 	c.proto.Emit(bytecode.OpLess, uint16(condReg), uint16(zeroReg), uint16(stepReg), 0)
 	negativeBranch := c.emit(bytecode.OpJumpIfFalse, uint16(condReg), 0, 0, 0)
@@ -215,16 +227,15 @@ func (c *funcCompiler) compileForNumericStmt(stmt *ir.ForNumericStmt) error {
 	c.proto.Emit(bytecode.OpLessEqual, uint16(condReg), uint16(limitReg), uint16(stmt.Slot), 0)
 	exitNegative := c.emit(bytecode.OpJumpIfFalse, uint16(condReg), 0, 0, 0)
 	c.patchJump(afterCond, len(c.proto.Code))
-	for _, bodyStmt := range stmt.Body {
-		if err := c.compileStmt(bodyStmt); err != nil {
-			return err
-		}
+	if err := c.compileScopedBlock(stmt.Body); err != nil {
+		return err
 	}
 	c.proto.Emit(bytecode.OpAdd, uint16(stmt.Slot), uint16(stmt.Slot), uint16(stepReg), 0)
 	c.emit(bytecode.OpJump, 0, 0, 0, int32(loopStart))
 	loopEnd := len(c.proto.Code)
 	c.patchJump(exitPositive, loopEnd)
 	c.patchJump(exitNegative, loopEnd)
+	c.closeLocalScope(localScope)
 	c.popLoop(loopEnd, loop)
 	return nil
 }
@@ -237,6 +248,17 @@ func (c *funcCompiler) compileForGenericStmt(stmt *ir.ForGenericStmt) error {
 		return err
 	}
 	loop := c.pushLoop()
+	localScope := []int{
+		c.openLocal(stmt.IteratorName, stmt.IteratorSlot),
+		c.openLocal(stmt.StateName, stmt.StateSlot),
+		c.openLocal(stmt.ControlName, stmt.ControlSlot),
+	}
+	for i, name := range stmt.VarNames {
+		if i >= len(stmt.VarSlots) {
+			break
+		}
+		localScope = append(localScope, c.openLocal(name, stmt.VarSlots[i]))
+	}
 	loopStart := len(c.proto.Code)
 	c.proto.Emit(bytecode.OpCallMulti, uint16(stmt.ControlSlot), uint16(stmt.IteratorSlot), uint16(stmt.StateSlot), bytecode.PackCallCounts(2, len(stmt.VarSlots)+1))
 	exitJump := c.emit(bytecode.OpJumpIfFalse, uint16(stmt.ControlSlot), 0, 0, 0)
@@ -244,14 +266,13 @@ func (c *funcCompiler) compileForGenericStmt(stmt *ir.ForGenericStmt) error {
 		slot := stmt.VarSlots[i]
 		c.proto.Emit(bytecode.OpMove, uint16(slot), uint16(stmt.ControlSlot+i), 0, 0)
 	}
-	for _, bodyStmt := range stmt.Body {
-		if err := c.compileStmt(bodyStmt); err != nil {
-			return err
-		}
+	if err := c.compileScopedBlock(stmt.Body); err != nil {
+		return err
 	}
 	c.emit(bytecode.OpJump, 0, 0, 0, int32(loopStart))
 	loopEnd := len(c.proto.Code)
 	c.patchJump(exitJump, loopEnd)
+	c.closeLocalScope(localScope)
 	c.popLoop(loopEnd, loop)
 	return nil
 }
@@ -937,6 +958,42 @@ func (c *funcCompiler) emit(op bytecode.Op, a, b, cArg uint16, d int32) int {
 
 func (c *funcCompiler) patchJump(index int, target int) {
 	c.proto.Code[index].D = int32(target)
+}
+
+func (c *funcCompiler) openLocal(name string, slot int) int {
+	index := len(c.proto.LocalsDebug)
+	c.proto.LocalsDebug = append(c.proto.LocalsDebug, bytecode.LocalVar{
+		Name:    name,
+		Slot:    slot,
+		StartPC: len(c.proto.Code),
+		EndPC:   -1,
+	})
+	return index
+}
+
+func (c *funcCompiler) openLocalAssign(stmt *ir.LocalAssignStmt) []int {
+	count := len(stmt.Names)
+	if len(stmt.Slots) < count {
+		count = len(stmt.Slots)
+	}
+	opened := make([]int, 0, count)
+	for i := 0; i < count; i++ {
+		opened = append(opened, c.openLocal(stmt.Names[i], stmt.Slots[i]))
+	}
+	return opened
+}
+
+func (c *funcCompiler) closeLocalScope(indices []int) {
+	endPC := len(c.proto.Code)
+	for i := len(indices) - 1; i >= 0; i-- {
+		index := indices[i]
+		if index < 0 || index >= len(c.proto.LocalsDebug) {
+			continue
+		}
+		if c.proto.LocalsDebug[index].EndPC < 0 {
+			c.proto.LocalsDebug[index].EndPC = endPC
+		}
+	}
 }
 
 func (c *funcCompiler) setLine(line int) {

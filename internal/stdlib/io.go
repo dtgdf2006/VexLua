@@ -5,19 +5,30 @@ import (
 	"fmt"
 	gio "io"
 	"os"
+	"os/exec"
+	goruntime "runtime"
 	"strings"
 
 	rt "vexlua/internal/runtime"
 	"vexlua/internal/vm"
 )
 
+const defaultLuaFileBufferSize = 4096
+
 type luaFile struct {
-	file     *os.File
-	name     string
-	reader   *bufio.Reader
-	writer   *bufio.Writer
-	standard bool
-	noclose  bool
+	file        *os.File
+	name        string
+	reader      *bufio.Reader
+	writer      *bufio.Writer
+	readSource  gio.Reader
+	writeTarget gio.Writer
+	seeker      gio.Seeker
+	closeRaw    func() error
+	standard    bool
+	noclose     bool
+	closedFlag  bool
+	bufferMode  string
+	bufferSize  int
 }
 
 type ioState struct {
@@ -47,15 +58,18 @@ func registerIO(runtime *rt.Runtime, machine *vm.VM) error {
 		if file.closed() {
 			return runtime.StringValue("file (closed)"), nil
 		}
-		return runtime.StringValue(fmt.Sprintf("file (%p)", file.file)), nil
+		if file.file != nil {
+			return runtime.StringValue(fmt.Sprintf("file (%p)", file.file)), nil
+		}
+		return runtime.StringValue(fmt.Sprintf("file (%p)", file)), nil
 	}))
 	state := &ioState{meta: metaValue}
 	newFileValue := func(file *luaFile, env rt.Value) rt.Value {
 		return runtime.NewUserdataValueWithEnv(file, metaValue, env)
 	}
-	state.input = newFileValue(newLuaFile(os.Stdin, "stdin", true, true), rt.HandleValue(runtime.GlobalsHandle()))
-	state.output = newFileValue(newLuaFile(os.Stdout, "stdout", true, true), rt.HandleValue(runtime.GlobalsHandle()))
-	state.stderr = newFileValue(newLuaFile(os.Stderr, "stderr", true, true), rt.HandleValue(runtime.GlobalsHandle()))
+	state.input = newFileValue(newLuaFile(os.Stdin, "stdin", true, false, true, true), rt.HandleValue(runtime.GlobalsHandle()))
+	state.output = newFileValue(newLuaFile(os.Stdout, "stdout", false, true, true, true), rt.HandleValue(runtime.GlobalsHandle()))
+	state.stderr = newFileValue(newLuaFile(os.Stderr, "stderr", false, true, true, true), rt.HandleValue(runtime.GlobalsHandle()))
 
 	closeFile := func(value rt.Value) ([]rt.Value, error) {
 		file, err := checkLuaFile(runtime, value)
@@ -193,15 +207,29 @@ func registerIO(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) < 2 || len(args) > 3 {
 			return rt.NilValue, fmt.Errorf("file:setvbuf expects self, mode, [size]")
 		}
-		if _, err := checkLuaFile(runtime, args[0]); err != nil {
+		file, err := checkLuaFile(runtime, args[0])
+		if err != nil {
 			return rt.NilValue, err
 		}
 		mode, ok := runtime.ToString(args[1])
 		if !ok {
 			return rt.NilValue, fmt.Errorf("file:setvbuf mode expects string")
 		}
+		size := defaultLuaFileBufferSize
+		if len(args) > 2 && args[2].Kind() != rt.KindNil {
+			if !args[2].IsNumber() {
+				return rt.NilValue, fmt.Errorf("file:setvbuf size expects number")
+			}
+			size = int(args[2].Number())
+			if size < 0 {
+				return rt.NilValue, fmt.Errorf("file:setvbuf size must be non-negative")
+			}
+		}
 		switch mode {
 		case "no", "full", "line":
+			if err := file.setvbuf(mode, size); err != nil {
+				return rt.NilValue, err
+			}
 			return rt.TrueValue, nil
 		default:
 			return rt.NilValue, fmt.Errorf("invalid buffering mode %q", mode)
@@ -315,8 +343,27 @@ func registerIO(runtime *rt.Runtime, machine *vm.VM) error {
 		state.output = args[0]
 		return state.output, nil
 	}))
-	ioTable.SetSymbol(runtime.InternSymbol("popen"), runtime.NewHostFunction("io.popen", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
-		return rt.NilValue, fmt.Errorf("io.popen is not supported")
+	ioTable.SetSymbol(runtime.InternSymbol("popen"), runtime.NewHostFunctionMulti("io.popen", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) == 0 || len(args) > 2 {
+			return nil, fmt.Errorf("io.popen expects command and optional mode")
+		}
+		command, ok := runtime.ToString(args[0])
+		if !ok {
+			return nil, fmt.Errorf("io.popen expects string command")
+		}
+		mode := "r"
+		if len(args) > 1 && args[1].Kind() != rt.KindNil {
+			text, ok := runtime.ToString(args[1])
+			if !ok {
+				return nil, fmt.Errorf("io.popen mode expects string")
+			}
+			mode = text
+		}
+		file, err := openLuaPipe(command, mode)
+		if err != nil {
+			return failureValues(runtime, err), nil
+		}
+		return []rt.Value{newFileValue(file, machine.CurrentEnv())}, nil
 	}))
 	ioTable.SetSymbol(runtime.InternSymbol("read"), runtime.NewHostFunctionMulti("io.read", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
 		return readFile(state.input, args)
@@ -329,7 +376,7 @@ func registerIO(runtime *rt.Runtime, machine *vm.VM) error {
 		if err != nil {
 			return failureValues(runtime, err), nil
 		}
-		return []rt.Value{newFileValue(newLuaFile(file, file.Name(), false, false), machine.CurrentEnv())}, nil
+		return []rt.Value{newFileValue(newLuaFile(file, file.Name(), true, true, false, false), machine.CurrentEnv())}, nil
 	}))
 	ioTable.SetSymbol(runtime.InternSymbol("type"), runtime.NewHostFunction("io.type", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		if len(args) != 1 {
@@ -355,8 +402,28 @@ func registerIO(runtime *rt.Runtime, machine *vm.VM) error {
 	return nil
 }
 
-func newLuaFile(file *os.File, name string, standard bool, noclose bool) *luaFile {
-	return &luaFile{file: file, name: name, standard: standard, noclose: noclose}
+func newLuaFile(file *os.File, name string, readable bool, writable bool, standard bool, noclose bool) *luaFile {
+	bufferMode := "full"
+	if standard && writable {
+		bufferMode = "no"
+	}
+	luaFile := &luaFile{
+		file:       file,
+		name:       name,
+		seeker:     file,
+		closeRaw:   file.Close,
+		standard:   standard,
+		noclose:    noclose,
+		bufferMode: bufferMode,
+		bufferSize: defaultLuaFileBufferSize,
+	}
+	if readable {
+		luaFile.readSource = file
+	}
+	if writable {
+		luaFile.writeTarget = file
+	}
+	return luaFile
 }
 
 func luaFileFromValue(runtime *rt.Runtime, value rt.Value) (*luaFile, bool) {
@@ -383,19 +450,30 @@ func checkLuaFile(runtime *rt.Runtime, value rt.Value) (*luaFile, error) {
 func openLuaFile(name string, mode string) (*luaFile, error) {
 	cleanMode := strings.ReplaceAll(mode, "b", "")
 	flag := 0
+	readable := false
+	writable := false
 	switch cleanMode {
 	case "", "r":
 		flag = os.O_RDONLY
+		readable = true
 	case "w":
 		flag = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+		writable = true
 	case "a":
 		flag = os.O_CREATE | os.O_WRONLY | os.O_APPEND
+		writable = true
 	case "r+":
 		flag = os.O_RDWR
+		readable = true
+		writable = true
 	case "w+":
 		flag = os.O_CREATE | os.O_RDWR | os.O_TRUNC
+		readable = true
+		writable = true
 	case "a+":
 		flag = os.O_CREATE | os.O_RDWR | os.O_APPEND
+		readable = true
+		writable = true
 	default:
 		return nil, fmt.Errorf("invalid file mode %q", mode)
 	}
@@ -403,11 +481,77 @@ func openLuaFile(name string, mode string) (*luaFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newLuaFile(file, name, false, false), nil
+	return newLuaFile(file, name, readable, writable, false, false), nil
+}
+
+func openLuaPipe(command string, mode string) (*luaFile, error) {
+	cleanMode := strings.ReplaceAll(mode, "b", "")
+	if cleanMode == "" {
+		cleanMode = "r"
+	}
+	cmd := shellCommand(command)
+	switch cleanMode {
+	case "r":
+		pipe, err := cmd.StdoutPipe()
+		if err != nil {
+			return nil, err
+		}
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		return &luaFile{
+			name:       command,
+			readSource: pipe,
+			closeRaw: func() error {
+				closeErr := pipe.Close()
+				waitErr := cmd.Wait()
+				if closeErr != nil {
+					return closeErr
+				}
+				return waitErr
+			},
+			bufferMode: "full",
+			bufferSize: defaultLuaFileBufferSize,
+		}, nil
+	case "w":
+		pipe, err := cmd.StdinPipe()
+		if err != nil {
+			return nil, err
+		}
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		return &luaFile{
+			name:        command,
+			writeTarget: pipe,
+			closeRaw: func() error {
+				closeErr := pipe.Close()
+				waitErr := cmd.Wait()
+				if closeErr != nil {
+					return closeErr
+				}
+				return waitErr
+			},
+			bufferMode: "full",
+			bufferSize: defaultLuaFileBufferSize,
+		}, nil
+	default:
+		return nil, fmt.Errorf("invalid popen mode %q", mode)
+	}
+}
+
+func shellCommand(command string) *exec.Cmd {
+	if goruntime.GOOS == "windows" {
+		return exec.Command("cmd", "/C", command)
+	}
+	return exec.Command("sh", "-c", command)
 }
 
 func (f *luaFile) closed() bool {
-	return f == nil || f.file == nil
+	return f == nil || f.closedFlag
 }
 
 func (f *luaFile) close() error {
@@ -420,10 +564,18 @@ func (f *luaFile) close() error {
 	if err := f.flush(); err != nil {
 		return err
 	}
-	err := f.file.Close()
+	err := error(nil)
+	if f.closeRaw != nil {
+		err = f.closeRaw()
+	}
 	f.file = nil
 	f.reader = nil
 	f.writer = nil
+	f.readSource = nil
+	f.writeTarget = nil
+	f.seeker = nil
+	f.closeRaw = nil
+	f.closedFlag = true
 	return err
 }
 
@@ -441,13 +593,16 @@ func (f *luaFile) prepareRead() error {
 	if f.closed() {
 		return fmt.Errorf("attempt to use a closed file")
 	}
+	if f.readSource == nil {
+		return fmt.Errorf("file is not open for reading")
+	}
 	if f.writer != nil {
 		if err := f.writer.Flush(); err != nil {
 			return err
 		}
 	}
 	if f.reader == nil {
-		f.reader = bufio.NewReader(f.file)
+		f.reader = bufio.NewReaderSize(f.readSource, f.readBufferSize())
 	}
 	return nil
 }
@@ -456,16 +611,26 @@ func (f *luaFile) prepareWrite() error {
 	if f.closed() {
 		return fmt.Errorf("attempt to use a closed file")
 	}
+	if f.writeTarget == nil {
+		return fmt.Errorf("file is not open for writing")
+	}
 	if f.reader != nil {
 		if unread := f.reader.Buffered(); unread > 0 {
-			if _, err := f.file.Seek(int64(-unread), gio.SeekCurrent); err != nil {
+			if f.seeker == nil {
+				return fmt.Errorf("file is not seekable")
+			}
+			if _, err := f.seeker.Seek(int64(-unread), gio.SeekCurrent); err != nil {
 				return err
 			}
 		}
 		f.reader = nil
 	}
+	if f.bufferMode == "no" {
+		f.writer = nil
+		return nil
+	}
 	if f.writer == nil {
-		f.writer = bufio.NewWriter(f.file)
+		f.writer = bufio.NewWriterSize(f.writeTarget, f.effectiveBufferSize())
 	}
 	return nil
 }
@@ -474,9 +639,12 @@ func (f *luaFile) seek(whence int, offset int64) (int64, error) {
 	if f.closed() {
 		return 0, fmt.Errorf("attempt to use a closed file")
 	}
+	if f.seeker == nil {
+		return 0, fmt.Errorf("file is not seekable")
+	}
 	if f.reader != nil {
 		if unread := f.reader.Buffered(); unread > 0 {
-			if _, err := f.file.Seek(int64(-unread), gio.SeekCurrent); err != nil {
+			if _, err := f.seeker.Seek(int64(-unread), gio.SeekCurrent); err != nil {
 				return 0, err
 			}
 		}
@@ -487,7 +655,7 @@ func (f *luaFile) seek(whence int, offset int64) (int64, error) {
 			return 0, err
 		}
 	}
-	position, err := f.file.Seek(offset, whence)
+	position, err := f.seeker.Seek(offset, whence)
 	if err != nil {
 		return 0, err
 	}
@@ -500,16 +668,60 @@ func (f *luaFile) write(runtime *rt.Runtime, values []rt.Value) error {
 	if err := f.prepareWrite(); err != nil {
 		return err
 	}
+	flushAfterWrite := f.bufferMode == "no"
 	for _, value := range values {
 		text, ok := concatString(runtime, value)
 		if !ok {
 			return fmt.Errorf("string or number expected")
 		}
+		if f.bufferMode == "no" {
+			if _, err := gio.WriteString(f.writeTarget, text); err != nil {
+				return err
+			}
+			continue
+		}
 		if _, err := f.writer.WriteString(text); err != nil {
 			return err
 		}
+		if f.bufferMode == "line" && strings.Contains(text, "\n") {
+			flushAfterWrite = true
+		}
 	}
-	return f.writer.Flush()
+	if f.writer != nil && flushAfterWrite {
+		return f.writer.Flush()
+	}
+	return nil
+}
+
+func (f *luaFile) setvbuf(mode string, size int) error {
+	if f.closed() {
+		return fmt.Errorf("attempt to use a closed file")
+	}
+	if size == 0 {
+		size = defaultLuaFileBufferSize
+	}
+	if err := f.flush(); err != nil {
+		return err
+	}
+	f.bufferMode = mode
+	f.bufferSize = size
+	f.reader = nil
+	f.writer = nil
+	return nil
+}
+
+func (f *luaFile) effectiveBufferSize() int {
+	if f.bufferSize > 0 {
+		return f.bufferSize
+	}
+	return defaultLuaFileBufferSize
+}
+
+func (f *luaFile) readBufferSize() int {
+	if f.bufferMode == "no" {
+		return 1
+	}
+	return f.effectiveBufferSize()
 }
 
 func readBySpecs(runtime *rt.Runtime, file *luaFile, specs []rt.Value) ([]rt.Value, bool, error) {

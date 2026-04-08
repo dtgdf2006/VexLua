@@ -93,7 +93,17 @@ func (e *Engine) RegisterTable(name string, fields map[string]any) error {
 	return nil
 }
 
-func (e *Engine) Run(proto *bytecode.Proto) (Value, error) {
+func (e *Engine) Run(proto *bytecode.Proto) (result Value, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if code, ok := stdlib.RecoverExitCode(recovered); ok {
+				result = rt.NilValue
+				err = &ExitError{Code: code}
+				return
+			}
+			panic(recovered)
+		}
+	}()
 	return e.machine.Run(proto)
 }
 

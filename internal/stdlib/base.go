@@ -2,6 +2,7 @@ package stdlib
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -118,10 +119,17 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 	runtime.SetGlobal("setmetatable", setmetatableFunc)
 	runtime.SetGlobal("error", runtime.NewHostFunction("error", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		message := runtime.StringValue("error")
+		level := 1
 		if len(args) > 0 {
 			message = args[0]
 		}
-		return rt.NilValue, raiseValueError(runtime, message)
+		if len(args) > 1 {
+			if !args[1].IsNumber() {
+				return rt.NilValue, fmt.Errorf("error level expects number")
+			}
+			level = int(args[1].Number())
+		}
+		return rt.NilValue, raiseBaseError(runtime, machine, message, level)
 	}))
 	runtime.SetGlobal("pcall", runtime.NewHostFunctionMulti("pcall", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
 		if len(args) == 0 {
@@ -257,6 +265,24 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		}
 		return machine.NewClosureValue(proto), rt.NilValue
 	}
+	readLoadedChunk := func(filename *string) ([]byte, string, rt.Value) {
+		if filename == nil {
+			data, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				return nil, "", runtime.StringValue(err.Error())
+			}
+			return data, "=stdin", rt.NilValue
+		}
+		data, err := os.ReadFile(*filename)
+		if err != nil {
+			return nil, "", runtime.StringValue(err.Error())
+		}
+		sourceName := *filename
+		if sourceName != "" && sourceName[0] != '@' && sourceName[0] != '=' {
+			sourceName = "@" + sourceName
+		}
+		return data, sourceName, rt.NilValue
+	}
 	gcPause := 200
 	gcStepMul := 200
 	gcRunning := true
@@ -293,6 +319,42 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		}
 		return runtime.NewUserdataValueWithEnv(nil, meta, machine.CurrentEnv()), nil
 	}))
+	runtime.SetGlobal("load", runtime.NewHostFunctionMulti("load", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) == 0 || len(args) > 2 {
+			return nil, fmt.Errorf("load expects 1 or 2 arguments")
+		}
+		if typeName(runtime, args[0]) != "function" {
+			return nil, fmt.Errorf("load expects reader function")
+		}
+		name := "=(load)"
+		if len(args) == 2 && args[1].Kind() != rt.KindNil {
+			text, ok := runtime.ToString(args[1])
+			if !ok {
+				return nil, fmt.Errorf("load chunk name expects string")
+			}
+			name = text
+		}
+		var builder strings.Builder
+		for {
+			results, err := machine.CallValue(args[0], nil)
+			if err != nil {
+				return []rt.Value{rt.NilValue, errorToValue(runtime, err)}, nil
+			}
+			if len(results) == 0 || results[0].Kind() == rt.KindNil {
+				break
+			}
+			text, ok := concatString(runtime, results[0])
+			if !ok {
+				return []rt.Value{rt.NilValue, runtime.StringValue("reader function must return a string")}, nil
+			}
+			builder.WriteString(text)
+		}
+		chunk, errValue := compileLoadedChunk(builder.String(), name)
+		if errValue.Kind() != rt.KindNil {
+			return []rt.Value{rt.NilValue, errValue}, nil
+		}
+		return []rt.Value{chunk}, nil
+	}))
 	loadString := runtime.NewHostFunctionMulti("loadstring", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
 		if len(args) == 0 || len(args) > 2 {
 			return nil, fmt.Errorf("loadstring expects 1 or 2 arguments")
@@ -320,20 +382,17 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		if len(args) > 1 {
 			return nil, fmt.Errorf("loadfile expects 0 or 1 argument")
 		}
-		if len(args) == 0 || args[0].Kind() == rt.KindNil {
-			return []rt.Value{rt.NilValue, runtime.StringValue("loadfile without filename is not supported")}, nil
+		var filename *string
+		if len(args) == 1 && args[0].Kind() != rt.KindNil {
+			text, ok := runtime.ToString(args[0])
+			if !ok {
+				return nil, fmt.Errorf("loadfile expects string filename")
+			}
+			filename = &text
 		}
-		filename, ok := runtime.ToString(args[0])
-		if !ok {
-			return nil, fmt.Errorf("loadfile expects string filename")
-		}
-		data, err := os.ReadFile(filename)
-		if err != nil {
-			return []rt.Value{rt.NilValue, runtime.StringValue(err.Error())}, nil
-		}
-		sourceName := filename
-		if sourceName != "" && sourceName[0] != '@' && sourceName[0] != '=' {
-			sourceName = "@" + sourceName
+		data, sourceName, errValue := readLoadedChunk(filename)
+		if errValue.Kind() != rt.KindNil {
+			return []rt.Value{rt.NilValue, errValue}, nil
 		}
 		chunk, errValue := compileLoadedChunk(string(data), sourceName)
 		if errValue.Kind() != rt.KindNil {
@@ -345,20 +404,17 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		if len(args) > 1 {
 			return nil, fmt.Errorf("dofile expects 0 or 1 argument")
 		}
-		if len(args) == 0 || args[0].Kind() == rt.KindNil {
-			return nil, fmt.Errorf("dofile without filename is not supported")
+		var filename *string
+		if len(args) == 1 && args[0].Kind() != rt.KindNil {
+			text, ok := runtime.ToString(args[0])
+			if !ok {
+				return nil, fmt.Errorf("dofile expects string filename")
+			}
+			filename = &text
 		}
-		filename, ok := runtime.ToString(args[0])
-		if !ok {
-			return nil, fmt.Errorf("dofile expects string filename")
-		}
-		data, err := os.ReadFile(filename)
-		if err != nil {
-			return nil, err
-		}
-		sourceName := filename
-		if sourceName != "" && sourceName[0] != '@' && sourceName[0] != '=' {
-			sourceName = "@" + sourceName
+		data, sourceName, errValue := readLoadedChunk(filename)
+		if errValue.Kind() != rt.KindNil {
+			return nil, raiseValueError(runtime, errValue)
 		}
 		chunk, errValue := compileLoadedChunk(string(data), sourceName)
 		if errValue.Kind() != rt.KindNil {
@@ -479,32 +535,37 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		return []rt.Value{nextFunc, args[0], rt.NilValue}, nil
 	}))
 	getfenv := runtime.NewHostFunction("getfenv", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
-		if len(args) == 0 {
-			return machine.CurrentEnv(), nil
-		}
-		if len(args) != 1 {
-			return rt.NilValue, fmt.Errorf("getfenv expects 0 or 1 argument")
-		}
-		if args[0].IsNumber() {
-			return machine.CurrentEnv(), nil
-		}
-		return machine.GetEnv(args[0])
-	})
-	runtime.SetGlobal("getfenv", getfenv)
-	setfenv := runtime.NewHostFunction("setfenv", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
-		if len(args) != 2 {
-			return rt.NilValue, fmt.Errorf("setfenv expects 2 arguments")
-		}
-		if args[0].IsNumber() {
-			if err := machine.SetCurrentEnv(args[1]); err != nil {
-				return rt.NilValue, err
-			}
-			return args[0], nil
-		}
-		if err := machine.SetEnv(args[0], args[1]); err != nil {
+		target, threadEnv, err := resolveBaseFenvTarget(machine, args, true)
+		if err != nil {
 			return rt.NilValue, err
 		}
-		return args[0], nil
+		if threadEnv {
+			return machine.CurrentThreadEnv(), nil
+		}
+		return machine.GetFunctionEnv(target)
+	})
+	runtime.SetGlobal("getfenv", getfenv)
+	setfenv := runtime.NewHostFunctionMulti("setfenv", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) != 2 {
+			return nil, fmt.Errorf("setfenv expects 2 arguments")
+		}
+		target, threadEnv, err := resolveBaseFenvTarget(machine, args[:1], false)
+		if err != nil {
+			return nil, err
+		}
+		if threadEnv {
+			if err := machine.SetCurrentThreadEnv(args[1]); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
+		if h, ok := target.Handle(); ok && h.Kind() == rt.ObjectHostFunction {
+			return nil, fmt.Errorf("setfenv cannot change environment of given object")
+		}
+		if err := machine.SetFunctionEnv(target, args[1]); err != nil {
+			return nil, err
+		}
+		return []rt.Value{target}, nil
 	})
 	runtime.SetGlobal("setfenv", setfenv)
 	packageValue, packageTable, loadedTable, err := ensurePackageTables(runtime)
@@ -519,6 +580,27 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 	if err != nil {
 		return err
 	}
+	packageTable.SetSymbol(runtime.InternSymbol("path"), runtime.StringValue(configuredPackagePath("LUA_PATH", defaultLuaPackagePath())))
+	packageTable.SetSymbol(runtime.InternSymbol("cpath"), runtime.StringValue(configuredPackagePath("LUA_CPATH", defaultCPackagePath())))
+	packageTable.SetSymbol(runtime.InternSymbol("config"), runtime.StringValue(packageConfigString()))
+	loadingSentinel := runtime.NewTableValue(0)
+	packageLoadlib := runtime.NewHostFunctionMulti("package.loadlib", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) != 2 {
+			return nil, fmt.Errorf("package.loadlib expects library name and init function")
+		}
+		libname, ok := runtime.ToString(args[0])
+		if !ok {
+			return nil, fmt.Errorf("package.loadlib library name expects string")
+		}
+		if _, ok := runtime.ToString(args[1]); !ok {
+			return nil, fmt.Errorf("package.loadlib init function expects string")
+		}
+		if _, err := os.Stat(libname); err != nil {
+			return []rt.Value{rt.NilValue, runtime.StringValue(err.Error()), runtime.StringValue("open")}, nil
+		}
+		return []rt.Value{rt.NilValue, runtime.StringValue("native Lua C modules are not supported in vexlua"), runtime.StringValue("open")}, nil
+	})
+	packageTable.SetSymbol(runtime.InternSymbol("loadlib"), packageLoadlib)
 	preloadSearcher := runtime.NewHostFunctionMulti("package.preload_searcher", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
 		if len(args) != 1 {
 			return nil, fmt.Errorf("preload searcher expects module name")
@@ -533,7 +615,123 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		}
 		return []rt.Value{runtime.StringValue("\n\tno field package.preload['" + name + "']")}, nil
 	})
+	luaSearcher := runtime.NewHostFunctionMulti("package.lua_searcher", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("lua searcher expects module name")
+		}
+		name, ok := runtime.ToString(args[0])
+		if !ok {
+			return nil, fmt.Errorf("lua searcher expects string name")
+		}
+		pathValue, _, found := packageTable.GetSymbol(runtime.InternSymbol("path"))
+		if !found {
+			return nil, fmt.Errorf("package.path must be a string")
+		}
+		pathText, ok := runtime.ToString(pathValue)
+		if !ok {
+			return nil, fmt.Errorf("package.path must be a string")
+		}
+		filename, messages := packageSearchPath(pathText, name)
+		if filename == "" {
+			return []rt.Value{runtime.StringValue(messages)}, nil
+		}
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			return []rt.Value{runtime.StringValue("\n\tno file '" + filename + "'")}, nil
+		}
+		chunk, errValue := compileLoadedChunk(string(data), "@"+filename)
+		if errValue.Kind() != rt.KindNil {
+			text, err := plainString(runtime, errValue)
+			if err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("error loading module %q from file %q:\n\t%s", name, filename, text)
+		}
+		return []rt.Value{chunk}, nil
+	})
+	cSearcher := runtime.NewHostFunctionMulti("package.c_searcher", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("c searcher expects module name")
+		}
+		name, ok := runtime.ToString(args[0])
+		if !ok {
+			return nil, fmt.Errorf("c searcher expects string name")
+		}
+		cpathValue, _, found := packageTable.GetSymbol(runtime.InternSymbol("cpath"))
+		if !found {
+			return nil, fmt.Errorf("package.cpath must be a string")
+		}
+		cpathText, ok := runtime.ToString(cpathValue)
+		if !ok {
+			return nil, fmt.Errorf("package.cpath must be a string")
+		}
+		filename, messages := packageSearchPath(cpathText, name)
+		if filename == "" {
+			return []rt.Value{runtime.StringValue(messages)}, nil
+		}
+		results, err := machine.CallValue(packageLoadlib, []rt.Value{runtime.StringValue(filename), runtime.StringValue(packageLoaderFuncName(name))})
+		if err != nil {
+			return nil, err
+		}
+		if len(results) > 0 && results[0].Kind() != rt.KindNil {
+			return []rt.Value{results[0]}, nil
+		}
+		message := "native Lua C modules are not supported in vexlua"
+		if len(results) > 1 && results[1].Kind() != rt.KindNil {
+			text, err := plainString(runtime, results[1])
+			if err != nil {
+				return nil, err
+			}
+			message = text
+		}
+		return nil, fmt.Errorf("error loading module %q from file %q:\n\t%s", name, filename, message)
+	})
+	cRootSearcher := runtime.NewHostFunctionMulti("package.croot_searcher", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("c root searcher expects module name")
+		}
+		name, ok := runtime.ToString(args[0])
+		if !ok {
+			return nil, fmt.Errorf("c root searcher expects string name")
+		}
+		dot := strings.Index(name, ".")
+		if dot < 0 {
+			return nil, nil
+		}
+		root := name[:dot]
+		cpathValue, _, found := packageTable.GetSymbol(runtime.InternSymbol("cpath"))
+		if !found {
+			return nil, fmt.Errorf("package.cpath must be a string")
+		}
+		cpathText, ok := runtime.ToString(cpathValue)
+		if !ok {
+			return nil, fmt.Errorf("package.cpath must be a string")
+		}
+		filename, messages := packageSearchPath(cpathText, root)
+		if filename == "" {
+			return []rt.Value{runtime.StringValue(messages)}, nil
+		}
+		results, err := machine.CallValue(packageLoadlib, []rt.Value{runtime.StringValue(filename), runtime.StringValue(packageLoaderFuncName(name))})
+		if err != nil {
+			return nil, err
+		}
+		if len(results) > 0 && results[0].Kind() != rt.KindNil {
+			return []rt.Value{results[0]}, nil
+		}
+		message := "native Lua C modules are not supported in vexlua"
+		if len(results) > 1 && results[1].Kind() != rt.KindNil {
+			text, err := plainString(runtime, results[1])
+			if err != nil {
+				return nil, err
+			}
+			message = text
+		}
+		return nil, fmt.Errorf("error loading module %q from file %q:\n\t%s", name, filename, message)
+	})
 	loadersTable.SetIndex(1, preloadSearcher)
+	loadersTable.SetIndex(2, luaSearcher)
+	loadersTable.SetIndex(3, cSearcher)
+	loadersTable.SetIndex(4, cRootSearcher)
 	seeAll := runtime.NewHostFunction("package.seeall", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		if len(args) != 1 {
 			return rt.NilValue, fmt.Errorf("package.seeall expects 1 argument")
@@ -546,6 +744,7 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		return args[0], nil
 	})
 	packageTable.SetSymbol(runtime.InternSymbol("seeall"), seeAll)
+	loadedTable.SetSymbol(runtime.InternSymbol("package"), packageValue)
 	runtime.SetGlobal("package", packageValue)
 	runtime.SetGlobal("require", runtime.NewHostFunction("require", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		if len(args) != 1 {
@@ -557,6 +756,9 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		}
 		sym := runtime.InternSymbol(name)
 		if loaded, _, found := loadedTable.GetSymbol(sym); found && isTruthy(loaded) {
+			if loaded == loadingSentinel {
+				return rt.NilValue, fmt.Errorf("loop or previous error loading module %q", name)
+			}
 			return loaded, nil
 		}
 		messages := strings.Builder{}
@@ -577,6 +779,7 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 				continue
 			}
 			loader := results[0]
+			loadedTable.SetSymbol(sym, loadingSentinel)
 			loadedResults, err := machine.CallValue(loader, []rt.Value{args[0]})
 			if err != nil {
 				return rt.NilValue, err
@@ -644,4 +847,65 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 	}))
 	runtime.SetGlobal("debug", rt.HandleValue(debugHandle))
 	return nil
+}
+
+func raiseBaseError(runtime *rt.Runtime, machine *vm.VM, message rt.Value, level int) error {
+	if level > 0 {
+		if text, ok := concatString(runtime, message); ok {
+			if prefix := whereString(machine, level); prefix != "" {
+				message = runtime.StringValue(prefix + text)
+			}
+		}
+	}
+	return raiseValueError(runtime, message)
+}
+
+func whereString(machine *vm.VM, level int) string {
+	info, ok := machine.DebugInfoForLevel(nil, level)
+	if !ok || info.CurrentLine <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d: ", info.ShortSource, info.CurrentLine)
+}
+
+func resolveBaseFenvTarget(machine *vm.VM, args []rt.Value, optional bool) (rt.Value, bool, error) {
+	if len(args) == 0 {
+		if !optional {
+			return rt.NilValue, false, fmt.Errorf("function or level expected")
+		}
+		value, tailCall, err := machine.FunctionValueForLevel(nil, 1)
+		if err != nil {
+			return rt.NilValue, false, err
+		}
+		if tailCall {
+			return rt.NilValue, false, fmt.Errorf("no function environment for tail call at level %d", 1)
+		}
+		return value, false, nil
+	}
+	if len(args) != 1 {
+		return rt.NilValue, false, fmt.Errorf("function or level expected")
+	}
+	arg := args[0]
+	if arg.IsNumber() {
+		level := int(arg.Number())
+		if level < 0 {
+			return rt.NilValue, false, fmt.Errorf("level must be non-negative")
+		}
+		if level == 0 {
+			return rt.NilValue, true, nil
+		}
+		value, tailCall, err := machine.FunctionValueForLevel(nil, level)
+		if err != nil {
+			return rt.NilValue, false, err
+		}
+		if tailCall {
+			return rt.NilValue, false, fmt.Errorf("no function environment for tail call at level %d", level)
+		}
+		return value, false, nil
+	}
+	h, ok := arg.Handle()
+	if !ok || (h.Kind() != rt.ObjectLuaClosure && h.Kind() != rt.ObjectHostFunction) {
+		return rt.NilValue, false, fmt.Errorf("function or level expected")
+	}
+	return arg, false, nil
 }

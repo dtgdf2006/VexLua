@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"time"
 
 	"vexlua"
@@ -185,12 +186,18 @@ return sum
 
 func must(err error) {
 	if err != nil {
+		if code, ok := vexlua.ExitCode(err); ok {
+			os.Exit(code)
+		}
 		panic(err)
 	}
 }
 
 func mustValue(v vexlua.Value, err error) vexlua.Value {
 	if err != nil {
+		if code, ok := vexlua.ExitCode(err); ok {
+			os.Exit(code)
+		}
 		panic(err)
 	}
 	return v

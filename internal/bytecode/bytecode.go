@@ -64,6 +64,7 @@ type UpvalueDesc struct {
 
 type LocalVar struct {
 	Name    string
+	Slot    int
 	StartPC int
 	EndPC   int
 }

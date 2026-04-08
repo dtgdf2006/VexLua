@@ -197,6 +197,41 @@ return type(proxy), proxy2.answer, n.answer, getmetatable(proxy2) == meta`,
 			Expectation: ExpectMatch,
 		},
 		{
+			Name:  "nil_metatable_debug_support",
+			Notes: "debug.setmetatable(nil, ...) 应该驱动 nil 的 __index/__newindex/__tostring 与保护元表语义",
+			Source: `local sink = {}
+local raw = {
+	__metatable = "nil-locked",
+	__index = function(value, key)
+		if value == nil and key == "answer" then
+			return 42
+		end
+	end,
+	__newindex = function(value, key, assigned)
+		sink[key] = assigned
+	end,
+	__tostring = function(value)
+		if value == nil then
+			return "nil-meta"
+		end
+		return "unexpected"
+	end,
+}
+debug.setmetatable(nil, raw)
+local probe = nil
+probe.written = 7
+local read = (function()
+	local value = nil
+	return value.answer
+end)()
+local visible = getmetatable(nil)
+local direct = debug.getmetatable(nil)
+local printed = tostring(nil)
+debug.setmetatable(nil, nil)
+return visible, direct == raw, read, sink.written, printed, getmetatable(nil) == nil, debug.getmetatable(nil) == nil`,
+			Expectation: ExpectMatch,
+		},
+		{
 			Name:  "userdata_env_and_debug_info",
 			Notes: "userdata environment、debug.getinfo/getupvalue/setupvalue/getregistry",
 			Source: `local proxy = newproxy(true)
@@ -471,7 +506,7 @@ carrot five
 		},
 		{
 			Name:          "official_trace_calls_script",
-			Notes:         "official trace-calls.lua 需要 debug.sethook call/return hook",
+			Notes:         "official trace-calls.lua 的 debug hook stdout",
 			SourceFile:    officialScript("trace-calls.lua"),
 			CaptureStdout: true,
 			Postlude: `local function leaf(v)
@@ -481,14 +516,14 @@ local function branch(v)
 	return leaf(v)
 end
 branch(41)`,
-			Expectation: ExpectKnownMismatch,
+			Expectation: ExpectMatch,
 		},
 		{
 			Name:          "official_trace_globals_script",
-			Notes:         "official trace-globals.lua 的 stdout（当前 debug.getinfo 缺少 Lua 5.1 风格行号信息）",
+			Notes:         "official trace-globals.lua 的 stdout",
 			SourceFile:    officialScript("trace-globals.lua"),
 			CaptureStdout: true,
-			Expectation:   ExpectKnownMismatch,
+			Expectation:   ExpectMatch,
 		},
 		{
 			Name:          "official_xd_script",

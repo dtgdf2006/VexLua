@@ -52,6 +52,10 @@ type callFrame struct {
 	base            int
 	stackSize       int
 	pc              int
+	tailCalls       int
+	tailLoss        int
+	lastHookLine    int
+	lastHookPC      int
 	returnReg       int
 	returnCount     int
 	openCount       int
@@ -208,20 +212,25 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 		frame := co.frames[len(co.frames)-1]
 		proto := frame.closure.Proto
 		state := m.stateFor(proto)
+		if err := m.maybeDispatchStepHooks(co, frame); err != nil {
+			return nil, err
+		}
 		if frame.pc == 0 {
 			state.runs++
-			if err := m.maybeCompile(state, proto); err != nil {
-				return nil, err
-			}
-			if state.compiled != nil {
-				result, err := state.compiled.Run(frame.regs)
-				if err != nil {
+			if !co.hook.enabled() {
+				if err := m.maybeCompile(state, proto); err != nil {
 					return nil, err
 				}
-				if err := m.returnFromFrame(co, []rt.Value{result}); err != nil {
-					return nil, err
+				if state.compiled != nil {
+					result, err := state.compiled.Run(frame.regs)
+					if err != nil {
+						return nil, err
+					}
+					if err := m.returnFromFrame(co, []rt.Value{result}); err != nil {
+						return nil, err
+					}
+					continue
 				}
-				continue
 			}
 		}
 		if frame.pc >= len(proto.Code) {
@@ -682,6 +691,10 @@ func (m *VM) pushFrame(co *Coroutine, closure *LuaClosure, args []rt.Value, retu
 
 func (m *VM) tailCallFrame(co *Coroutine, frame *callFrame, closure *LuaClosure, args []rt.Value) {
 	boundArgs := append([]rt.Value(nil), args...)
+	if len(co.frames) > 1 {
+		co.frames[len(co.frames)-2].tailCalls++
+		frame.tailLoss++
+	}
 	frame.closeUpvalues()
 	co.stackTop = frame.base
 	frame.closure = closure
@@ -700,6 +713,9 @@ func (m *VM) tailCallFrame(co *Coroutine, frame *callFrame, closure *LuaClosure,
 	frame.tailPending = false
 	frame.tailHookEvent = ""
 	frame.skipTailUnwind = false
+	frame.tailCalls = 0
+	frame.lastHookLine = -1
+	frame.lastHookPC = -1
 	if len(frame.openUpvalues) != closure.Proto.MaxStack {
 		frame.openUpvalues = make([]*upvalue, closure.Proto.MaxStack)
 	} else {
@@ -742,6 +758,7 @@ func (m *VM) returnFromFrame(co *Coroutine, results []rt.Value) error {
 	returnReg := frame.returnReg
 	returnCount := frame.returnCount
 	skipTailUnwind := frame.skipTailUnwind
+	tailLoss := frame.tailLoss
 	frameInfo := m.debugInfoForFrame(frame)
 	callerInfo := (*DebugInfo)(nil)
 	if len(co.frames) > 1 {
@@ -760,6 +777,13 @@ func (m *VM) returnFromFrame(co *Coroutine, results []rt.Value) error {
 		}
 	}
 	frame.closeUpvalues()
+	if len(co.frames) > 1 && tailLoss > 0 {
+		caller := co.frames[len(co.frames)-2]
+		caller.tailCalls -= tailLoss
+		if caller.tailCalls < 0 {
+			caller.tailCalls = 0
+		}
+	}
 	co.frames = co.frames[:len(co.frames)-1]
 	co.stackTop = frame.base
 	if len(co.frames) == 0 {
@@ -857,6 +881,10 @@ func (m *VM) acquireFrame(co *Coroutine, closure *LuaClosure, returnReg int, ret
 	frame.stackSize = closure.Proto.MaxStack
 	frame.regs = m.reserveRegisterWindow(co, frame.base, frame.stackSize)
 	frame.pc = 0
+	frame.tailCalls = 0
+	frame.tailLoss = 0
+	frame.lastHookLine = -1
+	frame.lastHookPC = -1
 	frame.returnReg = returnReg
 	frame.returnCount = returnCount
 	frame.openCount = 0
@@ -883,6 +911,10 @@ func (m *VM) releaseFrame(frame *callFrame) {
 	frame.stackSize = 0
 	frame.closure = nil
 	frame.pc = 0
+	frame.tailCalls = 0
+	frame.tailLoss = 0
+	frame.lastHookLine = -1
+	frame.lastHookPC = -1
 	frame.returnReg = 0
 	frame.returnCount = 0
 	frame.openCount = 0

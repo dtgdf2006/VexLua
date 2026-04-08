@@ -33,6 +33,7 @@ func (rt *Runtime) CollectGarbage(extraRoots []Value) []Value {
 	}
 	gc.markValue(HandleValue(rt.globals))
 	gc.markValue(HandleValue(rt.registry))
+	gc.markValue(rt.nilMeta)
 	gc.markValue(rt.stringMeta)
 	gc.markValue(rt.numberMeta)
 	gc.markValue(rt.boolMeta)

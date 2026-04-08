@@ -39,7 +39,10 @@ func registerDebug(runtime *rt.Runtime, machine *vm.VM) error {
 			return rt.NilValue, err
 		}
 		if nextArg >= len(args) {
-			return rt.NilValue, fmt.Errorf("debug.sethook expects function or nil")
+			if err := machine.SetHook(co, rt.NilValue, "", 0); err != nil {
+				return rt.NilValue, err
+			}
+			return rt.NilValue, nil
 		}
 		hook := args[nextArg]
 		nextArg++
@@ -63,6 +66,17 @@ func registerDebug(runtime *rt.Runtime, machine *vm.VM) error {
 			return rt.NilValue, err
 		}
 		return rt.NilValue, nil
+	}))
+	debugTable.SetSymbol(runtime.InternSymbol("gethook"), runtime.NewHostFunctionMulti("debug.gethook", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		co, nextArg, err := debugCoroutineArg(runtime, args)
+		if err != nil {
+			return nil, err
+		}
+		if nextArg != len(args) {
+			return nil, fmt.Errorf("debug.gethook expects no arguments")
+		}
+		hook, mask, count := machine.GetHook(co)
+		return []rt.Value{hook, runtime.StringValue(mask), rt.NumberValue(float64(count))}, nil
 	}))
 	debugTable.SetSymbol(runtime.InternSymbol("traceback"), runtime.NewHostFunction("debug.traceback", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		co, nextArg, err := debugCoroutineArg(runtime, args)
@@ -105,6 +119,9 @@ func registerDebug(runtime *rt.Runtime, machine *vm.VM) error {
 			}
 			what = text
 		}
+		if err := validateDebugInfoOptions(what); err != nil {
+			return rt.NilValue, err
+		}
 		var info vm.DebugInfo
 		if args[nextArg].IsNumber() {
 			level := int(args[nextArg].Number())
@@ -121,6 +138,46 @@ func registerDebug(runtime *rt.Runtime, machine *vm.VM) error {
 			info = functionInfo
 		}
 		return debugInfoTable(runtime, info, what), nil
+	}))
+	debugTable.SetSymbol(runtime.InternSymbol("getlocal"), runtime.NewHostFunctionMulti("debug.getlocal", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		co, nextArg, err := debugCoroutineArg(runtime, args)
+		if err != nil {
+			return nil, err
+		}
+		if len(args)-nextArg != 2 {
+			return nil, fmt.Errorf("debug.getlocal expects level and index")
+		}
+		if !args[nextArg].IsNumber() || !args[nextArg+1].IsNumber() {
+			return nil, fmt.Errorf("debug.getlocal expects level and index numbers")
+		}
+		name, value, ok, err := machine.GetLocal(co, int(args[nextArg].Number()), int(args[nextArg+1].Number()))
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return []rt.Value{rt.NilValue}, nil
+		}
+		return []rt.Value{runtime.StringValue(name), value}, nil
+	}))
+	debugTable.SetSymbol(runtime.InternSymbol("setlocal"), runtime.NewHostFunction("debug.setlocal", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		co, nextArg, err := debugCoroutineArg(runtime, args)
+		if err != nil {
+			return rt.NilValue, err
+		}
+		if len(args)-nextArg != 3 {
+			return rt.NilValue, fmt.Errorf("debug.setlocal expects level, index, and value")
+		}
+		if !args[nextArg].IsNumber() || !args[nextArg+1].IsNumber() {
+			return rt.NilValue, fmt.Errorf("debug.setlocal expects level and index numbers")
+		}
+		name, ok, err := machine.SetLocal(co, int(args[nextArg].Number()), int(args[nextArg+1].Number()), args[nextArg+2])
+		if err != nil {
+			return rt.NilValue, err
+		}
+		if !ok {
+			return rt.NilValue, nil
+		}
+		return runtime.StringValue(name), nil
 	}))
 	debugTable.SetSymbol(runtime.InternSymbol("getupvalue"), runtime.NewHostFunctionMulti("debug.getupvalue", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
 		if len(args) != 2 {
@@ -173,6 +230,16 @@ func debugInfoTable(runtime *rt.Runtime, info vm.DebugInfo, what string) rt.Valu
 	table := runtime.Heap().Table(handle)
 	for _, option := range what {
 		switch option {
+		case 'L':
+			if len(info.ActiveLines) == 0 {
+				continue
+			}
+			activelines := runtime.Heap().NewTable(len(info.ActiveLines))
+			activeTable := runtime.Heap().Table(activelines)
+			for _, line := range info.ActiveLines {
+				activeTable.RawSet(rt.NumberValue(float64(line)), rt.TrueValue)
+			}
+			table.SetSymbol(runtime.InternSymbol("activelines"), rt.HandleValue(activelines))
 		case 'f':
 			if info.Function.Kind() != rt.KindNil {
 				table.SetSymbol(runtime.InternSymbol("func"), info.Function)
@@ -197,4 +264,15 @@ func debugInfoTable(runtime *rt.Runtime, info vm.DebugInfo, what string) rt.Valu
 		}
 	}
 	return rt.HandleValue(handle)
+}
+
+func validateDebugInfoOptions(what string) error {
+	for _, option := range what {
+		switch option {
+		case 'f', 'l', 'n', 'S', 'u', 'L':
+		default:
+			return fmt.Errorf("invalid option")
+		}
+	}
+	return nil
 }

@@ -10,6 +10,18 @@ func (m *VM) GlobalEnv() rt.Value {
 	return m.globalEnv()
 }
 
+func (m *VM) CurrentThreadEnv() rt.Value {
+	co := m.currentCoroutine()
+	if co == nil || co.Proxy().Kind() == rt.KindNil {
+		return m.globalEnv()
+	}
+	env, err := m.GetEnv(co.Proxy())
+	if err != nil {
+		return m.globalEnv()
+	}
+	return env
+}
+
 func (m *VM) CurrentEnv() rt.Value {
 	frame := m.currentFrame()
 	if frame == nil {
@@ -30,6 +42,37 @@ func (m *VM) SetCurrentEnv(env rt.Value) error {
 	return nil
 }
 
+func (m *VM) SetCurrentThreadEnv(env rt.Value) error {
+	if err := m.validateEnv(env); err != nil {
+		return err
+	}
+	co := m.currentCoroutine()
+	if co == nil {
+		return fmt.Errorf("setfenv requires an active coroutine")
+	}
+	proxy := co.Proxy()
+	if proxy.Kind() == rt.KindNil {
+		proxy = m.runtime.NewThreadValue(co)
+		co.SetProxy(proxy)
+	}
+	return m.SetEnv(proxy, env)
+}
+
+func (m *VM) FunctionValueForLevel(co *Coroutine, level int) (rt.Value, bool, error) {
+	frame, tailCall, ok := m.debugFrameForLevel(co, level)
+	if !ok {
+		return rt.NilValue, false, fmt.Errorf("invalid level")
+	}
+	if tailCall || frame == nil {
+		return rt.NilValue, true, nil
+	}
+	value, ok := m.runtime.FindLuaClosureValue(frame.closure)
+	if !ok {
+		return rt.NilValue, false, fmt.Errorf("invalid level")
+	}
+	return value, false, nil
+}
+
 func (m *VM) GetFunctionEnv(value rt.Value) (rt.Value, error) {
 	h, ok := value.Handle()
 	if !ok {
@@ -40,7 +83,7 @@ func (m *VM) GetFunctionEnv(value rt.Value) (rt.Value, error) {
 		closure := m.runtime.Heap().LuaClosure(h).(*LuaClosure)
 		return m.envOf(closure), nil
 	case rt.ObjectHostFunction:
-		return m.globalEnv(), nil
+		return m.CurrentThreadEnv(), nil
 	default:
 		return rt.NilValue, fmt.Errorf("getfenv expects function")
 	}
@@ -56,7 +99,7 @@ func (m *VM) GetEnv(value rt.Value) (rt.Value, error) {
 		closure := m.runtime.Heap().LuaClosure(h).(*LuaClosure)
 		return m.envOf(closure), nil
 	case rt.ObjectHostFunction:
-		return m.globalEnv(), nil
+		return m.CurrentThreadEnv(), nil
 	case rt.ObjectThread:
 		thread := m.runtime.Heap().Thread(h)
 		if thread.Env.Kind() == rt.KindNil {

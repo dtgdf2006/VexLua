@@ -50,6 +50,7 @@ type IfClause struct {
 
 type LocalAssignStmt struct {
 	Line   int
+	Names  []string
 	Slots  []int
 	Values []Expr
 }
@@ -99,6 +100,7 @@ type DoStmt struct {
 
 type ForNumericStmt struct {
 	Line  int
+	Name  string
 	Slot  int
 	Start Expr
 	Limit Expr
@@ -108,6 +110,10 @@ type ForNumericStmt struct {
 
 type ForGenericStmt struct {
 	Line         int
+	IteratorName string
+	StateName    string
+	ControlName  string
+	VarNames     []string
 	IteratorSlot int
 	StateSlot    int
 	ControlSlot  int
