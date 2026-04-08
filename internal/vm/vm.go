@@ -167,6 +167,12 @@ func (m *VM) interpret(proto *bytecode.Proto, state *protoState, regs []rt.Value
 			}
 			constant := proto.Constants[instr.D]
 			regs[instr.A] = rt.NumberValue(lhs.Number() + constant.Number())
+		case bytecode.OpUnm:
+			value := regs[instr.B]
+			if !value.IsNumber() {
+				return rt.NilValue, fmt.Errorf("UNM expects numeric operand, got %s", value)
+			}
+			regs[instr.A] = rt.NumberValue(-value.Number())
 		case bytecode.OpCall:
 			argCount := int(instr.D)
 			args := make([]rt.Value, argCount)
@@ -195,6 +201,7 @@ func (m *VM) interpret(proto *bytecode.Proto, state *protoState, regs []rt.Value
 			if lhs.Number() <= rhs.Number() {
 				pc = int(instr.D) - 1
 			}
+		case bytecode.OpClose:
 		case bytecode.OpReturn:
 			return regs[instr.A], nil
 		default:

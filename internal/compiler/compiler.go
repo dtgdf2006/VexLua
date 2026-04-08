@@ -365,12 +365,10 @@ func (c *funcCompiler) compileExprTo(target int, expr ir.Expr) error {
 	case *ir.UnaryExpr:
 		switch e.Op {
 		case "MINUS":
-			zeroReg := c.allocTemp()
-			c.proto.Emit(bytecode.OpLoadConst, uint16(zeroReg), 0, 0, int32(c.zeroConst))
 			if err := c.compileExprTo(target, e.Expr); err != nil {
 				return err
 			}
-			c.proto.Emit(bytecode.OpSub, uint16(target), uint16(zeroReg), uint16(target), 0)
+			c.proto.Emit(bytecode.OpUnm, uint16(target), uint16(target), 0, 0)
 		case "NOT":
 			if err := c.compileExprTo(target, e.Expr); err != nil {
 				return err

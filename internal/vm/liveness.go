@@ -63,6 +63,10 @@ func instructionUseDef(instr bytecode.Instr, maxStack int) ([]uint64, []uint64) 
 		markRegisterRange(use, int(instr.C), 1)
 	case bytecode.OpAppendTable:
 		markRegisterRange(use, int(instr.A), 1)
+		markRegisterRange(use, int(instr.A)+1, int(instr.C))
+	case bytecode.OpUnm:
+		markRegisterRange(use, int(instr.B), 1)
+		markRegisterRange(defs, int(instr.A), 1)
 	case bytecode.OpAdd, bytecode.OpAddNum, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv, bytecode.OpMod, bytecode.OpPow,
 		bytecode.OpConcat, bytecode.OpEqual, bytecode.OpLess, bytecode.OpLessEqual:
 		markRegisterRange(use, int(instr.B), 1)

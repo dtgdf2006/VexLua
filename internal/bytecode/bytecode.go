@@ -54,6 +54,8 @@ const (
 	OpSelfIC
 	OpIterPairs
 	OpIterIPairs
+	OpUnm
+	OpClose
 )
 
 type UpvalueDesc struct {
@@ -216,6 +218,8 @@ func (op Op) String() string {
 		return "VARARG"
 	case OpYield:
 		return "YIELD"
+	case OpUnm:
+		return "UNM"
 	case OpReturn:
 		return "RETURN"
 	case OpReturnMulti:
@@ -238,6 +242,8 @@ func (op Op) String() string {
 		return "ITER_PAIRS"
 	case OpIterIPairs:
 		return "ITER_IPAIRS"
+	case OpClose:
+		return "CLOSE"
 	default:
 		return fmt.Sprintf("OP_%d", op)
 	}

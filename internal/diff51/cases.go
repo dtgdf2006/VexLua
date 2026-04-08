@@ -449,7 +449,7 @@ end`,
 		},
 		{
 			Name:          "official_luac_script",
-			Notes:         "official luac.lua 的 loadfile/string.dump 二进制输出（当前 chunk dump 还未与 Lua 5.1 完全字节对齐）",
+			Notes:         "official luac.lua 的 loadfile/string.dump 二进制输出",
 			SourceFile:    officialScript("luac.lua"),
 			CaptureStdout: true,
 			Args:          []string{"input.lua"},
@@ -466,7 +466,7 @@ for i = 1, string.len(data) do
 	end
 end
 io.write("\n")`,
-			Expectation: ExpectKnownMismatch,
+			Expectation: ExpectMatch,
 		},
 		{
 			Name:          "official_printf_script",

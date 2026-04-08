@@ -406,8 +406,12 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			}
 			table := m.runtime.Heap().Table(h)
 			start := int(instr.B)
+			prefix := int(instr.C)
+			for i := 0; i < prefix; i++ {
+				table.SetIndex(start+i, frame.regs[int(instr.A)+1+i])
+			}
 			for i, value := range frame.pendingResults {
-				table.SetIndex(start+i, value)
+				table.SetIndex(start+prefix+i, value)
 			}
 			frame.pendingResults = frame.pendingResults[:0]
 		case bytecode.OpAdd:
@@ -424,6 +428,17 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			frame.regs[instr.A] = rt.NumberValue(frame.regs[instr.B].Number() + frame.regs[instr.C].Number())
 		case bytecode.OpAddConst:
 			frame.regs[instr.A] = rt.NumberValue(frame.regs[instr.B].Number() + proto.Constants[instr.D].Number())
+		case bytecode.OpUnm:
+			value := frame.regs[instr.B]
+			if value.IsNumber() {
+				frame.regs[instr.A] = rt.NumberValue(-value.Number())
+				continue
+			}
+			result, err := m.callUnaryMetamethod("__unm", value)
+			if err != nil {
+				return nil, err
+			}
+			frame.regs[instr.A] = result
 		case bytecode.OpSub:
 			result, err := m.subValues(frame.regs[instr.B], frame.regs[instr.C])
 			if err != nil {
@@ -658,6 +673,8 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			if lhs.Number() <= rhs.Number() {
 				frame.pc = int(instr.D)
 			}
+		case bytecode.OpClose:
+			frame.closeUpvaluesFrom(int(instr.A))
 		case bytecode.OpReturn:
 			if err := m.returnFromFrame(co, []rt.Value{frame.regs[instr.A]}); err != nil {
 				return nil, err
@@ -844,18 +861,32 @@ func (f *callFrame) captureUpvalue(slot int) *upvalue {
 }
 
 func (f *callFrame) closeUpvalues() {
+	f.closeUpvaluesFrom(0)
+}
+
+func (f *callFrame) closeUpvaluesFrom(start int) {
 	if f.openCount == 0 {
 		return
 	}
-	for i, uv := range f.openUpvalues {
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(f.openUpvalues) {
+		return
+	}
+	for i := start; i < len(f.openUpvalues); i++ {
+		uv := f.openUpvalues[i]
 		if uv != nil && uv.isOpen {
 			uv.closed = uv.stack[uv.index]
 			uv.stack = nil
 			uv.isOpen = false
+			f.openCount--
 		}
 		f.openUpvalues[i] = nil
 	}
-	f.openCount = 0
+	if f.openCount < 0 {
+		f.openCount = 0
+	}
 }
 
 func (m *VM) isCallable(value rt.Value) bool {
