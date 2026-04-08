@@ -84,26 +84,62 @@ func (h hookState) enabled() bool {
 	return h.function.Kind() != rt.KindNil && (h.call || h.ret || h.line || h.count > 0)
 }
 
+func (m *VM) hookCallEnabled(co *Coroutine) bool {
+	return co != nil && !co.hook.running && co.hook.function.Kind() != rt.KindNil && co.hook.call
+}
+
+func (m *VM) hookReturnEnabled(co *Coroutine) bool {
+	return co != nil && !co.hook.running && co.hook.function.Kind() != rt.KindNil && co.hook.ret
+}
+
 func (m *VM) dispatchCallHook(co *Coroutine, target DebugInfo, caller *DebugInfo) error {
 	return m.dispatchHook(co, true, false, "call", nil, target, caller)
+}
+
+func (m *VM) dispatchCallHookForFrames(co *Coroutine, targetFrame *callFrame, callerFrame *callFrame) error {
+	if !m.hookCallEnabled(co) {
+		return nil
+	}
+	return m.dispatchCallHook(co, m.debugInfoForFrameWithOptions(targetFrame, debugInfoOptions{includeActiveLines: true}), m.debugInfoPtrForFrameWithOptions(callerFrame, debugInfoOptions{includeActiveLines: true}))
+}
+
+func (m *VM) dispatchCallHookWithInfo(co *Coroutine, target DebugInfo, caller *DebugInfo) error {
+	if !m.hookCallEnabled(co) {
+		return nil
+	}
+	return m.dispatchCallHook(co, target, caller)
 }
 
 func (m *VM) dispatchReturnHook(co *Coroutine, event string, target DebugInfo, caller *DebugInfo) error {
 	return m.dispatchHook(co, false, true, event, nil, target, caller)
 }
 
+func (m *VM) dispatchReturnHookForFrames(co *Coroutine, event string, targetFrame *callFrame, callerFrame *callFrame) error {
+	if !m.hookReturnEnabled(co) {
+		return nil
+	}
+	return m.dispatchReturnHook(co, event, m.debugInfoForFrameWithOptions(targetFrame, debugInfoOptions{includeActiveLines: true}), m.debugInfoPtrForFrameWithOptions(callerFrame, debugInfoOptions{includeActiveLines: true}))
+}
+
+func (m *VM) dispatchReturnHookWithInfo(co *Coroutine, event string, target DebugInfo, caller *DebugInfo) error {
+	if !m.hookReturnEnabled(co) {
+		return nil
+	}
+	return m.dispatchReturnHook(co, event, target, caller)
+}
+
 func (m *VM) dispatchLineHook(co *Coroutine, frame *callFrame, line int) error {
-	target := m.debugInfoForFrame(frame)
+	target := m.debugInfoForFrameWithOptions(frame, debugInfoOptions{includeActiveLines: true})
 	target.CurrentLine = line
-	return m.dispatchHook(co, false, false, "line", &line, target, m.debugCallerInfo(co, frame))
+	return m.dispatchHook(co, false, false, "line", &line, target, m.debugCallerInfoWithOptions(co, frame, debugInfoOptions{includeActiveLines: true}))
 }
 
 func (m *VM) dispatchCountHook(co *Coroutine, frame *callFrame) error {
-	target := m.debugInfoForFrame(frame)
+	target := m.debugInfoForFrameWithOptions(frame, debugInfoOptions{includeActiveLines: true})
 	if line := nextLineForFrame(frame); line >= 0 {
 		target.CurrentLine = line
 	}
-	return m.dispatchHook(co, false, false, "count", nil, target, m.debugCallerInfo(co, frame))
+	return m.dispatchHook(co, false, false, "count", nil, target, m.debugCallerInfoWithOptions(co, frame, debugInfoOptions{includeActiveLines: true}))
 }
 
 func (m *VM) maybeDispatchStepHooks(co *Coroutine, frame *callFrame) error {
@@ -176,14 +212,22 @@ func (m *VM) dispatchHook(co *Coroutine, wantCall bool, wantReturn bool, event s
 }
 
 func (m *VM) debugInfoPtrForFrame(frame *callFrame) *DebugInfo {
+	return m.debugInfoPtrForFrameWithOptions(frame, debugInfoOptions{})
+}
+
+func (m *VM) debugInfoPtrForFrameWithOptions(frame *callFrame, options debugInfoOptions) *DebugInfo {
 	if frame == nil {
 		return nil
 	}
-	info := m.debugInfoForFrame(frame)
+	info := m.debugInfoForFrameWithOptions(frame, options)
 	return &info
 }
 
 func (m *VM) debugCallerInfo(co *Coroutine, frame *callFrame) *DebugInfo {
+	return m.debugCallerInfoWithOptions(co, frame, debugInfoOptions{})
+}
+
+func (m *VM) debugCallerInfoWithOptions(co *Coroutine, frame *callFrame, options debugInfoOptions) *DebugInfo {
 	if co == nil || frame == nil {
 		return nil
 	}
@@ -194,7 +238,7 @@ func (m *VM) debugCallerInfo(co *Coroutine, frame *callFrame) *DebugInfo {
 		if index == 0 {
 			return nil
 		}
-		return m.debugInfoPtrForFrame(co.frames[index-1])
+		return m.debugInfoPtrForFrameWithOptions(co.frames[index-1], options)
 	}
 	return nil
 }

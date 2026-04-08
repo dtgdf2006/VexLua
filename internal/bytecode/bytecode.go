@@ -22,7 +22,9 @@ const (
 	OpGetFieldIC
 	OpSetField
 	OpGetTable
+	OpGetTableArray
 	OpSetTable
+	OpSetTableArray
 	OpAppendTable
 	OpAdd
 	OpAddNum
@@ -33,6 +35,7 @@ const (
 	OpMod
 	OpPow
 	OpLen
+	OpLenTable
 	OpConcat
 	OpEqual
 	OpLess
@@ -176,8 +179,12 @@ func (op Op) String() string {
 		return "SET_FIELD"
 	case OpGetTable:
 		return "GET_TABLE"
+	case OpGetTableArray:
+		return "GET_TABLE_ARRAY"
 	case OpSetTable:
 		return "SET_TABLE"
+	case OpSetTableArray:
+		return "SET_TABLE_ARRAY"
 	case OpAppendTable:
 		return "APPEND_TABLE"
 	case OpAdd:
@@ -198,6 +205,8 @@ func (op Op) String() string {
 		return "POW"
 	case OpLen:
 		return "LEN"
+	case OpLenTable:
+		return "LEN_TABLE"
 	case OpConcat:
 		return "CONCAT"
 	case OpEqual:

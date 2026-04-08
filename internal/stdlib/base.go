@@ -173,8 +173,11 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		}
 		return []rt.Value{rt.FalseValue, handled[0]}, nil
 	}))
-	if err := bind(runtime, "rawget", func(target rt.Value, key rt.Value) (rt.Value, error) {
-		value, found, err := rawTableGet(runtime, target, key)
+	runtime.SetGlobal("rawget", runtime.NewHostFunction("rawget", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) != 2 {
+			return rt.NilValue, fmt.Errorf("rawget expects table and key")
+		}
+		value, found, err := rawTableGet(runtime, args[0], args[1])
 		if err != nil {
 			return rt.NilValue, err
 		}
@@ -182,17 +185,16 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 			return rt.NilValue, nil
 		}
 		return value, nil
-	}); err != nil {
-		return err
-	}
-	if err := bind(runtime, "rawset", func(target rt.Value, key rt.Value, value rt.Value) (rt.Value, error) {
-		if err := rawTableSet(runtime, target, key, value); err != nil {
+	}))
+	runtime.SetGlobal("rawset", runtime.NewHostFunction("rawset", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) != 3 {
+			return rt.NilValue, fmt.Errorf("rawset expects table, key, value")
+		}
+		if err := rawTableSet(runtime, args[0], args[1], args[2]); err != nil {
 			return rt.NilValue, err
 		}
-		return target, nil
-	}); err != nil {
-		return err
-	}
+		return args[0], nil
+	}))
 	if err := bind(runtime, "rawequal", func(lhs rt.Value, rhs rt.Value) bool {
 		return lhs == rhs
 	}); err != nil {
@@ -522,15 +524,16 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		if len(args) != 2 {
 			return nil, fmt.Errorf("ipairs iterator expects 2 arguments")
 		}
+		tbl, err := asTable(runtime, args[0])
+		if err != nil {
+			return nil, err
+		}
 		index := 0
 		if args[1].IsNumber() {
 			index = int(args[1].Number())
 		}
 		index++
-		value, found, err := runtime.GetTable(args[0], rt.NumberValue(float64(index)))
-		if err != nil {
-			return nil, err
-		}
+		value, found := tbl.GetIndex(index)
 		if !found || value.Kind() == rt.KindNil {
 			return []rt.Value{rt.NilValue}, nil
 		}

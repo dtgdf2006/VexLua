@@ -3,11 +3,33 @@ package stdlib
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"vexlua/internal/chunk51"
 	rt "vexlua/internal/runtime"
 	"vexlua/internal/vm"
 )
+
+const (
+	stringGSubReplacementLiteral = -2
+	stringGSubReplacementFull    = -1
+)
+
+type stringGSubReplacementPart struct {
+	literal      string
+	captureIndex int
+}
+
+type stringGSubReplacementPlan struct {
+	parts []stringGSubReplacementPart
+}
+
+type stringGSubStaticReplacement struct {
+	literal string
+	plan    *stringGSubReplacementPlan
+}
+
+var stringGSubReplacementCache sync.Map
 
 func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 	handle := runtime.Heap().NewTable(8)
@@ -285,6 +307,25 @@ func stringFind(runtime *rt.Runtime, s string, pattern string, start int, plain 
 		return nil, err
 	}
 	start = luaStringStart(len(s), start)
+	if searcher.re != nil {
+		indices := searcher.findRegexIndices(s, start-1)
+		if indices == nil {
+			return []rt.Value{rt.NilValue}, nil
+		}
+		results := make([]rt.Value, 2+searcher.captures)
+		results[0] = rt.NumberValue(float64(indices[0] + 1))
+		results[1] = rt.NumberValue(float64(indices[1]))
+		for i := 0; i < searcher.captures; i++ {
+			captureStart := indices[2+i*2]
+			captureEnd := indices[3+i*2]
+			if captureStart < 0 {
+				results[2+i] = runtime.StringValue("")
+				continue
+			}
+			results[2+i] = runtime.StringValue(s[captureStart:captureEnd])
+		}
+		return results, nil
+	}
 	match, err := searcher.find(s, start-1)
 	if err != nil {
 		return nil, err
@@ -292,12 +333,11 @@ func stringFind(runtime *rt.Runtime, s string, pattern string, start int, plain 
 	if match == nil {
 		return []rt.Value{rt.NilValue}, nil
 	}
-	results := []rt.Value{
-		rt.NumberValue(float64(match.start + 1)),
-		rt.NumberValue(float64(match.end)),
-	}
-	for _, capture := range match.captures {
-		results = append(results, stringCaptureToValue(runtime, capture))
+	results := make([]rt.Value, 2+len(match.captures))
+	results[0] = rt.NumberValue(float64(match.start + 1))
+	results[1] = rt.NumberValue(float64(match.end))
+	for i, capture := range match.captures {
+		results[2+i] = stringCaptureToValue(runtime, capture)
 	}
 	return results, nil
 }
@@ -308,6 +348,26 @@ func stringMatch(runtime *rt.Runtime, s string, pattern string, start int) ([]rt
 		return nil, err
 	}
 	start = luaStringStart(len(s), start)
+	if searcher.re != nil {
+		indices := searcher.findRegexIndices(s, start-1)
+		if indices == nil {
+			return []rt.Value{rt.NilValue}, nil
+		}
+		if searcher.captures == 0 {
+			return []rt.Value{runtime.StringValue(s[indices[0]:indices[1]])}, nil
+		}
+		results := make([]rt.Value, searcher.captures)
+		for i := 0; i < searcher.captures; i++ {
+			captureStart := indices[2+i*2]
+			captureEnd := indices[3+i*2]
+			if captureStart < 0 {
+				results[i] = runtime.StringValue("")
+				continue
+			}
+			results[i] = runtime.StringValue(s[captureStart:captureEnd])
+		}
+		return results, nil
+	}
 	match, err := searcher.find(s, start-1)
 	if err != nil {
 		return nil, err
@@ -360,9 +420,22 @@ func stringGSub(runtime *rt.Runtime, machine *vm.VM, s string, pattern string, r
 	if limit == 0 {
 		return []rt.Value{runtime.StringValue(s), rt.NumberValue(0)}, nil
 	}
+	staticReplacement, hasStaticReplacement, err := compileStringGSubStaticReplacement(runtime, repl)
+	if err != nil {
+		return nil, err
+	}
+	if hasStaticReplacement {
+		if searcher.plain && searcher.literal != "" {
+			return stringGSubPlainStatic(runtime, s, searcher.literal, staticReplacement, limit), nil
+		}
+		if searcher.re != nil {
+			return stringGSubRegexStatic(runtime, s, searcher, staticReplacement, limit), nil
+		}
+	}
 	count := 0
 	position := 0
 	var builder strings.Builder
+	builder.Grow(len(s))
 	for position <= len(s) && limit != 0 {
 		match, err := searcher.find(s, position)
 		if err != nil {
@@ -373,14 +446,18 @@ func stringGSub(runtime *rt.Runtime, machine *vm.VM, s string, pattern string, r
 		}
 		full := s[match.start:match.end]
 		builder.WriteString(s[position:match.start])
-		replacement, replace, err := stringGSubReplacement(runtime, machine, repl, full, match.captures)
-		if err != nil {
-			return nil, err
-		}
-		if replace {
-			builder.WriteString(replacement)
+		if hasStaticReplacement {
+			staticReplacement.appendTo(&builder, full, match.captures)
 		} else {
-			builder.WriteString(full)
+			replacement, replace, err := stringGSubReplacement(runtime, machine, repl, full, match.captures)
+			if err != nil {
+				return nil, err
+			}
+			if replace {
+				builder.WriteString(replacement)
+			} else {
+				builder.WriteString(full)
+			}
 		}
 		count++
 		if limit > 0 {
@@ -401,6 +478,65 @@ func stringGSub(runtime *rt.Runtime, machine *vm.VM, s string, pattern string, r
 		builder.WriteString(s[position:])
 	}
 	return []rt.Value{runtime.StringValue(builder.String()), rt.NumberValue(float64(count))}, nil
+}
+
+func stringGSubPlainStatic(runtime *rt.Runtime, s string, literal string, replacement *stringGSubStaticReplacement, limit int) []rt.Value {
+	count := 0
+	position := 0
+	var builder strings.Builder
+	builder.Grow(len(s))
+	for position <= len(s) && limit != 0 {
+		index := strings.Index(s[position:], literal)
+		if index < 0 {
+			break
+		}
+		matchStart := position + index
+		matchEnd := matchStart + len(literal)
+		builder.WriteString(s[position:matchStart])
+		replacement.appendTo(&builder, s[matchStart:matchEnd], nil)
+		count++
+		if limit > 0 {
+			limit--
+		}
+		position = matchEnd
+	}
+	builder.WriteString(s[position:])
+	return []rt.Value{runtime.StringValue(builder.String()), rt.NumberValue(float64(count))}
+}
+
+func stringGSubRegexStatic(runtime *rt.Runtime, s string, searcher *stringPattern, replacement *stringGSubStaticReplacement, limit int) []rt.Value {
+	count := 0
+	position := 0
+	var builder strings.Builder
+	builder.Grow(len(s))
+	for position <= len(s) && limit != 0 {
+		indices := searcher.findRegexIndices(s, position)
+		if indices == nil {
+			break
+		}
+		matchStart := indices[0]
+		matchEnd := indices[1]
+		builder.WriteString(s[position:matchStart])
+		replacement.appendRegexTo(&builder, s, indices)
+		count++
+		if limit > 0 {
+			limit--
+		}
+		if matchEnd == matchStart {
+			if matchEnd < len(s) {
+				builder.WriteByte(s[matchEnd])
+				position = matchEnd + 1
+				continue
+			}
+			position = len(s) + 1
+			break
+		}
+		position = matchEnd
+	}
+	if position <= len(s) {
+		builder.WriteString(s[position:])
+	}
+	return []rt.Value{runtime.StringValue(builder.String()), rt.NumberValue(float64(count))}
 }
 
 func stringGSubReplacement(runtime *rt.Runtime, machine *vm.VM, repl rt.Value, full string, captures []stringPatternCapture) (string, bool, error) {
@@ -459,32 +595,134 @@ func stringGSubReplacement(runtime *rt.Runtime, machine *vm.VM, repl rt.Value, f
 	}
 }
 
+func compileStringGSubStaticReplacement(runtime *rt.Runtime, repl rt.Value) (*stringGSubStaticReplacement, bool, error) {
+	if s, ok := runtime.ToString(repl); ok {
+		if !strings.Contains(s, "%") {
+			return &stringGSubStaticReplacement{literal: s}, true, nil
+		}
+		plan, err := compileStringGSubReplacementPlan(s)
+		if err != nil {
+			return nil, false, err
+		}
+		return &stringGSubStaticReplacement{plan: plan}, true, nil
+	}
+	if repl.IsNumber() {
+		return &stringGSubStaticReplacement{literal: rt.FormatNumber(repl.Number())}, true, nil
+	}
+	return nil, false, nil
+}
+
+func (replacement *stringGSubStaticReplacement) appendTo(builder *strings.Builder, full string, captures []stringPatternCapture) {
+	if replacement == nil {
+		return
+	}
+	if replacement.plan == nil {
+		builder.WriteString(replacement.literal)
+		return
+	}
+	replacement.plan.appendTo(builder, full, captures)
+}
+
+func (replacement *stringGSubStaticReplacement) appendRegexTo(builder *strings.Builder, subject string, indices []int) {
+	if replacement == nil {
+		return
+	}
+	if replacement.plan == nil {
+		builder.WriteString(replacement.literal)
+		return
+	}
+	replacement.plan.appendRegexTo(builder, subject, indices)
+}
+
 func expandStringGSubReplacement(template string, full string, captures []stringPatternCapture) (string, error) {
+	plan, err := compileStringGSubReplacementPlan(template)
+	if err != nil {
+		return "", err
+	}
 	var builder strings.Builder
+	plan.appendTo(&builder, full, captures)
+	return builder.String(), nil
+}
+
+func compileStringGSubReplacementPlan(template string) (*stringGSubReplacementPlan, error) {
+	if cached, ok := stringGSubReplacementCache.Load(template); ok {
+		return cached.(*stringGSubReplacementPlan), nil
+	}
+	parts := make([]stringGSubReplacementPart, 0, 4)
+	literalStart := 0
 	for i := 0; i < len(template); i++ {
 		if template[i] != '%' {
-			builder.WriteByte(template[i])
 			continue
 		}
+		if literalStart < i {
+			parts = append(parts, stringGSubReplacementPart{literal: template[literalStart:i], captureIndex: stringGSubReplacementLiteral})
+		}
 		if i+1 >= len(template) {
-			return "", fmt.Errorf("invalid use of '%%' in replacement string")
+			return nil, fmt.Errorf("invalid use of '%%' in replacement string")
 		}
 		i++
 		switch next := template[i]; {
 		case next == '%':
-			builder.WriteByte('%')
+			parts = append(parts, stringGSubReplacementPart{literal: "%", captureIndex: stringGSubReplacementLiteral})
 		case next == '0':
-			builder.WriteString(full)
+			parts = append(parts, stringGSubReplacementPart{captureIndex: stringGSubReplacementFull})
 		case next >= '1' && next <= '9':
-			index := int(next - '1')
-			if index < len(captures) {
-				builder.WriteString(stringCaptureToString(captures[index]))
-			}
+			parts = append(parts, stringGSubReplacementPart{captureIndex: int(next - '1')})
 		default:
-			return "", fmt.Errorf("invalid capture index %%%c in replacement string", next)
+			return nil, fmt.Errorf("invalid capture index %%%c in replacement string", next)
+		}
+		literalStart = i + 1
+	}
+	if literalStart < len(template) {
+		parts = append(parts, stringGSubReplacementPart{literal: template[literalStart:], captureIndex: stringGSubReplacementLiteral})
+	}
+	plan := &stringGSubReplacementPlan{parts: parts}
+	actual, _ := stringGSubReplacementCache.LoadOrStore(template, plan)
+	return actual.(*stringGSubReplacementPlan), nil
+}
+
+func (plan *stringGSubReplacementPlan) appendTo(builder *strings.Builder, full string, captures []stringPatternCapture) {
+	if plan == nil {
+		return
+	}
+	for _, part := range plan.parts {
+		switch part.captureIndex {
+		case stringGSubReplacementLiteral:
+			builder.WriteString(part.literal)
+		case stringGSubReplacementFull:
+			builder.WriteString(full)
+		default:
+			if part.captureIndex >= 0 && part.captureIndex < len(captures) {
+				builder.WriteString(stringCaptureToString(captures[part.captureIndex]))
+			}
 		}
 	}
-	return builder.String(), nil
+}
+
+func (plan *stringGSubReplacementPlan) appendRegexTo(builder *strings.Builder, subject string, indices []int) {
+	if plan == nil || len(indices) < 2 {
+		return
+	}
+	fullStart := indices[0]
+	fullEnd := indices[1]
+	for _, part := range plan.parts {
+		switch part.captureIndex {
+		case stringGSubReplacementLiteral:
+			builder.WriteString(part.literal)
+		case stringGSubReplacementFull:
+			builder.WriteString(subject[fullStart:fullEnd])
+		default:
+			captureOffset := 2 + part.captureIndex*2
+			if captureOffset+1 >= len(indices) {
+				continue
+			}
+			captureStart := indices[captureOffset]
+			captureEnd := indices[captureOffset+1]
+			if captureStart >= 0 {
+				builder.WriteString(subject[captureStart:captureEnd])
+			}
+		}
+	}
 }
 
 func stringFormat(runtime *rt.Runtime, format string, args []rt.Value) (string, error) {

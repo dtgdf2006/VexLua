@@ -123,7 +123,10 @@ func (m *VM) frameLiveRegs(frame *callFrame) []uint64 {
 	if frame == nil || frame.closure == nil || frame.closure.Proto == nil {
 		return nil
 	}
-	state := m.stateFor(frame.closure.Proto)
+	state := frame.state
+	if state == nil {
+		state = m.stateFor(frame.closure.Proto)
+	}
 	if frame.pc < 0 || frame.pc >= len(state.liveRegs) {
 		return nil
 	}

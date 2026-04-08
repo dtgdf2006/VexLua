@@ -58,7 +58,11 @@ func (t *Table) GetSlot(slot uint32) (Value, bool) {
 	if int(slot) >= len(t.fields) {
 		return NilValue, false
 	}
-	return t.fields[slot], true
+	value := t.fields[slot]
+	if value.Kind() == KindNil {
+		return NilValue, false
+	}
+	return value, true
 }
 
 func (t *Table) GetSymbol(sym uint32) (Value, uint32, bool) {
@@ -69,7 +73,11 @@ func (t *Table) GetSymbol(sym uint32) (Value, uint32, bool) {
 	if int(slot) >= len(t.fields) {
 		return NilValue, 0, false
 	}
-	return t.fields[slot], slot, true
+	value := t.fields[slot]
+	if value.Kind() == KindNil {
+		return NilValue, slot, false
+	}
+	return value, slot, true
 }
 
 func (t *Table) SetSymbol(sym uint32, v Value) uint32 {
@@ -77,6 +85,7 @@ func (t *Table) SetSymbol(sym uint32, v Value) uint32 {
 		if int(slot) >= len(t.fields) {
 			grown := make([]Value, int(slot)+1)
 			copy(grown, t.fields)
+			fillNilValues(grown[len(t.fields):])
 			t.fields = grown
 		}
 		t.fields[slot] = v
@@ -92,29 +101,81 @@ func (t *Table) SetSymbol(sym uint32, v Value) uint32 {
 	return slot
 }
 
+func growArrayCapacity(current int, required int) int {
+	if required <= current {
+		return current
+	}
+	if current < 1 {
+		current = 1
+	}
+	newCap := current
+	for newCap < required {
+		if newCap < 1024 {
+			newCap *= 2
+		} else {
+			newCap += newCap / 2
+		}
+	}
+	return newCap
+}
+
+func fillNilValues(values []Value) {
+	for i := range values {
+		values[i] = NilValue
+	}
+}
+
+func (t *Table) ensureArrayLength(index int) {
+	if index <= len(t.array) {
+		return
+	}
+	if index > cap(t.array) {
+		grown := make([]Value, len(t.array), growArrayCapacity(cap(t.array), index))
+		copy(grown, t.array)
+		t.array = grown
+	}
+	oldLen := len(t.array)
+	t.array = t.array[:index]
+	fillNilValues(t.array[oldLen:index])
+}
+
+func (t *Table) trimArrayTail() {
+	newLen := len(t.array)
+	for newLen > 0 && t.array[newLen-1].Kind() == KindNil {
+		newLen--
+	}
+	t.array = t.array[:newLen]
+}
+
 func (t *Table) SetIndex(index int, v Value) {
 	if index <= 0 {
 		t.hash[uint64(index)] = v
 		t.version++
 		return
 	}
-	if index > cap(t.array) {
-		newArray := make([]Value, index)
-		copy(newArray, t.array)
-		t.array = newArray
+	if index > len(t.array) && v.Kind() == KindNil {
+		return
 	}
-	if index > len(t.array) {
-		t.array = t.array[:index]
-	}
+	t.ensureArrayLength(index)
 	t.array[index-1] = v
+	if v.Kind() == KindNil {
+		t.trimArrayTail()
+	}
 	t.version++
 }
 
 func (t *Table) GetIndex(index int) (Value, bool) {
 	if index > 0 && index <= len(t.array) {
-		return t.array[index-1], true
+		value := t.array[index-1]
+		if value.Kind() == KindNil {
+			return NilValue, false
+		}
+		return value, true
 	}
 	v, ok := t.hash[uint64(index)]
+	if ok && v.Kind() == KindNil {
+		return NilValue, false
+	}
 	return v, ok
 }
 
@@ -161,6 +222,9 @@ func (t *Table) RawGet(key Value) (Value, bool) {
 		}
 	}
 	v, ok := t.hash[uint64(key)]
+	if ok && v.Kind() == KindNil {
+		return NilValue, false
+	}
 	return v, ok
 }
 

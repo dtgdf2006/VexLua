@@ -3,10 +3,28 @@ package stdlib
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	rt "vexlua/internal/runtime"
 	"vexlua/internal/vm"
 )
+
+var tableSortValuePool sync.Pool
+
+func borrowTableSortValues(size int) []rt.Value {
+	if cached := tableSortValuePool.Get(); cached != nil {
+		values := cached.([]rt.Value)
+		if cap(values) >= size {
+			return values[:size]
+		}
+	}
+	return make([]rt.Value, size)
+}
+
+func releaseTableSortValues(values []rt.Value) {
+	clear(values)
+	tableSortValuePool.Put(values[:0])
+}
 
 func registerTable(runtime *rt.Runtime, machine *vm.VM) error {
 	handle := runtime.Heap().NewTable(8)
@@ -185,7 +203,8 @@ func registerTable(runtime *rt.Runtime, machine *vm.VM) error {
 		if length < 2 {
 			return rt.NilValue, nil
 		}
-		values := make([]rt.Value, length)
+		values := borrowTableSortValues(length)
+		defer releaseTableSortValues(values)
 		for index := 1; index <= length; index++ {
 			value, _ := tbl.GetIndex(index)
 			values[index-1] = value
@@ -193,8 +212,11 @@ func registerTable(runtime *rt.Runtime, machine *vm.VM) error {
 		var less func(rt.Value, rt.Value) (bool, error)
 		if len(args) == 2 {
 			cmp := args[1]
+			var cmpArgs [2]rt.Value
 			less = func(left rt.Value, right rt.Value) (bool, error) {
-				results, err := machine.CallValue(cmp, []rt.Value{left, right})
+				cmpArgs[0] = left
+				cmpArgs[1] = right
+				results, err := machine.CallValue(cmp, cmpArgs[:])
 				if err != nil {
 					return false, err
 				}
@@ -236,6 +258,7 @@ func registerTable(runtime *rt.Runtime, machine *vm.VM) error {
 			return rt.NilValue, err
 		}
 		key := rt.NilValue
+		var callArgs [2]rt.Value
 		for {
 			nextKey, nextValue, found, err := runtime.Next(args[0], key)
 			if err != nil {
@@ -244,7 +267,9 @@ func registerTable(runtime *rt.Runtime, machine *vm.VM) error {
 			if !found {
 				return rt.NilValue, nil
 			}
-			results, err := machine.CallValue(args[1], []rt.Value{nextKey, nextValue})
+			callArgs[0] = nextKey
+			callArgs[1] = nextValue
+			results, err := machine.CallValue(args[1], callArgs[:])
 			if err != nil {
 				return rt.NilValue, err
 			}
@@ -263,9 +288,12 @@ func registerTable(runtime *rt.Runtime, machine *vm.VM) error {
 		if err != nil {
 			return rt.NilValue, err
 		}
+		var callArgs [2]rt.Value
 		for index := 1; index <= tbl.Length(); index++ {
 			value, _ := tbl.GetIndex(index)
-			results, err := machine.CallValue(args[1], []rt.Value{rt.NumberValue(float64(index)), value})
+			callArgs[0] = rt.NumberValue(float64(index))
+			callArgs[1] = value
+			results, err := machine.CallValue(args[1], callArgs[:])
 			if err != nil {
 				return rt.NilValue, err
 			}

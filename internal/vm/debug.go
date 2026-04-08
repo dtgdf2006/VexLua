@@ -22,7 +22,15 @@ type DebugInfo struct {
 	ActiveLines     []int
 }
 
+type debugInfoOptions struct {
+	includeActiveLines bool
+}
+
 func (m *VM) DebugInfoForFunction(value rt.Value) (DebugInfo, error) {
+	return m.DebugInfoForFunctionWithOptions(value, false)
+}
+
+func (m *VM) DebugInfoForFunctionWithOptions(value rt.Value, includeActiveLines bool) (DebugInfo, error) {
 	h, ok := value.Handle()
 	if !ok {
 		return DebugInfo{}, fmt.Errorf("debug.getinfo expects function")
@@ -30,7 +38,7 @@ func (m *VM) DebugInfoForFunction(value rt.Value) (DebugInfo, error) {
 	switch h.Kind() {
 	case rt.ObjectLuaClosure:
 		closure := m.runtime.Heap().LuaClosure(h).(*LuaClosure)
-		info := m.debugInfoForClosure(closure)
+		info := m.debugInfoForClosureWithOptions(closure, debugInfoOptions{includeActiveLines: includeActiveLines})
 		info.Function = value
 		return info, nil
 	case rt.ObjectHostFunction:
@@ -53,6 +61,10 @@ func (m *VM) DebugInfoForFunction(value rt.Value) (DebugInfo, error) {
 }
 
 func (m *VM) DebugInfoForLevel(co *Coroutine, level int) (DebugInfo, bool) {
+	return m.DebugInfoForLevelWithOptions(co, level, false)
+}
+
+func (m *VM) DebugInfoForLevelWithOptions(co *Coroutine, level int, includeActiveLines bool) (DebugInfo, bool) {
 	if level < 1 {
 		return DebugInfo{}, false
 	}
@@ -77,7 +89,7 @@ func (m *VM) DebugInfoForLevel(co *Coroutine, level int) (DebugInfo, bool) {
 	if tailCall {
 		return tailCallDebugInfo(), true
 	}
-	info := m.debugInfoForFrame(frame)
+	info := m.debugInfoForFrameWithOptions(frame, debugInfoOptions{includeActiveLines: includeActiveLines})
 	if value, ok := m.runtime.FindLuaClosureValue(frame.closure); ok {
 		info.Function = value
 	}
@@ -223,6 +235,10 @@ func (m *VM) luaClosureForDebug(value rt.Value) (*LuaClosure, error) {
 }
 
 func (m *VM) debugInfoForClosure(closure *LuaClosure) DebugInfo {
+	return m.debugInfoForClosureWithOptions(closure, debugInfoOptions{})
+}
+
+func (m *VM) debugInfoForClosureWithOptions(closure *LuaClosure, options debugInfoOptions) DebugInfo {
 	name := closure.Proto.Name
 	proto := closure.Proto
 	what := "Lua"
@@ -239,7 +255,7 @@ func (m *VM) debugInfoForClosure(closure *LuaClosure) DebugInfo {
 			source = "=(string)"
 		}
 	}
-	return DebugInfo{
+	info := DebugInfo{
 		Name:            name,
 		NameWhat:        "",
 		Source:          source,
@@ -249,12 +265,19 @@ func (m *VM) debugInfoForClosure(closure *LuaClosure) DebugInfo {
 		LineDefined:     proto.LineDefined,
 		LastLineDefined: proto.LastLineDefined,
 		NumUpvalues:     len(closure.Upvalues),
-		ActiveLines:     activeLinesForProto(proto),
 	}
+	if options.includeActiveLines {
+		info.ActiveLines = m.activeLinesForProto(proto)
+	}
+	return info
 }
 
 func (m *VM) debugInfoForFrame(frame *callFrame) DebugInfo {
-	info := m.debugInfoForClosure(frame.closure)
+	return m.debugInfoForFrameWithOptions(frame, debugInfoOptions{})
+}
+
+func (m *VM) debugInfoForFrameWithOptions(frame *callFrame, options debugInfoOptions) DebugInfo {
+	info := m.debugInfoForClosureWithOptions(frame.closure, options)
 	info.CurrentLine = currentLineForFrame(frame)
 	return info
 }
@@ -344,9 +367,13 @@ func localActiveAt(local bytecode.LocalVar, pc int) bool {
 	return local.StartPC <= pc && pc < endPC
 }
 
-func activeLinesForProto(proto *bytecode.Proto) []int {
+func (m *VM) activeLinesForProto(proto *bytecode.Proto) []int {
 	if proto == nil || len(proto.LineInfo) == 0 {
 		return nil
+	}
+	state := m.stateFor(proto)
+	if state.activeLines != nil {
+		return state.activeLines
 	}
 	seen := make(map[int]struct{}, len(proto.LineInfo))
 	lines := make([]int, 0, len(proto.LineInfo))
@@ -360,7 +387,12 @@ func activeLinesForProto(proto *bytecode.Proto) []int {
 		seen[line] = struct{}{}
 		lines = append(lines, line)
 	}
-	return lines
+	if len(lines) == 0 {
+		state.activeLines = []int{}
+		return state.activeLines
+	}
+	state.activeLines = lines
+	return state.activeLines
 }
 
 func shortSource(source string) string {

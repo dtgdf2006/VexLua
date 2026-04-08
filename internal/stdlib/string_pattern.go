@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	rt "vexlua/internal/runtime"
 )
@@ -41,7 +42,27 @@ type luaPatternCapture struct {
 	isPosition bool
 }
 
+type stringPatternCacheKey struct {
+	pattern string
+	plain   bool
+}
+
+var stringPatternCache sync.Map
+
 func compileStringPattern(pattern string, plain bool) (*stringPattern, error) {
+	cacheKey := stringPatternCacheKey{pattern: pattern, plain: plain}
+	if cached, ok := stringPatternCache.Load(cacheKey); ok {
+		return cached.(*stringPattern), nil
+	}
+	compiled, err := compileStringPatternUncached(pattern, plain)
+	if err != nil {
+		return nil, err
+	}
+	actual, _ := stringPatternCache.LoadOrStore(cacheKey, compiled)
+	return actual.(*stringPattern), nil
+}
+
+func compileStringPatternUncached(pattern string, plain bool) (*stringPattern, error) {
 	if plain || !hasLuaPatternMagic(pattern) {
 		return &stringPattern{plain: true, literal: pattern}, nil
 	}
@@ -88,6 +109,22 @@ func (pattern *stringPattern) find(subject string, start int) (*stringPatternMat
 	return buildRegexStringPatternMatch(subject, adjusted, pattern.captures), nil
 }
 
+func (pattern *stringPattern) findRegexIndices(subject string, start int) []int {
+	if pattern == nil || pattern.re == nil || start < 0 || start > len(subject) {
+		return nil
+	}
+	indices := pattern.re.FindStringSubmatchIndex(subject[start:])
+	if indices == nil {
+		return nil
+	}
+	for i := range indices {
+		if indices[i] >= 0 {
+			indices[i] += start
+		}
+	}
+	return indices
+}
+
 func buildRegexStringPatternMatch(subject string, indices []int, captures int) *stringPatternMatch {
 	match := &stringPatternMatch{start: indices[0], end: indices[1]}
 	if captures == 0 {
@@ -124,9 +161,9 @@ func stringMatchResults(runtime *rt.Runtime, full string, captures []stringPatte
 	if len(captures) == 0 {
 		return []rt.Value{runtime.StringValue(full)}
 	}
-	results := make([]rt.Value, 0, len(captures))
-	for _, capture := range captures {
-		results = append(results, stringCaptureToValue(runtime, capture))
+	results := make([]rt.Value, len(captures))
+	for i, capture := range captures {
+		results[i] = stringCaptureToValue(runtime, capture)
 	}
 	return results
 }

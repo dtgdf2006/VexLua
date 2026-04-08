@@ -299,9 +299,9 @@ func (b *lua51Builder) emitInstr(pc int, instr bytecode.Instr) error {
 	case bytecode.OpSetField:
 		key := b.constantFromString(b.runtime.SymbolName(uint32(instr.D)))
 		b.emitLua(line, encodeABC(lOpSetTable, int(instr.A), rkConst(key), int(instr.B)))
-	case bytecode.OpGetTable:
+	case bytecode.OpGetTable, bytecode.OpGetTableArray:
 		b.emitLua(line, encodeABC(lOpGetTable, int(instr.A), int(instr.B), int(instr.C)))
-	case bytecode.OpSetTable:
+	case bytecode.OpSetTable, bytecode.OpSetTableArray:
 		b.emitLua(line, encodeABC(lOpSetTable, int(instr.A), int(instr.B), int(instr.C)))
 	case bytecode.OpAppendTable:
 		if prevPending < 0 {
@@ -347,7 +347,7 @@ func (b *lua51Builder) emitInstr(pc int, instr bytecode.Instr) error {
 		b.emitLua(line, encodeABC(lOpMod, int(instr.A), int(instr.B), int(instr.C)))
 	case bytecode.OpPow:
 		b.emitLua(line, encodeABC(lOpPow, int(instr.A), int(instr.B), int(instr.C)))
-	case bytecode.OpLen:
+	case bytecode.OpLen, bytecode.OpLenTable:
 		b.emitLua(line, encodeABC(lOpLen, int(instr.A), int(instr.B), 0))
 	case bytecode.OpConcat:
 		base := b.scratch(2)

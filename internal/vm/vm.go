@@ -20,6 +20,7 @@ type protoState struct {
 	fieldCaches  []rt.FieldCache
 	compiled     jit.Program
 	jitFailed    bool
+	activeLines  []int
 	liveRegs     [][]uint64
 	regs         []rt.Value
 	rootClosure  rt.Value

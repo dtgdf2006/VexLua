@@ -51,13 +51,13 @@ func instructionUseDef(instr bytecode.Instr, maxStack int) ([]uint64, []uint64) 
 		markRegisterRange(defs, int(instr.A), 1)
 	case bytecode.OpStoreUpvalue, bytecode.OpStoreGlobal:
 		markRegisterRange(use, int(instr.A), 1)
-	case bytecode.OpGetField, bytecode.OpGetFieldIC, bytecode.OpGetTable, bytecode.OpLen, bytecode.OpNot:
+	case bytecode.OpGetField, bytecode.OpGetFieldIC, bytecode.OpGetTable, bytecode.OpGetTableArray, bytecode.OpLen, bytecode.OpLenTable, bytecode.OpNot:
 		markRegisterRange(use, int(instr.B), 1)
 		markRegisterRange(defs, int(instr.A), 1)
 	case bytecode.OpSetField:
 		markRegisterRange(use, int(instr.A), 1)
 		markRegisterRange(use, int(instr.B), 1)
-	case bytecode.OpSetTable:
+	case bytecode.OpSetTable, bytecode.OpSetTableArray:
 		markRegisterRange(use, int(instr.A), 1)
 		markRegisterRange(use, int(instr.B), 1)
 		markRegisterRange(use, int(instr.C), 1)

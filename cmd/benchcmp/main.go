@@ -13,15 +13,9 @@ import (
 	"time"
 
 	"vexlua"
+	benchmarks "vexlua/internal/benchmarks"
 	"vexlua/internal/bytecode"
 )
-
-type workload struct {
-	Name     string
-	Source   string
-	Expected string
-	Notes    string
-}
 
 type sourceBenchResult struct {
 	Iterations int
@@ -30,120 +24,57 @@ type sourceBenchResult struct {
 }
 
 type runBenchResult struct {
-	Iterations int
-	VexNSOp    float64
-	VexJITNSOp float64
-	LuaNSOp    float64
+	Iterations      int
+	VexNSOp         float64
+	VexJITNSOp      float64
+	LuaNSOp         float64
+	VexJITCompiled  bool
+	VexQuickenedOps int
 }
 
 type summary struct {
-	Workload workload
+	Workload benchmarks.Workload
 	Source   sourceBenchResult
 	Run      runBenchResult
 }
 
 type vexSourceRunner struct {
 	engine   *vexlua.Engine
-	workload workload
+	workload benchmarks.Workload
 }
 
 type vexRunRunner struct {
 	engine   *vexlua.Engine
 	proto    *bytecode.Proto
-	workload workload
+	workload benchmarks.Workload
 }
 
 type luaRunner struct {
 	binary string
 	script string
-	work   workload
-}
-
-var workloads = []workload{
-	{
-		Name: "numeric_for_sum",
-		Source: `
-local sum = 0
-for i = 1, 20000 do
-	sum = sum + i
-end
-return sum
-`,
-		Expected: "200010000",
-		Notes:    "数值 for 循环与算术",
-	},
-	{
-		Name: "table_field_sum",
-		Source: `
-local obj = {x = 1, y = 2, z = 3}
-local sum = 0
-for i = 1, 50000 do
-	sum = sum + obj.x + obj.y + obj.z
-end
-return sum
-`,
-		Expected: "300000",
-		Notes:    "table 字段访问与 inline cache 热点",
-	},
-	{
-		Name: "method_dispatch",
-		Source: `
-local box = {base = 32}
-function box:mix(a, b, c)
-	return self.base + a + b + c
-end
-local sum = 0
-for i = 1, 5000 do
-	sum = sum + box:mix(2, 3, 4)
-end
-return sum
-`,
-		Expected: "205000",
-		Notes:    "方法查找、self 注入与调用开销",
-	},
-	{
-		Name: "closure_upvalue",
-		Source: `
-local seed = 40
-local function make()
-	local offset = 2
-	return function(v)
-		return v + seed + offset
-	end
-end
-local fn = make()
-local sum = 0
-for i = 1, 5000 do
-	sum = sum + fn(0)
-end
-return sum
-`,
-		Expected: "210000",
-		Notes:    "闭包、upvalue 与函数调用",
-	},
-	{
-		Name: "generic_for_pairs",
-		Source: `
-local t = {a = 1, b = 2, c = 3, d = 4, e = 5}
-local sum = 0
-for i = 1, 5000 do
-	for _, v in pairs(t) do
-		sum = sum + v
-	end
-end
-return sum
-`,
-		Expected: "75000",
-		Notes:    "generic for、pairs 与迭代协议",
-	},
+	work   benchmarks.Workload
 }
 
 func main() {
 	var luaBin string
 	var targetMS int
+	var workloadSpec string
+	var listWorkloads bool
 	flag.StringVar(&luaBin, "lua-bin", "", "Lua 5.1 executable to compare against; defaults to auto-detect from PATH")
 	flag.IntVar(&targetMS, "target-ms", 250, "Target duration in milliseconds for each benchmark calibration pass")
+	flag.StringVar(&workloadSpec, "workloads", "all", "Comma-separated workload names or tags (all, core, extended, numeric, table, call, closure, iterator, string, coroutine, stdlib, vararg, tailcall, metatable)")
+	flag.BoolVar(&listWorkloads, "list", false, "List available workloads and tags, then exit")
 	flag.Parse()
+
+	if listWorkloads {
+		printWorkloads(benchmarks.ScriptWorkloads())
+		return
+	}
+
+	selected, err := benchmarks.SelectWorkloads(workloadSpec)
+	if err != nil {
+		fatalf("invalid workloads selection: %v", err)
+	}
 
 	target := time.Duration(targetMS) * time.Millisecond
 	if target < 50*time.Millisecond {
@@ -161,8 +92,8 @@ func main() {
 	}
 	defer os.RemoveAll(tempDir)
 
-	summaries := make([]summary, 0, len(workloads))
-	for _, work := range workloads {
+	summaries := make([]summary, 0, len(selected))
+	for _, work := range selected {
 		sourceVex := &vexSourceRunner{engine: vexlua.NewWithOptions(vexlua.Options{EnableJIT: true, HotThreshold: 2}), workload: work}
 		runVex, err := newVexRunRunner(false, work)
 		if err != nil {
@@ -206,6 +137,7 @@ func main() {
 		if err != nil {
 			fatalf("bench Lua run-only for %s: %v", work.Name, err)
 		}
+		jitStats := runVexJIT.engine.Stats(runVexJIT.proto)
 
 		summaries = append(summaries, summary{
 			Workload: work,
@@ -215,10 +147,12 @@ func main() {
 				LuaNSOp:    nsPerOp(sourceLuaDur, sourceIterations),
 			},
 			Run: runBenchResult{
-				Iterations: runIterations,
-				VexNSOp:    nsPerOp(runVexDur, runIterations),
-				VexJITNSOp: nsPerOp(runVexJITDur, runIterations),
-				LuaNSOp:    nsPerOp(runLuaDur, runIterations),
+				Iterations:      runIterations,
+				VexNSOp:         nsPerOp(runVexDur, runIterations),
+				VexJITNSOp:      nsPerOp(runVexJITDur, runIterations),
+				LuaNSOp:         nsPerOp(runLuaDur, runIterations),
+				VexJITCompiled:  jitStats.JITCompiled,
+				VexQuickenedOps: jitStats.QuickenedOps,
 			},
 		})
 	}
@@ -254,7 +188,7 @@ func detectLua(explicit string) (string, string, error) {
 	return "", "", errors.New("no Lua 5.1 executable found in PATH")
 }
 
-func newVexRunRunner(enableJIT bool, work workload) (*vexRunRunner, error) {
+func newVexRunRunner(enableJIT bool, work benchmarks.Workload) (*vexRunRunner, error) {
 	hotThreshold := uint32(1024)
 	if enableJIT {
 		hotThreshold = 2
@@ -268,7 +202,7 @@ func newVexRunRunner(enableJIT bool, work workload) (*vexRunRunner, error) {
 	if err != nil {
 		return nil, err
 	}
-	if got := engine.FormatValue(result); !matchesExpected(got, work.Expected) {
+	if got := engine.FormatValue(result); !benchmarks.MatchesExpected(got, work.Expected) {
 		return nil, fmt.Errorf("unexpected VexLua result %q, want %q", got, work.Expected)
 	}
 	if enableJIT {
@@ -291,7 +225,7 @@ func (r *vexSourceRunner) bench(iterations int) (time.Duration, error) {
 			return 0, err
 		}
 	}
-	if got := r.engine.FormatValue(result); !matchesExpected(got, r.workload.Expected) {
+	if got := r.engine.FormatValue(result); !benchmarks.MatchesExpected(got, r.workload.Expected) {
 		return 0, fmt.Errorf("unexpected VexLua source result %q, want %q", got, r.workload.Expected)
 	}
 	return time.Since(start), nil
@@ -307,13 +241,13 @@ func (r *vexRunRunner) bench(iterations int) (time.Duration, error) {
 			return 0, err
 		}
 	}
-	if got := r.engine.FormatValue(result); !matchesExpected(got, r.workload.Expected) {
+	if got := r.engine.FormatValue(result); !benchmarks.MatchesExpected(got, r.workload.Expected) {
 		return 0, fmt.Errorf("unexpected VexLua run result %q, want %q", got, r.workload.Expected)
 	}
 	return time.Since(start), nil
 }
 
-func newLuaRunner(luaBin string, tempDir string, work workload) (*luaRunner, error) {
+func newLuaRunner(luaBin string, tempDir string, work benchmarks.Workload) (*luaRunner, error) {
 	scriptPath := filepath.Join(tempDir, work.Name+".lua")
 	script := buildLuaHarness(work)
 	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
@@ -337,13 +271,13 @@ func (r *luaRunner) bench(mode string, iterations int) (time.Duration, error) {
 		return 0, fmt.Errorf("parse lua elapsed time: %w", err)
 	}
 	result := strings.TrimSpace(lines[1])
-	if result != r.work.Expected {
+	if !benchmarks.MatchesExpected(result, r.work.Expected) {
 		return 0, fmt.Errorf("unexpected Lua result %q, want %q", result, r.work.Expected)
 	}
 	return time.Duration(elapsedSec * float64(time.Second)), nil
 }
 
-func buildLuaHarness(work workload) string {
+func buildLuaHarness(work benchmarks.Workload) string {
 	return fmt.Sprintf(`local mode = assert(arg[1], "mode required")
 local iterations = assert(tonumber(arg[2]), "iterations required")
 local source = [==[%s]==]
@@ -430,7 +364,10 @@ func calibrate(target time.Duration, minIterations int, maxIterations int, run f
 
 func printReport(luaBin string, version string, target time.Duration, summaries []summary) {
 	fmt.Printf("Lua baseline: %s (%s)\n", luaBin, version)
+	fmt.Printf("Selected workloads: %d\n", len(summaries))
 	fmt.Printf("Calibration target per row: %s\n\n", target)
+	fmt.Printf("Geomean speedup vs Lua 5.1: source %.2fx | run interp %.2fx | run JIT %.2fx\n", sourceGeomean(summaries), runInterpGeomean(summaries), runJITGeomean(summaries))
+	fmt.Printf("JIT active workloads: %d/%d\n\n", jitActiveCount(summaries), len(summaries))
 
 	fmt.Println("Source+Run benchmark")
 	fmt.Println("说明: VexLua 使用 DoString；同一 source 会复用已编译 proto，从而累积 IC/JIT 热点。Lua 5.1 对照仍使用每次 loadstring(source)()")
@@ -449,21 +386,32 @@ func printReport(luaBin string, version string, target time.Duration, summaries 
 
 	fmt.Println()
 	fmt.Println("Run-Only benchmark")
-	fmt.Println("说明: 源码只编译一次; VexLua 对比 interpreter/JIT 两档，对照 Lua 5.1 使用预先 loadstring 后重复调用")
-	fmt.Println("| workload | notes | iterations | VexLua interp ns/op | VexLua JIT ns/op | Lua 5.1 ns/op | interp vs Lua | JIT vs Lua |")
-	fmt.Println("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+	fmt.Println("说明: 源码只编译一次; VexLua 对比 interpreter/JIT 两档，对照 Lua 5.1 使用预先 loadstring 后重复调用。jit active 表示该 workload 在当前平台上是否真正进入机器码。")
+	fmt.Println("| workload | notes | iterations | VexLua interp ns/op | VexLua JIT ns/op | jit active | quickened | Lua 5.1 ns/op | interp vs Lua | JIT vs Lua |")
+	fmt.Println("| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |")
 	for _, item := range summaries {
-		fmt.Printf("| %s | %s | %d | %.1f | %.1f | %.1f | %.2fx | %.2fx |\n",
+		fmt.Printf("| %s | %s | %d | %.1f | %.1f | %s | %d | %.1f | %.2fx | %.2fx |\n",
 			item.Workload.Name,
 			item.Workload.Notes,
 			item.Run.Iterations,
 			item.Run.VexNSOp,
 			item.Run.VexJITNSOp,
+			formatBool(item.Run.VexJITCompiled),
+			item.Run.VexQuickenedOps,
 			item.Run.LuaNSOp,
 			speedup(item.Run.LuaNSOp, item.Run.VexNSOp),
 			speedup(item.Run.LuaNSOp, item.Run.VexJITNSOp),
 		)
 	}
+}
+
+func printWorkloads(workloads []benchmarks.Workload) {
+	fmt.Println("Available workloads:")
+	for _, work := range workloads {
+		fmt.Printf("- %s [%s]: %s\n", work.Name, strings.Join(work.Tags, ","), work.Notes)
+	}
+	fmt.Println()
+	fmt.Printf("Available tags: %s\n", strings.Join(benchmarks.AllTags(), ", "))
 }
 
 func nsPerOp(duration time.Duration, iterations int) float64 {
@@ -480,16 +428,64 @@ func speedup(baseline float64, contender float64) float64 {
 	return baseline / contender
 }
 
-func matchesExpected(actual string, expected string) bool {
-	if actual == expected {
-		return true
+func sourceGeomean(summaries []summary) float64 {
+	values := make([]float64, 0, len(summaries))
+	for _, item := range summaries {
+		values = append(values, speedup(item.Source.LuaNSOp, item.Source.VexNSOp))
 	}
-	actualNum, actualErr := strconv.ParseFloat(actual, 64)
-	expectedNum, expectedErr := strconv.ParseFloat(expected, 64)
-	if actualErr == nil && expectedErr == nil {
-		return actualNum == expectedNum
+	return geometricMean(values)
+}
+
+func runInterpGeomean(summaries []summary) float64 {
+	values := make([]float64, 0, len(summaries))
+	for _, item := range summaries {
+		values = append(values, speedup(item.Run.LuaNSOp, item.Run.VexNSOp))
 	}
-	return false
+	return geometricMean(values)
+}
+
+func runJITGeomean(summaries []summary) float64 {
+	values := make([]float64, 0, len(summaries))
+	for _, item := range summaries {
+		values = append(values, speedup(item.Run.LuaNSOp, item.Run.VexJITNSOp))
+	}
+	return geometricMean(values)
+}
+
+func geometricMean(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	var sum float64
+	count := 0
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		sum += math.Log(value)
+		count++
+	}
+	if count == 0 {
+		return 0
+	}
+	return math.Exp(sum / float64(count))
+}
+
+func jitActiveCount(summaries []summary) int {
+	count := 0
+	for _, item := range summaries {
+		if item.Run.VexJITCompiled {
+			count++
+		}
+	}
+	return count
+}
+
+func formatBool(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
 }
 
 func minInt(a int, b int) int {

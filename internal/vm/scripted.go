@@ -18,10 +18,13 @@ type LuaClosure struct {
 type CoroutineStatus string
 
 const (
-	CoroutineNew       CoroutineStatus = "suspended"
-	CoroutineRunning   CoroutineStatus = "running"
-	CoroutineSuspended CoroutineStatus = "suspended"
-	CoroutineDead      CoroutineStatus = "dead"
+	CoroutineNew         CoroutineStatus = "suspended"
+	CoroutineRunning     CoroutineStatus = "running"
+	CoroutineSuspended   CoroutineStatus = "suspended"
+	CoroutineDead        CoroutineStatus = "dead"
+	smallInlineValueCap                  = 4
+	smallScratchValueCap                 = 8
+	minCoroutineStackCap                 = 32
 )
 
 type Coroutine struct {
@@ -39,14 +42,17 @@ type Coroutine struct {
 	resumeCount   int
 	lastResult    rt.Value
 	lastResults   []rt.Value
+	lastInline    [smallInlineValueCap]rt.Value
 	yielded       rt.Value
 	yieldedResult []rt.Value
+	yieldedInline [smallInlineValueCap]rt.Value
 	argBuf        [1]rt.Value
 	stack         []rt.Value
 	stackTop      int
 }
 
 type callFrame struct {
+	state           *protoState
 	closure         *LuaClosure
 	regs            []rt.Value
 	base            int
@@ -60,7 +66,13 @@ type callFrame struct {
 	returnCount     int
 	openCount       int
 	varargs         []rt.Value
+	varargsInline   [smallInlineValueCap]rt.Value
 	pendingResults  []rt.Value
+	pendingInline   [smallInlineValueCap]rt.Value
+	argScratch      []rt.Value
+	argInline       [smallScratchValueCap]rt.Value
+	resultScratch   []rt.Value
+	resultInline    [smallScratchValueCap]rt.Value
 	gcRoots         []rt.Value
 	gcOverwriteReg  int
 	gcOverwriteCnt  int
@@ -107,7 +119,7 @@ func newLuaClosure(proto *bytecode.Proto) *LuaClosure {
 }
 
 func newCoroutine(machine *VM, entry rt.Value) Coroutine {
-	return Coroutine{machine: machine, entry: entry, proxy: rt.NilValue, status: CoroutineNew, resumeReg: -1, stack: make([]rt.Value, 0, 256)}
+	return Coroutine{machine: machine, entry: entry, proxy: rt.NilValue, status: CoroutineNew, resumeReg: -1}
 }
 
 func (m *VM) NewClosureValue(proto *bytecode.Proto) rt.Value {
@@ -156,7 +168,7 @@ func (m *VM) ResumeCoroutineMulti(co *Coroutine, args []rt.Value) ([]rt.Value, e
 		if ok && h.Kind() == rt.ObjectLuaClosure {
 			closure := m.runtime.Heap().LuaClosure(h).(*LuaClosure)
 			m.pushFrame(co, closure, args, -1, 0)
-			if err := m.dispatchCallHook(co, m.debugInfoForFrame(co.frames[len(co.frames)-1]), nil); err != nil {
+			if err := m.dispatchCallHookForFrames(co, co.frames[len(co.frames)-1], nil); err != nil {
 				return nil, err
 			}
 		} else {
@@ -211,7 +223,11 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 	for len(co.frames) > targetDepth {
 		frame := co.frames[len(co.frames)-1]
 		proto := frame.closure.Proto
-		state := m.stateFor(proto)
+		state := frame.state
+		if state == nil {
+			state = m.stateFor(proto)
+			frame.state = state
+		}
 		if err := m.maybeDispatchStepHooks(co, frame); err != nil {
 			return nil, err
 		}
@@ -226,7 +242,7 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 					if err != nil {
 						return nil, err
 					}
-					if err := m.returnFromFrame(co, []rt.Value{result}); err != nil {
+					if err := m.returnFromFrame(co, frame.singleResult(result)); err != nil {
 						return nil, err
 					}
 					continue
@@ -234,7 +250,7 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			}
 		}
 		if frame.pc >= len(proto.Code) {
-			if err := m.returnFromFrame(co, []rt.Value{rt.NilValue}); err != nil {
+			if err := m.returnFromFrame(co, frame.singleResult(rt.NilValue)); err != nil {
 				return nil, err
 			}
 			continue
@@ -390,12 +406,50 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 				return nil, err
 			}
 		case bytecode.OpGetTable:
+			if table, index, ok := m.fastPlainArrayTarget(frame.regs[instr.B], frame.regs[instr.C]); ok {
+				value, found := table.GetIndex(index)
+				if !found {
+					value = rt.NilValue
+				}
+				frame.regs[instr.A] = value
+				instr.Op = bytecode.OpGetTableArray
+				state.quickenedOps++
+				continue
+			}
+			value, err := m.getTableValue(frame.regs[instr.B], frame.regs[instr.C])
+			if err != nil {
+				return nil, err
+			}
+			frame.regs[instr.A] = value
+		case bytecode.OpGetTableArray:
+			if table, index, ok := m.fastPlainArrayTarget(frame.regs[instr.B], frame.regs[instr.C]); ok {
+				value, found := table.GetIndex(index)
+				if !found {
+					value = rt.NilValue
+				}
+				frame.regs[instr.A] = value
+				continue
+			}
 			value, err := m.getTableValue(frame.regs[instr.B], frame.regs[instr.C])
 			if err != nil {
 				return nil, err
 			}
 			frame.regs[instr.A] = value
 		case bytecode.OpSetTable:
+			if table, index, ok := m.fastPlainArrayTarget(frame.regs[instr.A], frame.regs[instr.B]); ok {
+				table.SetIndex(index, frame.regs[instr.C])
+				instr.Op = bytecode.OpSetTableArray
+				state.quickenedOps++
+				continue
+			}
+			if err := m.setTableValue(frame.regs[instr.A], frame.regs[instr.B], frame.regs[instr.C]); err != nil {
+				return nil, err
+			}
+		case bytecode.OpSetTableArray:
+			if table, index, ok := m.fastPlainArrayTarget(frame.regs[instr.A], frame.regs[instr.B]); ok {
+				table.SetIndex(index, frame.regs[instr.C])
+				continue
+			}
 			if err := m.setTableValue(frame.regs[instr.A], frame.regs[instr.B], frame.regs[instr.C]); err != nil {
 				return nil, err
 			}
@@ -470,6 +524,22 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			}
 			frame.regs[instr.A] = result
 		case bytecode.OpLen:
+			if table, ok := m.fastPlainTable(frame.regs[instr.B]); ok {
+				frame.regs[instr.A] = rt.NumberValue(float64(table.Length()))
+				instr.Op = bytecode.OpLenTable
+				state.quickenedOps++
+				continue
+			}
+			result, err := m.lenValue(frame.regs[instr.B])
+			if err != nil {
+				return nil, err
+			}
+			frame.regs[instr.A] = result
+		case bytecode.OpLenTable:
+			if table, ok := m.fastPlainTable(frame.regs[instr.B]); ok {
+				frame.regs[instr.A] = rt.NumberValue(float64(table.Length()))
+				continue
+			}
 			result, err := m.lenValue(frame.regs[instr.B])
 			if err != nil {
 				return nil, err
@@ -544,9 +614,8 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			args := frame.regs[int(instr.C) : int(instr.C)+argCount]
 			if h, ok := callee.Handle(); ok && h.Kind() == rt.ObjectLuaClosure {
 				closure := m.runtime.Heap().LuaClosure(h).(*LuaClosure)
-				callerInfo := m.debugInfoPtrForFrame(frame)
 				m.pushFrame(co, closure, args, int(instr.A), 1)
-				if err := m.dispatchCallHook(co, m.debugInfoForFrame(co.frames[len(co.frames)-1]), callerInfo); err != nil {
+				if err := m.dispatchCallHookForFrames(co, co.frames[len(co.frames)-1], frame); err != nil {
 					return nil, err
 				}
 				continue
@@ -576,9 +645,8 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 				if co != nil && co.hook.function.Kind() != rt.KindNil && !co.hook.running {
 					frame.tailPending = true
 					frame.tailHookEvent = "tail return"
-					callerInfo := m.debugInfoPtrForFrame(frame)
 					m.pushFrame(co, closure, resolvedArgs, -1, 0)
-					if err := m.dispatchCallHook(co, m.debugInfoForFrame(co.frames[len(co.frames)-1]), callerInfo); err != nil {
+					if err := m.dispatchCallHookForFrames(co, co.frames[len(co.frames)-1], frame); err != nil {
 						return nil, err
 					}
 					continue
@@ -613,9 +681,8 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			args := frame.callArgs(int(instr.C), argCount, appendPending)
 			if h, ok := callee.Handle(); ok && h.Kind() == rt.ObjectLuaClosure {
 				closure := m.runtime.Heap().LuaClosure(h).(*LuaClosure)
-				callerInfo := m.debugInfoPtrForFrame(frame)
 				m.pushFrame(co, closure, args, int(instr.A), resultCount)
-				if err := m.dispatchCallHook(co, m.debugInfoForFrame(co.frames[len(co.frames)-1]), callerInfo); err != nil {
+				if err := m.dispatchCallHookForFrames(co, co.frames[len(co.frames)-1], frame); err != nil {
 					return nil, err
 				}
 				if appendPending {
@@ -643,15 +710,9 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			co.status = CoroutineSuspended
 			co.resumeReg = int(instr.A)
 			co.resumeCount = resumeCount
-			co.yieldedResult = co.yieldedResult[:0]
-			co.yieldedResult = append(co.yieldedResult, frame.callArgs(int(instr.B), yieldCount, appendPending)...)
+			co.setYieldedResults(frame.callArgs(int(instr.B), yieldCount, appendPending))
 			if appendPending {
 				frame.pendingResults = frame.pendingResults[:0]
-			}
-			if len(co.yieldedResult) > 0 {
-				co.yielded = co.yieldedResult[0]
-			} else {
-				co.yielded = rt.NilValue
 			}
 			return append([]rt.Value(nil), co.yieldedResult...), nil
 		case bytecode.OpJump:
@@ -676,17 +737,15 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 		case bytecode.OpClose:
 			frame.closeUpvaluesFrom(int(instr.A))
 		case bytecode.OpReturn:
-			if err := m.returnFromFrame(co, []rt.Value{frame.regs[instr.A]}); err != nil {
+			if err := m.returnFromFrame(co, frame.regs[instr.A:int(instr.A)+1]); err != nil {
 				return nil, err
 			}
 		case bytecode.OpReturnMulti:
-			if err := m.returnFromFrame(co, append([]rt.Value(nil), frame.regs[int(instr.A):int(instr.A)+int(instr.B)]...)); err != nil {
+			if err := m.returnFromFrame(co, frame.regs[int(instr.A):int(instr.A)+int(instr.B)]); err != nil {
 				return nil, err
 			}
 		case bytecode.OpReturnAppendPending:
-			results := make([]rt.Value, 0, int(instr.B)+len(frame.pendingResults))
-			results = append(results, frame.regs[int(instr.A):int(instr.A)+int(instr.B)]...)
-			results = append(results, frame.pendingResults...)
+			results := frame.returnResults(int(instr.A), int(instr.B))
 			if err := m.returnFromFrame(co, results); err != nil {
 				return nil, err
 			}
@@ -707,12 +766,14 @@ func (m *VM) pushFrame(co *Coroutine, closure *LuaClosure, args []rt.Value, retu
 }
 
 func (m *VM) tailCallFrame(co *Coroutine, frame *callFrame, closure *LuaClosure, args []rt.Value) {
-	boundArgs := append([]rt.Value(nil), args...)
+	boundArgs := frame.copyArgs(args)
 	if len(co.frames) > 1 {
 		co.frames[len(co.frames)-2].tailCalls++
 		frame.tailLoss++
 	}
+	state := m.stateFor(closure.Proto)
 	frame.closeUpvalues()
+	frame.state = state
 	co.stackTop = frame.base
 	frame.closure = closure
 	frame.stackSize = closure.Proto.MaxStack
@@ -722,6 +783,8 @@ func (m *VM) tailCallFrame(co *Coroutine, frame *callFrame, closure *LuaClosure,
 	frame.openCount = 0
 	frame.varargs = frame.varargs[:0]
 	frame.pendingResults = frame.pendingResults[:0]
+	frame.argScratch = frame.argScratch[:0]
+	frame.resultScratch = frame.resultScratch[:0]
 	frame.gcRoots = frame.gcRoots[:0]
 	frame.gcOverwriteReg = -1
 	frame.gcOverwriteCnt = 0
@@ -766,7 +829,7 @@ func (m *VM) bindFrameArgs(frame *callFrame, args []rt.Value) {
 		copy(frame.regs[:paramCount], args[:paramCount])
 	}
 	if frame.closure.Proto.Vararg && len(args) > frame.closure.Proto.NumParams {
-		frame.varargs = append(frame.varargs[:0], args[frame.closure.Proto.NumParams:]...)
+		frame.setVarargs(args[frame.closure.Proto.NumParams:])
 	}
 }
 
@@ -776,22 +839,26 @@ func (m *VM) returnFromFrame(co *Coroutine, results []rt.Value) error {
 	returnCount := frame.returnCount
 	skipTailUnwind := frame.skipTailUnwind
 	tailLoss := frame.tailLoss
-	frameInfo := m.debugInfoForFrame(frame)
-	callerInfo := (*DebugInfo)(nil)
-	if len(co.frames) > 1 {
-		callerInfo = m.debugInfoPtrForFrame(co.frames[len(co.frames)-2])
-		if co.frames[len(co.frames)-2].tailPending && frameInfo.What == "Lua" {
-			frameInfo.Name = ""
-			callerInfo = nil
+	var tailSourceInfo *DebugInfo
+	if m.hookReturnEnabled(co) {
+		frameInfo := m.debugInfoForFrameWithOptions(frame, debugInfoOptions{includeActiveLines: true})
+		callerInfo := (*DebugInfo)(nil)
+		if len(co.frames) > 1 {
+			callerInfo = m.debugInfoPtrForFrameWithOptions(co.frames[len(co.frames)-2], debugInfoOptions{includeActiveLines: true})
+			if co.frames[len(co.frames)-2].tailPending && frameInfo.What == "Lua" {
+				frameInfo.Name = ""
+				callerInfo = nil
+			}
 		}
-	}
-	if err := m.dispatchReturnHook(co, "return", frameInfo, callerInfo); err != nil {
-		return err
-	}
-	if len(co.frames) == 1 && frameInfo.What == "main" && !co.helper {
-		if err := m.dispatchReturnHook(co, "return", cReturnDebugInfo(), nil); err != nil {
+		if err := m.dispatchReturnHookWithInfo(co, "return", frameInfo, callerInfo); err != nil {
 			return err
 		}
+		if len(co.frames) == 1 && frameInfo.What == "main" && !co.helper {
+			if err := m.dispatchReturnHookWithInfo(co, "return", cReturnDebugInfo(), nil); err != nil {
+				return err
+			}
+		}
+		tailSourceInfo = &frameInfo
 	}
 	frame.closeUpvalues()
 	if len(co.frames) > 1 && tailLoss > 0 {
@@ -813,13 +880,13 @@ func (m *VM) returnFromFrame(co *Coroutine, results []rt.Value) error {
 	if skipTailUnwind {
 		caller := co.frames[len(co.frames)-1]
 		if returnCount == 0 {
-			caller.pendingResults = append(caller.pendingResults[:0], results...)
+			caller.setPendingResults(results)
 		} else if returnReg >= 0 && returnReg < len(caller.regs) {
 			caller.storeResults(returnReg, returnCount, results)
 		}
 		return nil
 	}
-	return m.unwindTailFrames(co, results, returnReg, returnCount, &frameInfo)
+	return m.unwindTailFrames(co, results, returnReg, returnCount, tailSourceInfo)
 }
 
 func (m *VM) makeClosure(frame *callFrame, proto *bytecode.Proto) rt.Value {
@@ -907,6 +974,7 @@ func (m *VM) acquireFrame(co *Coroutine, closure *LuaClosure, returnReg int, ret
 	} else {
 		frame = &callFrame{}
 	}
+	frame.state = state
 	frame.closure = closure
 	frame.base = co.stackTop
 	frame.stackSize = closure.Proto.MaxStack
@@ -936,10 +1004,14 @@ func (m *VM) acquireFrame(co *Coroutine, closure *LuaClosure, returnReg int, ret
 }
 
 func (m *VM) releaseFrame(frame *callFrame) {
-	state := m.stateFor(frame.closure.Proto)
+	state := frame.state
+	if state == nil && frame.closure != nil {
+		state = m.stateFor(frame.closure.Proto)
+	}
 	frame.regs = nil
 	frame.base = 0
 	frame.stackSize = 0
+	frame.state = nil
 	frame.closure = nil
 	frame.pc = 0
 	frame.tailCalls = 0
@@ -951,6 +1023,8 @@ func (m *VM) releaseFrame(frame *callFrame) {
 	frame.openCount = 0
 	frame.varargs = frame.varargs[:0]
 	frame.pendingResults = frame.pendingResults[:0]
+	frame.argScratch = frame.argScratch[:0]
+	frame.resultScratch = frame.resultScratch[:0]
 	frame.gcRoots = frame.gcRoots[:0]
 	frame.gcOverwriteReg = -1
 	frame.gcOverwriteCnt = 0
@@ -959,7 +1033,9 @@ func (m *VM) releaseFrame(frame *callFrame) {
 	frame.tailPending = false
 	frame.tailHookEvent = ""
 	frame.skipTailUnwind = false
-	state.framePool = append(state.framePool, frame)
+	if state != nil {
+		state.framePool = append(state.framePool, frame)
+	}
 }
 
 func (m *VM) globalEnv() rt.Value {
@@ -997,7 +1073,7 @@ func (m *VM) storeGlobal(closure *LuaClosure, sym uint32, value rt.Value) error 
 }
 
 func (co *Coroutine) setResults(results []rt.Value) {
-	co.lastResults = append(co.lastResults[:0], results...)
+	co.lastResults = storeOwnedValues(co.lastResults, co.lastInline[:], results)
 	if len(results) == 0 {
 		co.lastResult = rt.NilValue
 		return
@@ -1005,9 +1081,32 @@ func (co *Coroutine) setResults(results []rt.Value) {
 	co.lastResult = results[0]
 }
 
+func (co *Coroutine) setYieldedResults(results []rt.Value) {
+	co.yieldedResult = storeOwnedValues(co.yieldedResult, co.yieldedInline[:], results)
+	if len(results) == 0 {
+		co.yielded = rt.NilValue
+		return
+	}
+	co.yielded = results[0]
+}
+
+func storeOwnedValues(dst []rt.Value, inline []rt.Value, src []rt.Value) []rt.Value {
+	if len(src) <= len(inline) {
+		copy(inline[:len(src)], src)
+		return inline[:len(src)]
+	}
+	if cap(dst) < len(src) {
+		dst = make([]rt.Value, len(src))
+	} else {
+		dst = dst[:len(src)]
+	}
+	copy(dst, src)
+	return dst
+}
+
 func (f *callFrame) storeResults(start int, count int, results []rt.Value) {
 	if count == 0 {
-		f.pendingResults = append(f.pendingResults[:0], results...)
+		f.setPendingResults(results)
 		return
 	}
 	f.pendingResults = f.pendingResults[:0]
@@ -1026,10 +1125,72 @@ func (f *callFrame) callArgs(start int, count int, appendPending bool) []rt.Valu
 	if !appendPending {
 		return f.regs[start : start+count]
 	}
-	args := make([]rt.Value, 0, count+len(f.pendingResults))
+	if len(f.pendingResults) == 0 {
+		return f.regs[start : start+count]
+	}
+	if count == 0 {
+		return f.pendingResults
+	}
+	args := f.borrowArgScratch(count + len(f.pendingResults))
 	args = append(args, f.regs[start:start+count]...)
 	args = append(args, f.pendingResults...)
 	return args
+}
+
+func (f *callFrame) setPendingResults(results []rt.Value) {
+	f.pendingResults = storeOwnedValues(f.pendingResults, f.pendingInline[:], results)
+}
+
+func (f *callFrame) setVarargs(values []rt.Value) {
+	f.varargs = storeOwnedValues(f.varargs, f.varargsInline[:], values)
+}
+
+func (f *callFrame) borrowArgScratch(size int) []rt.Value {
+	if size <= len(f.argInline) {
+		return f.argInline[:0]
+	}
+	if cap(f.argScratch) < size {
+		f.argScratch = make([]rt.Value, 0, size)
+	}
+	return f.argScratch[:0]
+}
+
+func (f *callFrame) borrowResultScratch(size int) []rt.Value {
+	if size <= len(f.resultInline) {
+		return f.resultInline[:0]
+	}
+	if cap(f.resultScratch) < size {
+		f.resultScratch = make([]rt.Value, 0, size)
+	}
+	return f.resultScratch[:0]
+}
+
+func (f *callFrame) copyArgs(args []rt.Value) []rt.Value {
+	if len(args) == 0 {
+		return nil
+	}
+	bound := f.borrowResultScratch(len(args))
+	bound = append(bound, args...)
+	return bound
+}
+
+func (f *callFrame) returnResults(start int, count int) []rt.Value {
+	if len(f.pendingResults) == 0 {
+		return f.regs[start : start+count]
+	}
+	if count == 0 {
+		return f.pendingResults
+	}
+	results := f.borrowResultScratch(count + len(f.pendingResults))
+	results = append(results, f.regs[start:start+count]...)
+	results = append(results, f.pendingResults...)
+	return results
+}
+
+func (f *callFrame) singleResult(value rt.Value) []rt.Value {
+	results := f.borrowResultScratch(1)
+	results = append(results, value)
+	return results
 }
 
 func (f *callFrame) clearRange(start int, count int) {
@@ -1042,8 +1203,8 @@ func (m *VM) reserveRegisterWindow(co *Coroutine, base int, size int) []rt.Value
 	need := base + size
 	if cap(co.stack) < need {
 		newCap := cap(co.stack) * 2
-		if newCap < 256 {
-			newCap = 256
+		if newCap < minCoroutineStackCap {
+			newCap = minCoroutineStackCap
 		}
 		if newCap < need {
 			newCap = need
@@ -1087,6 +1248,9 @@ func (m *VM) resolveFieldIndex(target rt.Value, symbol uint32) (rt.Value, bool, 
 }
 
 func (m *VM) getTableValue(target rt.Value, key rt.Value) (rt.Value, error) {
+	if value, handled := m.fastTableArrayGet(target, key); handled {
+		return value, nil
+	}
 	value, found, err := m.runtime.GetTable(target, key)
 	if err != nil {
 		meta, ok := m.runtime.GetMetafield(target, "__index")
@@ -1141,6 +1305,9 @@ func (m *VM) setFieldValue(target rt.Value, symbol uint32, value rt.Value) error
 }
 
 func (m *VM) setTableValue(target rt.Value, key rt.Value, value rt.Value) error {
+	if handled, err := m.fastTableArraySet(target, key, value); handled {
+		return err
+	}
 	_, found, err := m.runtime.GetTable(target, key)
 	if err != nil {
 		meta, ok := m.runtime.GetMetafield(target, "__newindex")
@@ -1157,6 +1324,75 @@ func (m *VM) setTableValue(target rt.Value, key rt.Value, value rt.Value) error 
 		return m.runtime.SetTable(target, key, value)
 	}
 	return m.resolveNewIndexMetamethod(meta, target, key, value)
+}
+
+func positiveIntegerIndex(value rt.Value) (int, bool) {
+	if !value.IsNumber() {
+		return 0, false
+	}
+	number := value.Number()
+	if number <= 0 || math.Trunc(number) != number {
+		return 0, false
+	}
+	return int(number), true
+}
+
+func (m *VM) fastPlainTable(target rt.Value) (*rt.Table, bool) {
+	h, ok := target.Handle()
+	if !ok || h.Kind() != rt.ObjectTable {
+		return nil, false
+	}
+	table := m.runtime.Heap().Table(h)
+	if table.Metatable().Kind() != rt.KindNil {
+		return nil, false
+	}
+	return table, true
+}
+
+func (m *VM) fastTableArrayTarget(target rt.Value, key rt.Value) (*rt.Table, int, bool) {
+	h, ok := target.Handle()
+	if !ok || h.Kind() != rt.ObjectTable {
+		return nil, 0, false
+	}
+	index, ok := positiveIntegerIndex(key)
+	if !ok {
+		return nil, 0, false
+	}
+	return m.runtime.Heap().Table(h), index, true
+}
+
+func (m *VM) fastPlainArrayTarget(target rt.Value, key rt.Value) (*rt.Table, int, bool) {
+	table, index, ok := m.fastTableArrayTarget(target, key)
+	if !ok || table.Metatable().Kind() != rt.KindNil {
+		return nil, 0, false
+	}
+	return table, index, true
+}
+
+func (m *VM) fastTableArrayGet(target rt.Value, key rt.Value) (rt.Value, bool) {
+	table, index, ok := m.fastTableArrayTarget(target, key)
+	if !ok {
+		return rt.NilValue, false
+	}
+	if value, found := table.GetIndex(index); found {
+		return value, true
+	}
+	if table.Metatable().Kind() == rt.KindNil {
+		return rt.NilValue, true
+	}
+	return rt.NilValue, false
+}
+
+func (m *VM) fastTableArraySet(target rt.Value, key rt.Value, value rt.Value) (bool, error) {
+	table, index, ok := m.fastTableArrayTarget(target, key)
+	if !ok {
+		return false, nil
+	}
+	if _, found := table.GetIndex(index); found || table.Metatable().Kind() == rt.KindNil {
+		table.SetIndex(index, value)
+		return true, nil
+	}
+	return false, nil
 }
 
 func (m *VM) resolveIndexMetamethod(meta rt.Value, target rt.Value, key rt.Value) (rt.Value, bool, error) {
@@ -1400,14 +1636,110 @@ func (m *VM) lookupBinaryMetamethod(name string, left rt.Value, right rt.Value) 
 }
 
 func (m *VM) callValue(callee rt.Value, args []rt.Value) (rt.Value, error) {
-	results, err := m.callValueMulti(callee, args)
+	resolvedCallee, resolvedArgs, err := m.resolveCallTarget(callee, args)
 	if err != nil {
 		return rt.NilValue, err
 	}
-	if len(results) == 0 {
-		return rt.NilValue, nil
+	h, ok := resolvedCallee.Handle()
+	if ok {
+		switch h.Kind() {
+		case rt.ObjectHostFunction:
+			co := m.currentCoroutine()
+			var (
+				info       DebugInfo
+				callerInfo *DebugInfo
+				haveInfo   bool
+			)
+			if m.hookCallEnabled(co) {
+				info, err = m.DebugInfoForFunctionWithOptions(resolvedCallee, true)
+				if err != nil {
+					return rt.NilValue, err
+				}
+				callerInfo = m.debugInfoPtrForFrameWithOptions(m.currentFrame(), debugInfoOptions{includeActiveLines: true})
+				haveInfo = true
+				if err := m.dispatchCallHookWithInfo(co, info, callerInfo); err != nil {
+					return rt.NilValue, err
+				}
+			}
+			result, err := m.runtime.CallValue(resolvedCallee, resolvedArgs)
+			if err != nil {
+				return rt.NilValue, err
+			}
+			if m.hookReturnEnabled(co) {
+				if !haveInfo {
+					info, err = m.DebugInfoForFunctionWithOptions(resolvedCallee, true)
+					if err != nil {
+						return rt.NilValue, err
+					}
+					callerInfo = m.debugInfoPtrForFrameWithOptions(m.currentFrame(), debugInfoOptions{includeActiveLines: true})
+				}
+				if err := m.dispatchReturnHookWithInfo(co, "return", info, callerInfo); err != nil {
+					return rt.NilValue, err
+				}
+			}
+			return result, nil
+		case rt.ObjectLuaClosure:
+			closure := m.runtime.Heap().LuaClosure(h).(*LuaClosure)
+			parentCo := m.currentCoroutine()
+			if parentCo != nil && len(parentCo.frames) > 0 && (!parentCo.frames[len(parentCo.frames)-1].tailPending || parentCo.hook.running) {
+				co := parentCo
+				targetDepth := len(co.frames)
+				m.pushFrame(co, closure, resolvedArgs, -1, 0)
+				if co.hook.running {
+					co.frames[len(co.frames)-1].skipTailUnwind = true
+				}
+				if err := m.dispatchCallHookForFrames(co, co.frames[len(co.frames)-1], co.frames[targetDepth-1]); err != nil {
+					return rt.NilValue, err
+				}
+				if _, err := m.executeCoroutineUntil(co, targetDepth); err != nil {
+					return rt.NilValue, err
+				}
+				if len(co.frames) < targetDepth {
+					if len(co.lastResults) == 0 {
+						return rt.NilValue, nil
+					}
+					return co.lastResults[0], nil
+				}
+				caller := co.frames[targetDepth-1]
+				result := rt.NilValue
+				if len(caller.pendingResults) > 0 {
+					result = caller.pendingResults[0]
+				}
+				caller.pendingResults = caller.pendingResults[:0]
+				return result, nil
+			}
+			co := newCoroutine(m, resolvedCallee)
+			co.helper = true
+			if parentCo != nil && parentCo.hook.function.Kind() != rt.KindNil {
+				co.hook = parentCo.hook
+				co.hook.running = false
+				co.hook.context = nil
+			}
+			m.pushFrame(&co, closure, resolvedArgs, -1, 0)
+			restoreCo := m.pushActiveCoroutine(&co)
+			if err := m.dispatchCallHookForFrames(&co, co.frames[len(co.frames)-1], nil); err != nil {
+				restoreCo()
+				return rt.NilValue, err
+			}
+			results, err := m.executeCoroutine(&co)
+			restoreCo()
+			if err != nil {
+				return rt.NilValue, err
+			}
+			if parentCo != nil && co.hookTouched {
+				parentCo.hook = co.hook
+				parentCo.hookTouched = true
+			}
+			if co.status != CoroutineDead {
+				return rt.NilValue, fmt.Errorf("metamethod yielded")
+			}
+			if len(results) == 0 {
+				return rt.NilValue, nil
+			}
+			return results[0], nil
+		}
 	}
-	return results[0], nil
+	return rt.NilValue, fmt.Errorf("attempt to call unsupported object kind %s", h.Kind())
 }
 
 func (m *VM) resolveCallTarget(callee rt.Value, args []rt.Value) (rt.Value, []rt.Value, error) {
@@ -1436,33 +1768,51 @@ func (m *VM) callValueMulti(callee rt.Value, args []rt.Value) ([]rt.Value, error
 		switch h.Kind() {
 		case rt.ObjectHostFunction:
 			co := m.currentCoroutine()
-			callerInfo := m.debugInfoPtrForFrame(m.currentFrame())
-			if info, err := m.DebugInfoForFunction(resolvedCallee); err == nil {
-				if err := m.dispatchCallHook(co, info, callerInfo); err != nil {
-					return nil, err
-				}
-				results, err := m.runtime.CallValueMulti(resolvedCallee, resolvedArgs)
+			var (
+				info       DebugInfo
+				callerInfo *DebugInfo
+				haveInfo   bool
+			)
+			if m.hookCallEnabled(co) {
+				info, err = m.DebugInfoForFunctionWithOptions(resolvedCallee, true)
 				if err != nil {
 					return nil, err
 				}
-				if err := m.dispatchReturnHook(co, "return", info, callerInfo); err != nil {
+				callerInfo = m.debugInfoPtrForFrameWithOptions(m.currentFrame(), debugInfoOptions{includeActiveLines: true})
+				haveInfo = true
+				if err := m.dispatchCallHookWithInfo(co, info, callerInfo); err != nil {
 					return nil, err
 				}
-				return results, nil
 			}
-			return m.runtime.CallValueMulti(resolvedCallee, resolvedArgs)
+			results, err := m.runtime.CallValueMulti(resolvedCallee, resolvedArgs)
+			if err != nil {
+				return nil, err
+			}
+			if m.hookReturnEnabled(co) {
+				if !haveInfo {
+					info, err = m.DebugInfoForFunctionWithOptions(resolvedCallee, true)
+					if err != nil {
+						return nil, err
+					}
+					callerInfo = m.debugInfoPtrForFrameWithOptions(m.currentFrame(), debugInfoOptions{includeActiveLines: true})
+					haveInfo = true
+				}
+				if err := m.dispatchReturnHookWithInfo(co, "return", info, callerInfo); err != nil {
+					return nil, err
+				}
+			}
+			return results, nil
 		case rt.ObjectLuaClosure:
 			closure := m.runtime.Heap().LuaClosure(h).(*LuaClosure)
 			parentCo := m.currentCoroutine()
 			if parentCo != nil && len(parentCo.frames) > 0 && (!parentCo.frames[len(parentCo.frames)-1].tailPending || parentCo.hook.running) {
 				co := parentCo
 				targetDepth := len(co.frames)
-				callerInfo := m.debugInfoPtrForFrame(co.frames[targetDepth-1])
 				m.pushFrame(co, closure, resolvedArgs, -1, 0)
 				if co.hook.running {
 					co.frames[len(co.frames)-1].skipTailUnwind = true
 				}
-				if err := m.dispatchCallHook(co, m.debugInfoForFrame(co.frames[len(co.frames)-1]), callerInfo); err != nil {
+				if err := m.dispatchCallHookForFrames(co, co.frames[len(co.frames)-1], co.frames[targetDepth-1]); err != nil {
 					return nil, err
 				}
 				if _, err := m.executeCoroutineUntil(co, targetDepth); err != nil {
@@ -1485,7 +1835,7 @@ func (m *VM) callValueMulti(callee rt.Value, args []rt.Value) ([]rt.Value, error
 			}
 			m.pushFrame(&co, closure, resolvedArgs, -1, 0)
 			restoreCo := m.pushActiveCoroutine(&co)
-			if err := m.dispatchCallHook(&co, m.debugInfoForFrame(co.frames[len(co.frames)-1]), nil); err != nil {
+			if err := m.dispatchCallHookForFrames(&co, co.frames[len(co.frames)-1], nil); err != nil {
 				restoreCo()
 				return nil, err
 			}
@@ -1515,21 +1865,23 @@ func (m *VM) unwindTailFrames(co *Coroutine, results []rt.Value, returnReg int, 
 		}
 		returnReg = frame.returnReg
 		returnCount = frame.returnCount
-		callerInfo := (*DebugInfo)(nil)
-		if len(co.frames) > 1 {
-			callerInfo = m.debugInfoPtrForFrame(co.frames[len(co.frames)-2])
-		}
 		event := frame.tailHookEvent
 		if event == "" {
 			event = "tail return"
 		}
-		eventInfo := m.debugInfoForFrame(frame)
-		if event == "tail return" && tailSourceInfo != nil {
-			eventInfo = *tailSourceInfo
-			eventInfo.Name = frame.closure.Proto.Name
-		}
-		if err := m.dispatchReturnHook(co, event, eventInfo, callerInfo); err != nil {
-			return err
+		if m.hookReturnEnabled(co) {
+			callerInfo := (*DebugInfo)(nil)
+			if len(co.frames) > 1 {
+				callerInfo = m.debugInfoPtrForFrameWithOptions(co.frames[len(co.frames)-2], debugInfoOptions{includeActiveLines: true})
+			}
+			eventInfo := m.debugInfoForFrameWithOptions(frame, debugInfoOptions{includeActiveLines: true})
+			if event == "tail return" && tailSourceInfo != nil {
+				eventInfo = *tailSourceInfo
+				eventInfo.Name = frame.closure.Proto.Name
+			}
+			if err := m.dispatchReturnHookWithInfo(co, event, eventInfo, callerInfo); err != nil {
+				return err
+			}
 		}
 		frame.closeUpvalues()
 		co.frames = co.frames[:len(co.frames)-1]
@@ -1543,7 +1895,7 @@ func (m *VM) unwindTailFrames(co *Coroutine, results []rt.Value, returnReg int, 
 	}
 	caller := co.frames[len(co.frames)-1]
 	if returnCount == 0 {
-		caller.pendingResults = append(caller.pendingResults[:0], results...)
+		caller.setPendingResults(results)
 	} else if returnReg >= 0 && returnReg < len(caller.regs) {
 		caller.storeResults(returnReg, returnCount, results)
 	}

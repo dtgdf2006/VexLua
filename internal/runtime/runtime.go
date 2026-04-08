@@ -9,6 +9,7 @@ type Runtime struct {
 	heap         Heap
 	symbolIDs    map[string]uint32
 	symbolNames  []string
+	symbolValues []Handle
 	stringIDs    map[string]Handle
 	globals      Handle
 	registry     Handle
@@ -25,6 +26,7 @@ func NewRuntime() *Runtime {
 	rt := &Runtime{
 		symbolIDs:    make(map[string]uint32, 64),
 		symbolNames:  make([]string, 0, 64),
+		symbolValues: make([]Handle, 0, 64),
 		stringIDs:    make(map[string]Handle, 64),
 		nilMeta:      NilValue,
 		stringMeta:   NilValue,
@@ -48,8 +50,14 @@ func (rt *Runtime) InternSymbol(name string) uint32 {
 		return id
 	}
 	id := uint32(len(rt.symbolNames))
+	handle, ok := rt.stringIDs[name]
+	if !ok {
+		handle = rt.heap.NewString(name)
+		rt.stringIDs[name] = handle
+	}
 	rt.symbolIDs[name] = id
 	rt.symbolNames = append(rt.symbolNames, name)
+	rt.symbolValues = append(rt.symbolValues, handle)
 	return id
 }
 
@@ -58,6 +66,13 @@ func (rt *Runtime) SymbolName(sym uint32) string {
 		return fmt.Sprintf("sym#%d", sym)
 	}
 	return rt.symbolNames[sym]
+}
+
+func (rt *Runtime) SymbolValue(sym uint32) Value {
+	if int(sym) < len(rt.symbolValues) {
+		return HandleValue(rt.symbolValues[sym])
+	}
+	return rt.StringValue(rt.SymbolName(sym))
 }
 
 func (rt *Runtime) GlobalsHandle() Handle {
@@ -447,7 +462,7 @@ func (rt *Runtime) nextFast(table *Table, key Value) (Value, Value, bool, bool, 
 			return NumberValue(float64(nextIndex)), value, true, true, nil
 		}
 		if nextSym, value, found := table.nextSymbolEntry(0); found {
-			return rt.StringValue(rt.SymbolName(nextSym)), value, true, true, nil
+			return rt.SymbolValue(nextSym), value, true, true, nil
 		}
 		if hasHash {
 			return rt.firstHashEntry(table)
@@ -461,7 +476,7 @@ func (rt *Runtime) nextFast(table *Table, key Value) (Value, Value, bool, bool, 
 				return NumberValue(float64(nextIndex)), value, true, true, nil
 			}
 			if nextSym, value, found := table.nextSymbolEntry(0); found {
-				return rt.StringValue(rt.SymbolName(nextSym)), value, true, true, nil
+				return rt.SymbolValue(nextSym), value, true, true, nil
 			}
 			if hasHash {
 				return rt.firstHashEntry(table)
@@ -472,7 +487,7 @@ func (rt *Runtime) nextFast(table *Table, key Value) (Value, Value, bool, bool, 
 	if name, ok := rt.ToString(key); ok {
 		sym := rt.InternSymbol(name)
 		if nextSym, value, found := table.nextSymbolAfter(sym); found {
-			return rt.StringValue(rt.SymbolName(nextSym)), value, true, true, nil
+			return rt.SymbolValue(nextSym), value, true, true, nil
 		}
 		if hasHash {
 			return rt.firstHashEntry(table)
@@ -503,7 +518,7 @@ func (rt *Runtime) nextSlow(table *Table, key Value) (Value, Value, bool, error)
 		if !found || value.Kind() == KindNil {
 			continue
 		}
-		keys = append(keys, rt.StringValue(rt.SymbolName(sym)))
+		keys = append(keys, rt.SymbolValue(sym))
 		values = append(values, value)
 	}
 	for rawKey, value := range table.hash {
@@ -541,14 +556,27 @@ func (rt *Runtime) firstHashEntry(table *Table) (Value, Value, bool, bool, error
 }
 
 func (rt *Runtime) CallValue(callee Value, args []Value) (Value, error) {
-	results, err := rt.CallValueMulti(callee, args)
-	if err != nil {
-		return NilValue, err
+	h, ok := callee.Handle()
+	if !ok {
+		return NilValue, fmt.Errorf("attempt to call non-callable value %s", callee)
 	}
-	if len(results) == 0 {
-		return NilValue, nil
+	switch h.Kind() {
+	case ObjectHostFunction:
+		host := rt.heap.HostFunction(h)
+		if host.Call != nil {
+			return host.Call(rt, args)
+		}
+		results, err := host.CallMulti(rt, args)
+		if err != nil {
+			return NilValue, err
+		}
+		if len(results) == 0 {
+			return NilValue, nil
+		}
+		return results[0], nil
+	default:
+		return NilValue, fmt.Errorf("attempt to call unsupported object kind %s", h.Kind())
 	}
-	return results[0], nil
 }
 
 func (rt *Runtime) CallValueMulti(callee Value, args []Value) ([]Value, error) {

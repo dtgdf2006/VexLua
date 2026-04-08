@@ -2,6 +2,7 @@ package stdlib
 
 import (
 	"fmt"
+	"strings"
 
 	rt "vexlua/internal/runtime"
 	"vexlua/internal/vm"
@@ -122,16 +123,17 @@ func registerDebug(runtime *rt.Runtime, machine *vm.VM) error {
 		if err := validateDebugInfoOptions(what); err != nil {
 			return rt.NilValue, err
 		}
+		includeActiveLines := strings.ContainsRune(what, 'L')
 		var info vm.DebugInfo
 		if args[nextArg].IsNumber() {
 			level := int(args[nextArg].Number())
-			stackInfo, ok := machine.DebugInfoForLevel(co, level)
+			stackInfo, ok := machine.DebugInfoForLevelWithOptions(co, level, includeActiveLines)
 			if !ok {
 				return rt.NilValue, nil
 			}
 			info = stackInfo
 		} else {
-			functionInfo, err := machine.DebugInfoForFunction(args[nextArg])
+			functionInfo, err := machine.DebugInfoForFunctionWithOptions(args[nextArg], includeActiveLines)
 			if err != nil {
 				return rt.NilValue, err
 			}

@@ -603,6 +603,80 @@ return (getmetatable(a) == mt and 1 or 0) + sink.answer + (a + b)
 	}
 }
 
+func TestSparseArrayHolesStillUseIndexMetamethod(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local mt = {
+	__index = function(_, key)
+		return key * 10
+	end,
+}
+local t = setmetatable({}, mt)
+t[3] = 7
+return t[1] + t[2] + t[3]
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 37 {
+		t.Fatalf("sparse array metatable result = %v, want 37", got)
+	}
+}
+
+func TestNumericIndexMetatableSemanticsOnFastPath(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local sink = {}
+local mt = {
+	__index = function(_, key)
+		return key * 10
+	end,
+	__newindex = function(_, key, value)
+		sink[key] = value
+	end,
+}
+local t = setmetatable({[1] = 4}, mt)
+t[1] = 9
+t[2] = 5
+return t[1] + t[3] + sink[2]
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 44 {
+		t.Fatalf("numeric index fast path semantics result = %v, want 44", got)
+	}
+}
+
+func TestStringDumpSupportsQuickenedArrayOps(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local fn = function()
+	local t = {}
+	for i = 1, 8 do
+		t[i] = i
+	end
+	local sum = 0
+	for i = 1, #t do
+		sum = sum + t[i]
+	end
+	return sum
+end
+for i = 1, 4 do
+	fn()
+end
+local dumped = string.dump(fn)
+local loaded = assert(loadstring(dumped))
+return loaded()
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 36 {
+		t.Fatalf("quickened array dump result = %v, want 36", got)
+	}
+}
+
 func TestVarargAndMultiReturn(t *testing.T) {
 	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
 	result, err := engine.DoString(`
@@ -697,6 +771,31 @@ return sum
 	}
 	if got := result.Number(); got != 42 {
 		t.Fatalf("generic for result = %v, want 42", got)
+	}
+}
+
+func TestIpairsUsesRawArrayAccess(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local mt = {
+	__index = function(_, key)
+		if key == 1 then
+			return 99
+		end
+		return nil
+	end,
+}
+local sum = 0
+for _, v in ipairs(setmetatable({}, mt)) do
+	sum = sum + v
+end
+return sum
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 0 {
+		t.Fatalf("ipairs raw access result = %v, want 0", got)
 	}
 }
 
@@ -1077,6 +1176,24 @@ return ((formatted == "id:07:3.2:FF:\"hi\"") and 1 or 0)
 	}
 }
 
+func TestStringGSubPlainStaticReplacementPaths(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local r1, c1 = string.gsub("aaaa", "aa", "X")
+local r2, c2 = string.gsub("abcabc", "abc", 9, 1)
+return ((r1 == "XX") and 1 or 0)
+	+ c1 * 10
+	+ ((r2 == "9abc") and 100 or 0)
+	+ c2 * 1000
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 1121 {
+		t.Fatalf("plain static gsub result = %v, want 1121", got)
+	}
+}
+
 func TestStringDumpAdvancedPatternsAndObsoleteSetN(t *testing.T) {
 	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
 	result, err := engine.DoString(`
@@ -1337,6 +1454,9 @@ local function make()
 end
 local fn = make()
 local info = debug.getinfo(fn, "Su")
+local linesFn = assert(loadstring("local a = 1\nlocal b = 2\nreturn a + b\n", "@debug_getinfo_lines.lua"))
+local infoNoLines = debug.getinfo(linesFn, "S")
+local infoWithLines = debug.getinfo(linesFn, "SL")
 local name, value = debug.getupvalue(fn, 1)
 local changed = debug.setupvalue(fn, 1, 99)
 local _, updated = debug.getupvalue(fn, 1)
@@ -1352,12 +1472,14 @@ return ((debug.getfenv(proxy) == env) and 1 or 0)
 	+ ((fn() == 99) and 10000000 or 0)
 	+ ((type(registry) == "table") and 100000000 or 0)
 	+ ((string.find(trace, "stack traceback:", 1, true) ~= nil) and 1000000000 or 0)
+	+ ((infoNoLines.activelines == nil) and 10000000000 or 0)
+	+ (((infoWithLines.activelines[1] == true) and (infoWithLines.activelines[2] == true) and (infoWithLines.activelines[3] == true)) and 100000000000 or 0)
 `)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := result.Number(); got != 1111111111 {
-		t.Fatalf("userdata/debug result = %v, want 1111111111", got)
+	if got := result.Number(); got != 111111111111 {
+		t.Fatalf("userdata/debug result = %v, want 111111111111", got)
 	}
 }
 
