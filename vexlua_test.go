@@ -3,6 +3,7 @@ package vexlua
 import (
 	"bytes"
 	"math"
+	"path/filepath"
 	"runtime"
 	"testing"
 )
@@ -732,6 +733,235 @@ return loaded(40)
 	}
 }
 
+func TestStringMetatableFormatAndNumericCoercion(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local mt = getmetatable("")
+local quoted = string.format("%q", string.char(65, 0, 66, 10, 67, 13, 34, 92))
+local expected = string.char(34, 65, 92, 48, 48, 48, 66, 92, 10, 67, 92, 114, 92, 34, 92, 92, 34)
+return ((type(mt) == "table") and 1 or 0)
+	+ ((mt.__index == string) and 10 or 0)
+	+ ((("vexlua"):sub(2, 4) == "exl") and 100 or 0)
+	+ ((string.len(10) == 2) and 1000 or 0)
+	+ ((string.sub(12345, 2, 4) == "234") and 10000 or 0)
+	+ ((quoted == expected) and 100000 or 0)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 111111 {
+		t.Fatalf("string metatable/format result = %v, want 111111", got)
+	}
+}
+
+func TestLongStringsCommentsAndEscapes(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+--[=[
+ignored comment
+]=]
+local long = [=[alpha
+beta]=]
+local short = "\097\10\r\t\v\f\b\a\\\"\'"
+local expected = string.char(97, 10, 13, 9, 11, 12, 8, 7, 92, 34, 39)
+return ((long == "alpha\nbeta") and 1 or 0)
+	+ ((short == expected) and 10 or 0)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 11 {
+		t.Fatalf("long string/comment/escape result = %v, want 11", got)
+	}
+}
+
+func TestThreadUserdataMetatablesGlobalsAndMath(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local co = coroutine.create(function() end)
+local proxy = newproxy(true)
+local proxy2 = newproxy(proxy)
+local meta = getmetatable(proxy)
+meta.__index = { answer = 42 }
+debug.setmetatable(1, { __index = function(v, key) return v + 41 end })
+local n = 1
+local ip, fp = math.modf(3.25)
+return ((type(co) == "thread") and 1 or 0)
+	+ ((type(proxy) == "userdata") and 10 or 0)
+	+ ((proxy2.answer == 42) and 100 or 0)
+	+ ((n.answer == 42) and 1000 or 0)
+	+ (((_G ~= nil) and (_VERSION == "Lua 5.1")) and 10000 or 0)
+	+ ((math.sqrt(9) == 3) and 100000 or 0)
+	+ (((math.floor(2.9) == 2) and (math.ceil(2.1) == 3)) and 1000000 or 0)
+	+ (((ip == 3) and (fp == 0.25)) and 10000000 or 0)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 11111111 {
+		t.Fatalf("thread/userdata/metatable/globals/math result = %v, want 11111111", got)
+	}
+}
+
+func TestDoBlockStatementAndScope(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local x = 1
+do
+	local x = 40
+end
+do
+	x = x + 1
+end
+return x
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 2 {
+		t.Fatalf("do-block result = %v, want 2", got)
+	}
+}
+
+func TestProperTailCall(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local function loop(n, acc)
+	if n == 0 then
+		return acc
+	end
+	return loop(n - 1, acc + 1)
+end
+return loop(200000, 0)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 200000 {
+		t.Fatalf("proper tail call result = %v, want 200000", got)
+	}
+}
+
+func TestProperTailCallFrameReuseWithNestedCalls(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local loop, step
+local function add0(x)
+	return x
+end
+function loop(n, acc)
+	if n == 0 then
+		return acc
+	end
+	return step(n - 1, acc + 1)
+end
+function step(n, acc)
+	local current = add0(acc)
+	if n == 0 then
+		return current
+	end
+	return loop(n, current)
+end
+return loop(50000, 0)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 50000 {
+		t.Fatalf("proper tail call frame reuse result = %v, want 50000", got)
+	}
+}
+
+func TestUserdataEnvAndDebugIntrospection(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local proxy = newproxy(true)
+local env = { answer = 42 }
+debug.setfenv(proxy, env)
+local function make()
+	local captured = 41
+	return function()
+		return captured
+	end
+end
+local fn = make()
+local info = debug.getinfo(fn, "Su")
+local name, value = debug.getupvalue(fn, 1)
+local changed = debug.setupvalue(fn, 1, 99)
+local _, updated = debug.getupvalue(fn, 1)
+local trace = debug.traceback("boom", 1)
+local registry = debug.getregistry()
+return ((debug.getfenv(proxy) == env) and 1 or 0)
+	+ ((info.what == "Lua") and 10 or 0)
+	+ ((info.nups == 1) and 100 or 0)
+	+ ((name == "captured") and 1000 or 0)
+	+ ((value == 41) and 10000 or 0)
+	+ ((changed == "captured") and 100000 or 0)
+	+ ((updated == 99) and 1000000 or 0)
+	+ ((fn() == 99) and 10000000 or 0)
+	+ ((type(registry) == "table") and 100000000 or 0)
+	+ ((string.find(trace, "stack traceback:", 1, true) ~= nil) and 1000000000 or 0)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 1111111111 {
+		t.Fatalf("userdata/debug result = %v, want 1111111111", got)
+	}
+}
+
+func TestIOOSLoadfileAndGC(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	tempDir := t.TempDir()
+	dataPath := filepath.ToSlash(filepath.Join(tempDir, "data.txt"))
+	movedPath := filepath.ToSlash(filepath.Join(tempDir, "data-moved.txt"))
+	codePath := filepath.ToSlash(filepath.Join(tempDir, "code.lua"))
+	source := `
+local dataPath = [[` + dataPath + `]]
+local movedPath = [[` + movedPath + `]]
+local codePath = [[` + codePath + `]]
+local writer = assert(io.open(dataPath, "w"))
+assert(io.type(writer) == "file")
+assert(writer:write("alpha\nbeta\n"))
+assert(writer:close())
+local reader = assert(io.open(dataPath, "r"))
+local line1 = reader:read()
+local line2 = reader:read("*l")
+assert(reader:close())
+assert(os.rename(dataPath, movedPath))
+local moved = assert(io.open(movedPath, "r"))
+local all = moved:read("*a")
+assert(moved:close())
+assert(os.remove(movedPath))
+local chunk = assert(io.open(codePath, "w"))
+assert(chunk:write("return 20 + 22"))
+assert(chunk:close())
+local loaded = assert(loadfile(codePath))
+local total = loaded() + dofile(codePath)
+assert(os.remove(codePath))
+local utc = os.date("!%Y-%m-%d", 86400)
+local stamp = os.time({year = 2001, month = 9, day = 9, hour = 1, min = 46, sec = 40})
+local stampInfo = os.date("*t", stamp)
+local count = collectgarbage("count")
+local prev = collectgarbage("setpause", 150)
+return ((line1 == "alpha") and 1 or 0)
+	+ ((line2 == "beta") and 10 or 0)
+	+ ((all == "alpha\nbeta\n") and 100 or 0)
+	+ ((total == 84) and 1000 or 0)
+	+ ((io.type(io.stdout) == "file") and 10000 or 0)
+	+ ((utc == "1970-01-02") and 100000 or 0)
+	+ (((stampInfo.year == 2001) and (stampInfo.month == 9) and (stampInfo.day == 9) and (stampInfo.hour == 1) and (stampInfo.min == 46) and (stampInfo.sec == 40)) and 1000000 or 0)
+	+ ((type(count) == "number" and type(prev) == "number" and type(gcinfo()) == "number") and 10000000 or 0)
+`
+	result, err := engine.DoString(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 11111111 {
+		t.Fatalf("io/os/loadfile/gc result = %v, want 11111111", got)
+	}
+}
+
 func TestMetatableCallToStringProtectionAndCompareFallback(t *testing.T) {
 	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
 	result, err := engine.DoString(`
@@ -943,6 +1173,65 @@ return box:inc(1)
 	}
 	if got := result.Number(); got != 42 {
 		t.Fatalf("method official roundtrip result = %v, want 42", got)
+	}
+}
+
+func TestWeakTablesAndUserdataFinalizer(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local finalized = 0
+local weakValues = setmetatable({}, { __mode = "v" })
+do
+	local value = {}
+	weakValues[1] = value
+end
+collectgarbage("collect")
+collectgarbage("collect")
+local weakKeys = setmetatable({}, { __mode = "k" })
+do
+	local key = {}
+	weakKeys[key] = 42
+end
+collectgarbage("collect")
+collectgarbage("collect")
+do
+	local proxy = newproxy(true)
+	getmetatable(proxy).__gc = function()
+		finalized = finalized + 1
+	end
+	proxy = nil
+end
+collectgarbage("collect")
+collectgarbage("collect")
+return ((weakValues[1] == nil) and 1 or 0)
+	+ ((next(weakKeys) == nil) and 10 or 0)
+	+ ((finalized == 1) and 100 or 0)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 111 {
+		t.Fatalf("weak table/finalizer result = %v, want 111", got)
+	}
+}
+
+func TestCoroutineWrapSurvivesCollectGarbage(t *testing.T) {
+	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 16})
+	result, err := engine.DoString(`
+local wrapped = coroutine.wrap(function()
+	local next = coroutine.yield(40)
+	return next + 2
+end)
+local first = wrapped()
+collectgarbage("collect")
+local second = wrapped(40)
+return first + second
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Number(); got != 82 {
+		t.Fatalf("coroutine.wrap GC result = %v, want 82", got)
 	}
 }
 

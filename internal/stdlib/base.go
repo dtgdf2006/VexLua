@@ -2,6 +2,7 @@ package stdlib
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -12,6 +13,8 @@ import (
 )
 
 func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) error {
+	runtime.SetGlobal("_G", rt.HandleValue(runtime.GlobalsHandle()))
+	runtime.SetGlobal("_VERSION", runtime.StringValue("Lua 5.1"))
 	runtime.SetGlobal("print", runtime.NewHostFunction("print", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		parts := make([]string, 0, len(args))
 		for _, arg := range args {
@@ -49,23 +52,42 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		}
 		return runtime.StringValue(text), nil
 	}))
-	if err := bind(runtime, "tonumber", func(value rt.Value) (float64, error) {
-		if value.IsNumber() {
-			return value.Number(), nil
+	runtime.SetGlobal("tonumber", runtime.NewHostFunction("tonumber", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) == 0 || len(args) > 2 {
+			return rt.NilValue, fmt.Errorf("tonumber expects 1 or 2 arguments")
 		}
-		s, ok := runtime.ToString(value)
-		if !ok {
-			return 0, fmt.Errorf("tonumber expects string or number")
+		if len(args) == 1 {
+			if args[0].IsNumber() {
+				return args[0], nil
+			}
+			s, ok := runtime.ToString(args[0])
+			if !ok {
+				return rt.NilValue, nil
+			}
+			parsed, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+			if err != nil {
+				return rt.NilValue, nil
+			}
+			return rt.NumberValue(parsed), nil
 		}
-		parsed, err := strconv.ParseFloat(s, 64)
+		if !args[1].IsNumber() {
+			return rt.NilValue, fmt.Errorf("tonumber base expects number")
+		}
+		base := int(args[1].Number())
+		if base < 2 || base > 36 {
+			return rt.NilValue, fmt.Errorf("base out of range")
+		}
+		s, ok := runtime.ToString(args[0])
+		if !ok || args[0].IsNumber() {
+			return rt.NilValue, nil
+		}
+		parsed, err := strconv.ParseInt(strings.TrimSpace(s), base, 64)
 		if err != nil {
-			return 0, err
+			return rt.NilValue, nil
 		}
-		return parsed, nil
-	}); err != nil {
-		return err
-	}
-	runtime.SetGlobal("getmetatable", runtime.NewHostFunction("getmetatable", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		return rt.NumberValue(float64(parsed)), nil
+	}))
+	getmetatableFunc := runtime.NewHostFunction("getmetatable", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		if len(args) != 1 {
 			return rt.NilValue, fmt.Errorf("getmetatable expects 1 argument")
 		}
@@ -77,8 +99,9 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 			return protected, nil
 		}
 		return meta, nil
-	}))
-	runtime.SetGlobal("setmetatable", runtime.NewHostFunction("setmetatable", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+	})
+	runtime.SetGlobal("getmetatable", getmetatableFunc)
+	setmetatableFunc := runtime.NewHostFunction("setmetatable", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		if len(args) != 2 {
 			return rt.NilValue, fmt.Errorf("setmetatable expects 2 arguments")
 		}
@@ -91,7 +114,8 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 			return rt.NilValue, err
 		}
 		return args[0], nil
-	}))
+	})
+	runtime.SetGlobal("setmetatable", setmetatableFunc)
 	runtime.SetGlobal("error", runtime.NewHostFunction("error", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
 		message := runtime.StringValue("error")
 		if len(args) > 0 {
@@ -213,14 +237,8 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		}
 		return results, nil
 	}))
-	loadString := runtime.NewHostFunction("loadstring", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
-		if len(args) != 1 {
-			return rt.NilValue, fmt.Errorf("loadstring expects 1 argument")
-		}
-		source, ok := runtime.ToString(args[0])
-		if !ok {
-			return rt.NilValue, fmt.Errorf("loadstring expects string")
-		}
+	validProxyMetas := make(map[rt.Handle]struct{})
+	compileLoadedChunk := func(source string, name string) (rt.Value, rt.Value) {
 		var (
 			proto *bytecode.Proto
 			err   error
@@ -229,13 +247,189 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 			proto, err = chunk51.Load(runtime, []byte(source))
 		} else {
 			proto, err = compiler.CompileSource(source)
+			if err == nil && name != "" {
+				proto.Name = name
+				proto.SetSourceRecursive(name)
+			}
 		}
 		if err != nil {
-			return rt.NilValue, err
+			return rt.NilValue, runtime.StringValue(err.Error())
 		}
-		return machine.NewClosureValue(proto), nil
+		return machine.NewClosureValue(proto), rt.NilValue
+	}
+	gcPause := 200
+	gcStepMul := 200
+	gcRunning := true
+	runtime.SetGlobal("newproxy", runtime.NewHostFunction("newproxy", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) > 1 {
+			return rt.NilValue, fmt.Errorf("newproxy expects 0 or 1 argument")
+		}
+		arg := rt.NilValue
+		if len(args) == 1 {
+			arg = args[0]
+		}
+		if arg.Kind() == rt.KindNil || (arg.Kind() == rt.KindBool && !arg.Bool()) {
+			return runtime.NewUserdataValueWithEnv(nil, rt.NilValue, machine.CurrentEnv()), nil
+		}
+		if arg.Kind() == rt.KindBool {
+			meta := runtime.Heap().NewTable(0)
+			validProxyMetas[meta] = struct{}{}
+			return runtime.NewUserdataValueWithEnv(nil, rt.HandleValue(meta), machine.CurrentEnv()), nil
+		}
+		h, ok := arg.Handle()
+		if !ok || h.Kind() != rt.ObjectUserdata {
+			return rt.NilValue, fmt.Errorf("boolean or proxy expected")
+		}
+		meta, hasMeta := runtime.GetMetatable(arg)
+		if !hasMeta || meta.Kind() == rt.KindNil {
+			return rt.NilValue, fmt.Errorf("boolean or proxy expected")
+		}
+		mh, ok := meta.Handle()
+		if !ok || mh.Kind() != rt.ObjectTable {
+			return rt.NilValue, fmt.Errorf("boolean or proxy expected")
+		}
+		if _, valid := validProxyMetas[mh]; !valid {
+			return rt.NilValue, fmt.Errorf("boolean or proxy expected")
+		}
+		return runtime.NewUserdataValueWithEnv(nil, meta, machine.CurrentEnv()), nil
+	}))
+	loadString := runtime.NewHostFunctionMulti("loadstring", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) == 0 || len(args) > 2 {
+			return nil, fmt.Errorf("loadstring expects 1 or 2 arguments")
+		}
+		source, ok := runtime.ToString(args[0])
+		if !ok {
+			return nil, fmt.Errorf("loadstring expects string")
+		}
+		name := ""
+		if len(args) == 2 && args[1].Kind() != rt.KindNil {
+			text, ok := runtime.ToString(args[1])
+			if !ok {
+				return nil, fmt.Errorf("loadstring chunk name expects string")
+			}
+			name = text
+		}
+		chunk, errValue := compileLoadedChunk(source, name)
+		if errValue.Kind() != rt.KindNil {
+			return []rt.Value{rt.NilValue, errValue}, nil
+		}
+		return []rt.Value{chunk}, nil
 	})
 	runtime.SetGlobal("loadstring", loadString)
+	runtime.SetGlobal("loadfile", runtime.NewHostFunctionMulti("loadfile", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) > 1 {
+			return nil, fmt.Errorf("loadfile expects 0 or 1 argument")
+		}
+		if len(args) == 0 || args[0].Kind() == rt.KindNil {
+			return []rt.Value{rt.NilValue, runtime.StringValue("loadfile without filename is not supported")}, nil
+		}
+		filename, ok := runtime.ToString(args[0])
+		if !ok {
+			return nil, fmt.Errorf("loadfile expects string filename")
+		}
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			return []rt.Value{rt.NilValue, runtime.StringValue(err.Error())}, nil
+		}
+		sourceName := filename
+		if sourceName != "" && sourceName[0] != '@' && sourceName[0] != '=' {
+			sourceName = "@" + sourceName
+		}
+		chunk, errValue := compileLoadedChunk(string(data), sourceName)
+		if errValue.Kind() != rt.KindNil {
+			return []rt.Value{rt.NilValue, errValue}, nil
+		}
+		return []rt.Value{chunk}, nil
+	}))
+	runtime.SetGlobal("dofile", runtime.NewHostFunctionMulti("dofile", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		if len(args) > 1 {
+			return nil, fmt.Errorf("dofile expects 0 or 1 argument")
+		}
+		if len(args) == 0 || args[0].Kind() == rt.KindNil {
+			return nil, fmt.Errorf("dofile without filename is not supported")
+		}
+		filename, ok := runtime.ToString(args[0])
+		if !ok {
+			return nil, fmt.Errorf("dofile expects string filename")
+		}
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			return nil, err
+		}
+		sourceName := filename
+		if sourceName != "" && sourceName[0] != '@' && sourceName[0] != '=' {
+			sourceName = "@" + sourceName
+		}
+		chunk, errValue := compileLoadedChunk(string(data), sourceName)
+		if errValue.Kind() != rt.KindNil {
+			return nil, raiseValueError(runtime, errValue)
+		}
+		return machine.CallValue(chunk, nil)
+	}))
+	runtime.SetGlobal("collectgarbage", runtime.NewHostFunctionMulti("collectgarbage", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
+		option := "collect"
+		if len(args) > 0 {
+			text, ok := runtime.ToString(args[0])
+			if !ok {
+				return nil, fmt.Errorf("collectgarbage expects string option")
+			}
+			option = text
+		}
+		count := func() rt.Value {
+			return rt.NumberValue(float64(runtime.ApproxMemoryBytes()) / 1024.0)
+		}
+		switch option {
+		case "collect":
+			if gcRunning {
+				if err := machine.CollectGarbage(); err != nil {
+					return nil, err
+				}
+			}
+			return []rt.Value{rt.NumberValue(0)}, nil
+		case "count":
+			return []rt.Value{count()}, nil
+		case "step":
+			if !gcRunning {
+				return []rt.Value{rt.FalseValue}, nil
+			}
+			if err := machine.CollectGarbage(); err != nil {
+				return nil, err
+			}
+			return []rt.Value{rt.TrueValue}, nil
+		case "stop":
+			gcRunning = false
+			return []rt.Value{rt.NumberValue(0)}, nil
+		case "restart":
+			gcRunning = true
+			return []rt.Value{rt.NumberValue(0)}, nil
+		case "setpause":
+			previous := gcPause
+			if len(args) > 1 {
+				if !args[1].IsNumber() {
+					return nil, fmt.Errorf("collectgarbage setpause expects number")
+				}
+				gcPause = int(args[1].Number())
+			}
+			return []rt.Value{rt.NumberValue(float64(previous))}, nil
+		case "setstepmul":
+			previous := gcStepMul
+			if len(args) > 1 {
+				if !args[1].IsNumber() {
+					return nil, fmt.Errorf("collectgarbage setstepmul expects number")
+				}
+				gcStepMul = int(args[1].Number())
+			}
+			return []rt.Value{rt.NumberValue(float64(previous))}, nil
+		default:
+			return nil, fmt.Errorf("invalid collectgarbage option %q", option)
+		}
+	}))
+	runtime.SetGlobal("gcinfo", runtime.NewHostFunction("gcinfo", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) != 0 {
+			return rt.NilValue, fmt.Errorf("gcinfo expects no arguments")
+		}
+		return rt.NumberValue(float64(runtime.ApproxMemoryBytes()) / 1024.0), nil
+	}))
 	nextFunc := runtime.NewHostFunctionMulti("next", func(runtime *rt.Runtime, args []rt.Value) ([]rt.Value, error) {
 		if len(args) == 0 {
 			return nil, fmt.Errorf("next expects table")
@@ -294,7 +488,7 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 		if args[0].IsNumber() {
 			return machine.CurrentEnv(), nil
 		}
-		return machine.GetFunctionEnv(args[0])
+		return machine.GetEnv(args[0])
 	})
 	runtime.SetGlobal("getfenv", getfenv)
 	setfenv := runtime.NewHostFunction("setfenv", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
@@ -307,7 +501,7 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 			}
 			return args[0], nil
 		}
-		if err := machine.SetFunctionEnv(args[0], args[1]); err != nil {
+		if err := machine.SetEnv(args[0], args[1]); err != nil {
 			return rt.NilValue, err
 		}
 		return args[0], nil
@@ -429,6 +623,25 @@ func registerBase(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) 
 	debugTable := runtime.Heap().Table(debugHandle)
 	debugTable.SetSymbol(runtime.InternSymbol("getfenv"), getfenv)
 	debugTable.SetSymbol(runtime.InternSymbol("setfenv"), setfenv)
+	debugTable.SetSymbol(runtime.InternSymbol("getmetatable"), runtime.NewHostFunction("debug.getmetatable", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) != 1 {
+			return rt.NilValue, fmt.Errorf("debug.getmetatable expects 1 argument")
+		}
+		meta, ok := runtime.GetMetatable(args[0])
+		if !ok {
+			return rt.NilValue, nil
+		}
+		return meta, nil
+	}))
+	debugTable.SetSymbol(runtime.InternSymbol("setmetatable"), runtime.NewHostFunction("debug.setmetatable", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
+		if len(args) != 2 {
+			return rt.NilValue, fmt.Errorf("debug.setmetatable expects 2 arguments")
+		}
+		if err := runtime.SetAnyMetatable(args[0], args[1]); err != nil {
+			return rt.NilValue, err
+		}
+		return args[0], nil
+	}))
 	runtime.SetGlobal("debug", rt.HandleValue(debugHandle))
 	return nil
 }

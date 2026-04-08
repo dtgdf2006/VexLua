@@ -13,24 +13,30 @@ type Expr interface {
 }
 
 type LocalAssignStmt struct {
+	Line   int
 	Names  []string
 	Values []Expr
 }
 
-type BreakStmt struct{}
+type BreakStmt struct {
+	Line int
+}
 
 type AssignStmt struct {
+	Line    int
 	Targets []Expr
 	Values  []Expr
 }
 
 type FunctionStmt struct {
-	Local  bool
-	Name   string
-	Target Expr
-	Params []string
-	Vararg bool
-	Body   []Stmt
+	Line    int
+	EndLine int
+	Local   bool
+	Name    string
+	Target  Expr
+	Params  []string
+	Vararg  bool
+	Body    []Stmt
 }
 
 type IfClause struct {
@@ -39,21 +45,30 @@ type IfClause struct {
 }
 
 type IfStmt struct {
+	Line     int
 	Clauses  []IfClause
 	ElseBody []Stmt
 }
 
 type WhileStmt struct {
+	Line int
 	Cond Expr
 	Body []Stmt
 }
 
 type RepeatStmt struct {
+	Line int
 	Body []Stmt
 	Cond Expr
 }
 
+type DoStmt struct {
+	Line int
+	Body []Stmt
+}
+
 type ForNumericStmt struct {
+	Line  int
 	Name  string
 	Start Expr
 	Limit Expr
@@ -62,73 +77,92 @@ type ForNumericStmt struct {
 }
 
 type ForGenericStmt struct {
+	Line  int
 	Names []string
 	Exprs []Expr
 	Body  []Stmt
 }
 
 type ReturnStmt struct {
+	Line   int
 	Values []Expr
 }
 
 type ExprStmt struct {
+	Line int
 	Expr Expr
 }
 
 type NameExpr struct {
+	Line int
 	Name string
 }
 
 type NumberExpr struct {
+	Line  int
 	Value float64
 }
 
 type StringExpr struct {
+	Line  int
 	Value string
 }
 
 type BoolExpr struct {
+	Line  int
 	Value bool
 }
 
-type NilExpr struct{}
+type NilExpr struct {
+	Line int
+}
 
-type VarargExpr struct{}
+type VarargExpr struct {
+	Line int
+}
 
 type UnaryExpr struct {
+	Line int
 	Op   TokenType
 	Expr Expr
 }
 
 type BinaryExpr struct {
+	Line  int
 	Op    TokenType
 	Left  Expr
 	Right Expr
 }
 
 type CallExpr struct {
+	Line   int
 	Callee Expr
 	Args   []Expr
 }
 
 type MethodCallExpr struct {
+	Line     int
 	Receiver Expr
 	Name     string
 	Args     []Expr
 }
 
 type FieldExpr struct {
+	Line   int
 	Target Expr
 	Name   string
 }
 
 type FunctionExpr struct {
-	Params []string
-	Vararg bool
-	Body   []Stmt
+	Line    int
+	EndLine int
+	Params  []string
+	Vararg  bool
+	Body    []Stmt
 }
 
 type IndexExpr struct {
+	Line   int
 	Target Expr
 	Key    Expr
 }
@@ -149,6 +183,7 @@ type TableField struct {
 }
 
 type TableExpr struct {
+	Line   int
 	Fields []TableField
 }
 
@@ -159,6 +194,7 @@ func (*FunctionStmt) stmtNode()    {}
 func (*IfStmt) stmtNode()          {}
 func (*WhileStmt) stmtNode()       {}
 func (*RepeatStmt) stmtNode()      {}
+func (*DoStmt) stmtNode()          {}
 func (*ForNumericStmt) stmtNode()  {}
 func (*ForGenericStmt) stmtNode()  {}
 func (*ReturnStmt) stmtNode()      {}

@@ -1,8 +1,11 @@
 package stdlib
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"strings"
+	"syscall"
 
 	rt "vexlua/internal/runtime"
 	"vexlua/internal/vm"
@@ -53,7 +56,9 @@ func typeName(runtime *rt.Runtime, value rt.Value) string {
 			return "table"
 		case rt.ObjectHostFunction, rt.ObjectLuaClosure:
 			return "function"
-		case rt.ObjectHostProxy:
+		case rt.ObjectThread:
+			return "thread"
+		case rt.ObjectUserdata, rt.ObjectHostProxy:
 			return "userdata"
 		default:
 			return "userdata"
@@ -72,15 +77,27 @@ func typeString(runtime *rt.Runtime, value rt.Value) string {
 
 func asCoroutine(runtime *rt.Runtime, value rt.Value) (*vm.Coroutine, error) {
 	h, ok := value.Handle()
-	if !ok || h.Kind() != rt.ObjectHostProxy {
+	if !ok {
 		return nil, fmt.Errorf("expected coroutine")
 	}
-	proxy := runtime.Heap().HostProxy(h)
-	co, ok := proxy.Subject.(*vm.Coroutine)
-	if !ok {
-		return nil, fmt.Errorf("expected coroutine, got %T", proxy.Subject)
+	switch h.Kind() {
+	case rt.ObjectThread:
+		thread := runtime.Heap().Thread(h)
+		co, ok := thread.State.(*vm.Coroutine)
+		if !ok {
+			return nil, fmt.Errorf("expected coroutine, got %T", thread.State)
+		}
+		return co, nil
+	case rt.ObjectHostProxy:
+		proxy := runtime.Heap().HostProxy(h)
+		co, ok := proxy.Subject.(*vm.Coroutine)
+		if !ok {
+			return nil, fmt.Errorf("expected coroutine, got %T", proxy.Subject)
+		}
+		return co, nil
+	default:
+		return nil, fmt.Errorf("expected coroutine")
 	}
-	return co, nil
 }
 
 func coroutineValue(runtime *rt.Runtime, co *vm.Coroutine) rt.Value {
@@ -90,7 +107,7 @@ func coroutineValue(runtime *rt.Runtime, co *vm.Coroutine) rt.Value {
 	if co.Proxy().Kind() != rt.KindNil {
 		return co.Proxy()
 	}
-	value := runtime.NewHostProxy("coroutine", co, nil)
+	value := runtime.NewThreadValue(co)
 	co.SetProxy(value)
 	return value
 }
@@ -152,6 +169,26 @@ func errorToValue(runtime *rt.Runtime, err error) rt.Value {
 		return raised.value
 	}
 	return runtime.StringValue(err.Error())
+}
+
+func failureValues(runtime *rt.Runtime, err error) []rt.Value {
+	values := []rt.Value{rt.NilValue, runtime.StringValue(err.Error())}
+	if code, ok := failureCode(err); ok {
+		values = append(values, rt.NumberValue(float64(code)))
+	}
+	return values
+}
+
+func failureCode(err error) (int, bool) {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return int(errno), true
+	}
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) && errors.As(pathErr.Err, &errno) {
+		return int(errno), true
+	}
+	return 0, false
 }
 
 func errorAs(err error, target **luaError) bool {
@@ -240,7 +277,7 @@ func concatString(runtime *rt.Runtime, value rt.Value) (string, bool) {
 		return s, true
 	}
 	if value.IsNumber() {
-		return fmt.Sprintf("%g", value.Number()), true
+		return rt.FormatNumber(value.Number()), true
 	}
 	return "", false
 }

@@ -101,8 +101,28 @@ func (e *Engine) CompileString(source string) (*bytecode.Proto, error) {
 	return e.compiler.CompileSource(source)
 }
 
+func (e *Engine) CompileStringNamed(source string, name string) (*bytecode.Proto, error) {
+	proto, err := e.compiler.CompileSource(source)
+	if err != nil {
+		return nil, err
+	}
+	if name != "" {
+		proto.Name = name
+		proto.SetSourceRecursive(name)
+	}
+	return proto, nil
+}
+
 func (e *Engine) DoString(source string) (Value, error) {
 	proto, err := e.cachedCompileString(source)
+	if err != nil {
+		return rt.NilValue, err
+	}
+	return e.Run(proto)
+}
+
+func (e *Engine) DoStringNamed(source string, name string) (Value, error) {
+	proto, err := e.CompileStringNamed(source, name)
 	if err != nil {
 		return rt.NilValue, err
 	}

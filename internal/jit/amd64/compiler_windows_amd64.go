@@ -124,6 +124,11 @@ func (c *Compiler) Compile(proto *bytecode.Proto) (jit.Program, error) {
 			emit.movRegMem(0, slotDisp(instr.A))
 			emit.ret()
 		case bytecode.OpReturnMulti:
+			if instr.B == 0 {
+				emit.movRegImm64(0, uint64(rt.NilValue))
+				emit.ret()
+				break
+			}
 			if instr.B != 1 {
 				return nil, jit.ErrUnsupported
 			}

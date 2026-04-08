@@ -180,6 +180,10 @@ func (t *Table) String() string {
 	return fmt.Sprintf("table(shape=%d, version=%d)", t.shape, t.version)
 }
 
+func (t *Table) ApproxBytes() int64 {
+	return int64(len(t.array))*8 + int64(len(t.hash))*24 + int64(len(t.slots))*16 + int64(len(t.keys))*4 + int64(len(t.fields))*8 + 64
+}
+
 func (t *Table) nextArrayEntry(after int) (int, Value, bool) {
 	for index := after + 1; index <= len(t.array); index++ {
 		value := t.array[index-1]

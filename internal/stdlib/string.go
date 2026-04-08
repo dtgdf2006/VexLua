@@ -12,6 +12,7 @@ import (
 func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 	handle := runtime.Heap().NewTable(8)
 	table := runtime.Heap().Table(handle)
+	stringValue := rt.HandleValue(handle)
 	set := func(name string, value rt.Value) {
 		table.SetSymbol(runtime.InternSymbol(name), value)
 	}
@@ -19,9 +20,9 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) != 1 {
 			return rt.NilValue, fmt.Errorf("string.len expects 1 argument")
 		}
-		s, ok := runtime.ToString(args[0])
+		s, ok := concatString(runtime, args[0])
 		if !ok {
-			return rt.NilValue, fmt.Errorf("string.len expects string")
+			return rt.NilValue, fmt.Errorf("string.len expects string or number")
 		}
 		return rt.NumberValue(float64(len(s))), nil
 	}))
@@ -29,9 +30,9 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) < 2 || len(args) > 3 {
 			return rt.NilValue, fmt.Errorf("string.sub expects 2 or 3 arguments")
 		}
-		s, ok := runtime.ToString(args[0])
+		s, ok := concatString(runtime, args[0])
 		if !ok {
-			return rt.NilValue, fmt.Errorf("string.sub expects string")
+			return rt.NilValue, fmt.Errorf("string.sub expects string or number")
 		}
 		if !args[1].IsNumber() {
 			return rt.NilValue, fmt.Errorf("string.sub start expects number")
@@ -52,9 +53,9 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) != 1 {
 			return rt.NilValue, fmt.Errorf("string.lower expects 1 argument")
 		}
-		s, ok := runtime.ToString(args[0])
+		s, ok := concatString(runtime, args[0])
 		if !ok {
-			return rt.NilValue, fmt.Errorf("string.lower expects string")
+			return rt.NilValue, fmt.Errorf("string.lower expects string or number")
 		}
 		return runtime.StringValue(strings.ToLower(s)), nil
 	}))
@@ -62,9 +63,9 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) != 1 {
 			return rt.NilValue, fmt.Errorf("string.upper expects 1 argument")
 		}
-		s, ok := runtime.ToString(args[0])
+		s, ok := concatString(runtime, args[0])
 		if !ok {
-			return rt.NilValue, fmt.Errorf("string.upper expects string")
+			return rt.NilValue, fmt.Errorf("string.upper expects string or number")
 		}
 		return runtime.StringValue(strings.ToUpper(s)), nil
 	}))
@@ -72,9 +73,9 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) < 1 || len(args) > 3 {
 			return nil, fmt.Errorf("string.byte expects 1 to 3 arguments")
 		}
-		s, ok := runtime.ToString(args[0])
+		s, ok := concatString(runtime, args[0])
 		if !ok {
-			return nil, fmt.Errorf("string.byte expects string")
+			return nil, fmt.Errorf("string.byte expects string or number")
 		}
 		start := 1
 		finish := 1
@@ -119,9 +120,9 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) != 1 {
 			return rt.NilValue, fmt.Errorf("string.reverse expects 1 argument")
 		}
-		s, ok := runtime.ToString(args[0])
+		s, ok := concatString(runtime, args[0])
 		if !ok {
-			return rt.NilValue, fmt.Errorf("string.reverse expects string")
+			return rt.NilValue, fmt.Errorf("string.reverse expects string or number")
 		}
 		buf := make([]byte, len(s))
 		for i := range s {
@@ -133,9 +134,9 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) != 2 {
 			return rt.NilValue, fmt.Errorf("string.rep expects 2 arguments")
 		}
-		s, ok := runtime.ToString(args[0])
+		s, ok := concatString(runtime, args[0])
 		if !ok {
-			return rt.NilValue, fmt.Errorf("string.rep expects string")
+			return rt.NilValue, fmt.Errorf("string.rep expects string or number")
 		}
 		if !args[1].IsNumber() {
 			return rt.NilValue, fmt.Errorf("string.rep count expects number")
@@ -150,13 +151,13 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) < 2 || len(args) > 4 {
 			return nil, fmt.Errorf("string.find expects 2 to 4 arguments")
 		}
-		s, ok := runtime.ToString(args[0])
+		s, ok := concatString(runtime, args[0])
 		if !ok {
-			return nil, fmt.Errorf("string.find expects string")
+			return nil, fmt.Errorf("string.find expects string or number")
 		}
-		pattern, ok := runtime.ToString(args[1])
+		pattern, ok := concatString(runtime, args[1])
 		if !ok {
-			return nil, fmt.Errorf("string.find pattern expects string")
+			return nil, fmt.Errorf("string.find pattern expects string or number")
 		}
 		start := 1
 		if len(args) >= 3 {
@@ -172,13 +173,13 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) < 2 || len(args) > 3 {
 			return nil, fmt.Errorf("string.match expects 2 or 3 arguments")
 		}
-		s, ok := runtime.ToString(args[0])
+		s, ok := concatString(runtime, args[0])
 		if !ok {
-			return nil, fmt.Errorf("string.match expects string")
+			return nil, fmt.Errorf("string.match expects string or number")
 		}
-		pattern, ok := runtime.ToString(args[1])
+		pattern, ok := concatString(runtime, args[1])
 		if !ok {
-			return nil, fmt.Errorf("string.match pattern expects string")
+			return nil, fmt.Errorf("string.match pattern expects string or number")
 		}
 		start := 1
 		if len(args) == 3 {
@@ -193,13 +194,13 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) < 2 || len(args) > 3 {
 			return rt.NilValue, fmt.Errorf("string.gmatch expects 2 or 3 arguments")
 		}
-		s, ok := runtime.ToString(args[0])
+		s, ok := concatString(runtime, args[0])
 		if !ok {
-			return rt.NilValue, fmt.Errorf("string.gmatch expects string")
+			return rt.NilValue, fmt.Errorf("string.gmatch expects string or number")
 		}
-		pattern, ok := runtime.ToString(args[1])
+		pattern, ok := concatString(runtime, args[1])
 		if !ok {
-			return rt.NilValue, fmt.Errorf("string.gmatch pattern expects string")
+			return rt.NilValue, fmt.Errorf("string.gmatch pattern expects string or number")
 		}
 		start := 1
 		if len(args) == 3 {
@@ -216,13 +217,13 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) < 3 || len(args) > 4 {
 			return nil, fmt.Errorf("string.gsub expects 3 or 4 arguments")
 		}
-		s, ok := runtime.ToString(args[0])
+		s, ok := concatString(runtime, args[0])
 		if !ok {
-			return nil, fmt.Errorf("string.gsub expects string")
+			return nil, fmt.Errorf("string.gsub expects string or number")
 		}
-		pattern, ok := runtime.ToString(args[1])
+		pattern, ok := concatString(runtime, args[1])
 		if !ok {
-			return nil, fmt.Errorf("string.gsub pattern expects string")
+			return nil, fmt.Errorf("string.gsub pattern expects string or number")
 		}
 		limit := -1
 		if len(args) == 4 {
@@ -237,9 +238,9 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		if len(args) == 0 {
 			return rt.NilValue, fmt.Errorf("string.format expects format string")
 		}
-		format, ok := runtime.ToString(args[0])
+		format, ok := concatString(runtime, args[0])
 		if !ok {
-			return rt.NilValue, fmt.Errorf("string.format expects string format")
+			return rt.NilValue, fmt.Errorf("string.format expects string or number format")
 		}
 		text, err := stringFormat(runtime, format, args[1:])
 		if err != nil {
@@ -248,12 +249,18 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		return runtime.StringValue(text), nil
 	}))
 	set("dump", runtime.NewHostFunction("string.dump", func(runtime *rt.Runtime, args []rt.Value) (rt.Value, error) {
-		if len(args) < 1 || len(args) > 2 {
-			return rt.NilValue, fmt.Errorf("string.dump expects 1 or 2 arguments")
+		if len(args) != 1 {
+			return rt.NilValue, fmt.Errorf("string.dump expects 1 argument")
 		}
 		h, ok := args[0].Handle()
-		if !ok || h.Kind() != rt.ObjectLuaClosure {
-			return rt.NilValue, fmt.Errorf("string.dump expects Lua function")
+		if !ok {
+			return rt.NilValue, fmt.Errorf("string.dump expects function")
+		}
+		if h.Kind() == rt.ObjectHostFunction {
+			return rt.NilValue, fmt.Errorf("unable to dump given function")
+		}
+		if h.Kind() != rt.ObjectLuaClosure {
+			return rt.NilValue, fmt.Errorf("string.dump expects function")
 		}
 		closure := runtime.Heap().LuaClosure(h).(*vm.LuaClosure)
 		data, err := chunk51.Dump(runtime, closure.Proto)
@@ -262,7 +269,13 @@ func registerString(runtime *rt.Runtime, machine *vm.VM) error {
 		}
 		return runtime.StringValue(string(data)), nil
 	}))
-	runtime.SetGlobal("string", rt.HandleValue(handle))
+	metaHandle := runtime.Heap().NewTable(1)
+	metaTable := runtime.Heap().Table(metaHandle)
+	metaTable.SetSymbol(runtime.InternSymbol("__index"), stringValue)
+	if err := runtime.SetStringMetatable(rt.HandleValue(metaHandle)); err != nil {
+		return err
+	}
+	runtime.SetGlobal("string", stringValue)
 	return nil
 }
 
@@ -396,7 +409,7 @@ func stringGSubReplacement(runtime *rt.Runtime, machine *vm.VM, repl rt.Value, f
 		return text, true, err
 	}
 	if repl.IsNumber() {
-		return fmt.Sprintf("%g", repl.Number()), true, nil
+		return rt.FormatNumber(repl.Number()), true, nil
 	}
 	h, ok := repl.Handle()
 	if !ok {
@@ -505,18 +518,35 @@ func stringFormat(runtime *rt.Runtime, format string, args []rt.Value) (string, 
 	return builder.String(), nil
 }
 
+const stringFormatFlags = "-+ #0"
+
 func parseStringFormatSpec(format string, start int) (string, byte, int, error) {
 	i := start + 1
-	for i < len(format) && strings.IndexByte("-+ #0", format[i]) >= 0 {
+	flagCount := 0
+	for i < len(format) && strings.IndexByte(stringFormatFlags, format[i]) >= 0 {
 		i++
+		flagCount++
+		if flagCount >= len(stringFormatFlags)+1 {
+			return "", 0, 0, fmt.Errorf("invalid format (repeated flags)")
+		}
 	}
-	for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+	widthDigits := 0
+	for i < len(format) && isASCIIDigit(format[i]) {
 		i++
+		widthDigits++
+		if widthDigits > 2 {
+			return "", 0, 0, fmt.Errorf("invalid format (width or precision too long)")
+		}
 	}
 	if i < len(format) && format[i] == '.' {
 		i++
-		for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+		precisionDigits := 0
+		for i < len(format) && isASCIIDigit(format[i]) {
 			i++
+			precisionDigits++
+			if precisionDigits > 2 {
+				return "", 0, 0, fmt.Errorf("invalid format (width or precision too long)")
+			}
 		}
 	}
 	if i >= len(format) {
@@ -551,7 +581,8 @@ func formatStringValue(runtime *rt.Runtime, spec string, verb byte, value rt.Val
 		if !value.IsNumber() {
 			return "", fmt.Errorf("string.format %%%c expects number", verb)
 		}
-		return fmt.Sprintf(spec, value.Number()), nil
+		formatted := fmt.Sprintf(spec, value.Number())
+		return normalizeLuaExponent(formatted), nil
 	case 'c':
 		integer, err := formatIntegerValue(value)
 		if err != nil {
@@ -563,15 +594,18 @@ func formatStringValue(runtime *rt.Runtime, spec string, verb byte, value rt.Val
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf(spec, text), nil
+		return quoteLuaString(text), nil
 	case 's':
 		text, err := plainString(runtime, value)
 		if err != nil {
 			return "", err
 		}
+		if !strings.Contains(spec, ".") && len(text) >= 100 {
+			return text, nil
+		}
 		return fmt.Sprintf(spec, text), nil
 	default:
-		return "", fmt.Errorf("unsupported string.format conversion %%%c", verb)
+		return "", fmt.Errorf("invalid option '%%%c' to 'format'", verb)
 	}
 }
 
@@ -580,4 +614,53 @@ func formatIntegerValue(value rt.Value) (int64, error) {
 		return 0, fmt.Errorf("integer format expects number")
 	}
 	return int64(value.Number()), nil
+}
+
+func isASCIIDigit(ch byte) bool {
+	return ch >= '0' && ch <= '9'
+}
+
+func quoteLuaString(text string) string {
+	var builder strings.Builder
+	builder.Grow(len(text) + 2)
+	builder.WriteByte('"')
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '"', '\\', '\n':
+			builder.WriteByte('\\')
+			builder.WriteByte(text[i])
+		case '\r':
+			builder.WriteString("\\r")
+		case 0:
+			builder.WriteString("\\000")
+		default:
+			builder.WriteByte(text[i])
+		}
+	}
+	builder.WriteByte('"')
+	return builder.String()
+}
+
+func normalizeLuaExponent(text string) string {
+	index := strings.LastIndexAny(text, "eE")
+	if index < 0 || index+2 >= len(text) {
+		return text
+	}
+	sign := text[index+1]
+	if sign != '+' && sign != '-' {
+		return text
+	}
+	digits := text[index+2:]
+	if digits == "" {
+		return text
+	}
+	for i := 0; i < len(digits); i++ {
+		if !isASCIIDigit(digits[i]) {
+			return text
+		}
+	}
+	if len(digits) >= 3 {
+		return text
+	}
+	return text[:index+2] + strings.Repeat("0", 3-len(digits)) + digits
 }

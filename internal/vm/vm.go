@@ -20,6 +20,7 @@ type protoState struct {
 	fieldCaches  []rt.FieldCache
 	compiled     jit.Program
 	jitFailed    bool
+	liveRegs     [][]uint64
 	regs         []rt.Value
 	rootClosure  rt.Value
 	framePool    []*callFrame
@@ -210,6 +211,7 @@ func (m *VM) stateFor(proto *bytecode.Proto) *protoState {
 	}
 	state = &protoState{
 		fieldCaches: make([]rt.FieldCache, proto.InlineCaches),
+		liveRegs:    analyzeLiveRegisters(proto),
 		singletons:  make(map[*bytecode.Proto]rt.Value),
 	}
 	for i := range state.fieldCaches {

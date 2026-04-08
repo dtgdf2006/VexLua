@@ -2,12 +2,14 @@ package frontend
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 )
 
 type Parser struct {
 	tokens []Token
 	index  int
+	lines  []int
 }
 
 func Parse(source string) (*Chunk, error) {
@@ -15,7 +17,7 @@ func Parse(source string) (*Chunk, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Parser{tokens: tokens}
+	p := &Parser{tokens: tokens, lines: computeLineStarts(source)}
 	return p.parseBlockUntil(TokenEOF)
 }
 
@@ -37,10 +39,12 @@ func (p *Parser) parseBlockUntil(terminators ...TokenType) (*Chunk, error) {
 func (p *Parser) parseStmt() (Stmt, error) {
 	switch p.current().Type {
 	case TokenLocal:
+		localTok := p.current()
 		p.advance()
 		if p.match(TokenFunction) {
+			functionTok := p.current()
 			p.advance()
-			return p.parseFunctionStmt(true)
+			return p.parseFunctionStmt(true, p.lineAt(functionTok.Offset))
 		}
 		names, err := p.parseNameList()
 		if err != nil {
@@ -54,36 +58,42 @@ func (p *Parser) parseStmt() (Stmt, error) {
 				return nil, err
 			}
 		}
-		return &LocalAssignStmt{Names: names, Values: values}, nil
+		return &LocalAssignStmt{Line: p.lineAt(localTok.Offset), Names: names, Values: values}, nil
 	case TokenFunction:
+		functionTok := p.current()
 		p.advance()
-		return p.parseFunctionStmt(false)
+		return p.parseFunctionStmt(false, p.lineAt(functionTok.Offset))
 	case TokenBreak:
+		breakTok := p.current()
 		p.advance()
-		return &BreakStmt{}, nil
+		return &BreakStmt{Line: p.lineAt(breakTok.Offset)}, nil
 	case TokenIf:
 		return p.parseIfStmt()
 	case TokenWhile:
 		return p.parseWhileStmt()
 	case TokenRepeat:
 		return p.parseRepeatStmt()
+	case TokenDo:
+		return p.parseDoStmt()
 	case TokenFor:
 		return p.parseForStmt()
 	case TokenReturn:
+		returnTok := p.current()
 		p.advance()
 		if p.match(TokenEnd) || p.match(TokenElse) || p.match(TokenElseif) || p.match(TokenUntil) || p.match(TokenEOF) || p.match(TokenSemi) {
-			return &ReturnStmt{Values: nil}, nil
+			return &ReturnStmt{Line: p.lineAt(returnTok.Offset), Values: nil}, nil
 		}
 		values, err := p.parseExprList()
 		if err != nil {
 			return nil, err
 		}
-		return &ReturnStmt{Values: values}, nil
+		return &ReturnStmt{Line: p.lineAt(returnTok.Offset), Values: values}, nil
 	default:
 		expr, err := p.parsePrefixExpr()
 		if err != nil {
 			return nil, err
 		}
+		line := exprLine(expr)
 		if p.match(TokenComma) || p.match(TokenAssign) {
 			targets := []Expr{expr}
 			for p.match(TokenComma) {
@@ -102,11 +112,11 @@ func (p *Parser) parseStmt() (Stmt, error) {
 			if err != nil {
 				return nil, err
 			}
-			return &AssignStmt{Targets: targets, Values: values}, nil
+			return &AssignStmt{Line: line, Targets: targets, Values: values}, nil
 		}
 		switch expr.(type) {
 		case *CallExpr, *MethodCallExpr:
-			return &ExprStmt{Expr: expr}, nil
+			return &ExprStmt{Line: line, Expr: expr}, nil
 		default:
 			return nil, fmt.Errorf("statement must be assignment or function call at offset %d", p.current().Offset)
 		}
@@ -114,7 +124,8 @@ func (p *Parser) parseStmt() (Stmt, error) {
 }
 
 func (p *Parser) parseIfStmt() (Stmt, error) {
-	if _, err := p.expect(TokenIf); err != nil {
+	ifTok, err := p.expect(TokenIf)
+	if err != nil {
 		return nil, err
 	}
 	clauses := make([]IfClause, 0, 2)
@@ -157,11 +168,12 @@ func (p *Parser) parseIfStmt() (Stmt, error) {
 	if _, err := p.expect(TokenEnd); err != nil {
 		return nil, err
 	}
-	return &IfStmt{Clauses: clauses, ElseBody: elseBody}, nil
+	return &IfStmt{Line: p.lineAt(ifTok.Offset), Clauses: clauses, ElseBody: elseBody}, nil
 }
 
 func (p *Parser) parseWhileStmt() (Stmt, error) {
-	if _, err := p.expect(TokenWhile); err != nil {
+	whileTok, err := p.expect(TokenWhile)
+	if err != nil {
 		return nil, err
 	}
 	cond, err := p.parseExpr()
@@ -178,11 +190,12 @@ func (p *Parser) parseWhileStmt() (Stmt, error) {
 	if _, err := p.expect(TokenEnd); err != nil {
 		return nil, err
 	}
-	return &WhileStmt{Cond: cond, Body: body.Statements}, nil
+	return &WhileStmt{Line: p.lineAt(whileTok.Offset), Cond: cond, Body: body.Statements}, nil
 }
 
 func (p *Parser) parseRepeatStmt() (Stmt, error) {
-	if _, err := p.expect(TokenRepeat); err != nil {
+	repeatTok, err := p.expect(TokenRepeat)
+	if err != nil {
 		return nil, err
 	}
 	body, err := p.parseBlockUntil(TokenUntil)
@@ -196,11 +209,27 @@ func (p *Parser) parseRepeatStmt() (Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &RepeatStmt{Body: body.Statements, Cond: cond}, nil
+	return &RepeatStmt{Line: p.lineAt(repeatTok.Offset), Body: body.Statements, Cond: cond}, nil
+}
+
+func (p *Parser) parseDoStmt() (Stmt, error) {
+	doTok, err := p.expect(TokenDo)
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.parseBlockUntil(TokenEnd)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(TokenEnd); err != nil {
+		return nil, err
+	}
+	return &DoStmt{Line: p.lineAt(doTok.Offset), Body: body.Statements}, nil
 }
 
 func (p *Parser) parseForStmt() (Stmt, error) {
-	if _, err := p.expect(TokenFor); err != nil {
+	forTok, err := p.expect(TokenFor)
+	if err != nil {
 		return nil, err
 	}
 	name, err := p.expect(TokenName)
@@ -220,7 +249,7 @@ func (p *Parser) parseForStmt() (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		step := Expr(&NumberExpr{Value: 1})
+		step := Expr(&NumberExpr{Line: p.lineAt(forTok.Offset), Value: 1})
 		if p.match(TokenComma) {
 			p.advance()
 			step, err = p.parseExpr()
@@ -238,7 +267,7 @@ func (p *Parser) parseForStmt() (Stmt, error) {
 		if _, err := p.expect(TokenEnd); err != nil {
 			return nil, err
 		}
-		return &ForNumericStmt{Name: name.Literal, Start: start, Limit: limit, Step: step, Body: body.Statements}, nil
+		return &ForNumericStmt{Line: p.lineAt(forTok.Offset), Name: name.Literal, Start: start, Limit: limit, Step: step, Body: body.Statements}, nil
 	}
 	names := []string{name.Literal}
 	for p.match(TokenComma) {
@@ -266,30 +295,30 @@ func (p *Parser) parseForStmt() (Stmt, error) {
 	if _, err := p.expect(TokenEnd); err != nil {
 		return nil, err
 	}
-	return &ForGenericStmt{Names: names, Exprs: exprs, Body: body.Statements}, nil
+	return &ForGenericStmt{Line: p.lineAt(forTok.Offset), Names: names, Exprs: exprs, Body: body.Statements}, nil
 }
 
-func (p *Parser) parseFunctionStmt(local bool) (Stmt, error) {
+func (p *Parser) parseFunctionStmt(local bool, line int) (Stmt, error) {
 	if local {
 		name, err := p.expect(TokenName)
 		if err != nil {
 			return nil, err
 		}
-		params, vararg, body, err := p.parseFunctionBody(false)
+		params, vararg, body, endLine, err := p.parseFunctionBody(false)
 		if err != nil {
 			return nil, err
 		}
-		return &FunctionStmt{Local: true, Name: name.Literal, Params: params, Vararg: vararg, Body: body}, nil
+		return &FunctionStmt{Line: line, EndLine: endLine, Local: true, Name: name.Literal, Params: params, Vararg: vararg, Body: body}, nil
 	}
 	target, injectSelf, err := p.parseFunctionNameTarget()
 	if err != nil {
 		return nil, err
 	}
-	params, vararg, body, err := p.parseFunctionBody(injectSelf)
+	params, vararg, body, endLine, err := p.parseFunctionBody(injectSelf)
 	if err != nil {
 		return nil, err
 	}
-	return &FunctionStmt{Local: false, Target: target, Params: params, Vararg: vararg, Body: body}, nil
+	return &FunctionStmt{Line: line, EndLine: endLine, Local: false, Target: target, Params: params, Vararg: vararg, Body: body}, nil
 }
 
 func (p *Parser) parseFunctionNameTarget() (Expr, bool, error) {
@@ -297,7 +326,7 @@ func (p *Parser) parseFunctionNameTarget() (Expr, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	var target Expr = &NameExpr{Name: name.Literal}
+	var target Expr = &NameExpr{Line: p.lineAt(name.Offset), Name: name.Literal}
 	injectSelf := false
 	for p.match(TokenDot) {
 		p.advance()
@@ -305,7 +334,7 @@ func (p *Parser) parseFunctionNameTarget() (Expr, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
-		target = &FieldExpr{Target: target, Name: part.Literal}
+		target = &FieldExpr{Line: exprLine(target), Target: target, Name: part.Literal}
 	}
 	if p.match(TokenColon) {
 		p.advance()
@@ -313,15 +342,15 @@ func (p *Parser) parseFunctionNameTarget() (Expr, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
-		target = &FieldExpr{Target: target, Name: part.Literal}
+		target = &FieldExpr{Line: exprLine(target), Target: target, Name: part.Literal}
 		injectSelf = true
 	}
 	return target, injectSelf, nil
 }
 
-func (p *Parser) parseFunctionBody(injectSelf bool) ([]string, bool, []Stmt, error) {
+func (p *Parser) parseFunctionBody(injectSelf bool) ([]string, bool, []Stmt, int, error) {
 	if _, err := p.expect(TokenLParen); err != nil {
-		return nil, false, nil, err
+		return nil, false, nil, 0, err
 	}
 	params := make([]string, 0, 4)
 	if injectSelf {
@@ -337,7 +366,7 @@ func (p *Parser) parseFunctionBody(injectSelf bool) ([]string, bool, []Stmt, err
 			}
 			name, err := p.expect(TokenName)
 			if err != nil {
-				return nil, false, nil, err
+				return nil, false, nil, 0, err
 			}
 			params = append(params, name.Literal)
 			if !p.match(TokenComma) {
@@ -347,16 +376,17 @@ func (p *Parser) parseFunctionBody(injectSelf bool) ([]string, bool, []Stmt, err
 		}
 	}
 	if _, err := p.expect(TokenRParen); err != nil {
-		return nil, false, nil, err
+		return nil, false, nil, 0, err
 	}
 	chunk, err := p.parseBlockUntil(TokenEnd)
 	if err != nil {
-		return nil, false, nil, err
+		return nil, false, nil, 0, err
 	}
-	if _, err := p.expect(TokenEnd); err != nil {
-		return nil, false, nil, err
+	endTok, err := p.expect(TokenEnd)
+	if err != nil {
+		return nil, false, nil, 0, err
 	}
-	return params, vararg, chunk.Statements, nil
+	return params, vararg, chunk.Statements, p.lineAt(endTok.Offset), nil
 }
 
 func (p *Parser) parseNameList() ([]string, error) {
@@ -409,7 +439,7 @@ func (p *Parser) parseOr() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		left = &BinaryExpr{Op: op, Left: left, Right: right}
+		left = &BinaryExpr{Line: exprLine(left), Op: op, Left: left, Right: right}
 	}
 	return left, nil
 }
@@ -426,7 +456,7 @@ func (p *Parser) parseAnd() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		left = &BinaryExpr{Op: op, Left: left, Right: right}
+		left = &BinaryExpr{Line: exprLine(left), Op: op, Left: left, Right: right}
 	}
 	return left, nil
 }
@@ -443,7 +473,7 @@ func (p *Parser) parseComparison() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		left = &BinaryExpr{Op: op, Left: left, Right: right}
+		left = &BinaryExpr{Line: exprLine(left), Op: op, Left: left, Right: right}
 	}
 	return left, nil
 }
@@ -460,7 +490,7 @@ func (p *Parser) parseConcat() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &BinaryExpr{Op: op, Left: left, Right: right}, nil
+		return &BinaryExpr{Line: exprLine(left), Op: op, Left: left, Right: right}, nil
 	}
 	return left, nil
 }
@@ -477,7 +507,7 @@ func (p *Parser) parseAdditive() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		left = &BinaryExpr{Op: op, Left: left, Right: right}
+		left = &BinaryExpr{Line: exprLine(left), Op: op, Left: left, Right: right}
 	}
 	return left, nil
 }
@@ -494,20 +524,21 @@ func (p *Parser) parseMultiplicative() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		left = &BinaryExpr{Op: op, Left: left, Right: right}
+		left = &BinaryExpr{Line: exprLine(left), Op: op, Left: left, Right: right}
 	}
 	return left, nil
 }
 
 func (p *Parser) parseUnary() (Expr, error) {
 	if p.match(TokenMinus) || p.match(TokenNot) || p.match(TokenHash) {
-		op := p.current().Type
+		tok := p.current()
+		op := tok.Type
 		p.advance()
 		expr, err := p.parseUnary()
 		if err != nil {
 			return nil, err
 		}
-		return &UnaryExpr{Op: op, Expr: expr}, nil
+		return &UnaryExpr{Line: p.lineAt(tok.Offset), Op: op, Expr: expr}, nil
 	}
 	return p.parsePower()
 }
@@ -524,7 +555,7 @@ func (p *Parser) parsePower() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &BinaryExpr{Op: op, Left: left, Right: right}, nil
+		return &BinaryExpr{Line: exprLine(left), Op: op, Left: left, Right: right}, nil
 	}
 	return left, nil
 }
@@ -542,7 +573,7 @@ func (p *Parser) parsePrefixExpr() (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			expr = &FieldExpr{Target: expr, Name: name.Literal}
+			expr = &FieldExpr{Line: exprLine(expr), Target: expr, Name: name.Literal}
 		case TokenLBracket:
 			p.advance()
 			key, err := p.parseExpr()
@@ -552,13 +583,13 @@ func (p *Parser) parsePrefixExpr() (Expr, error) {
 			if _, err := p.expect(TokenRBracket); err != nil {
 				return nil, err
 			}
-			expr = &IndexExpr{Target: expr, Key: key}
-		case TokenLParen:
+			expr = &IndexExpr{Line: exprLine(expr), Target: expr, Key: key}
+		case TokenLParen, TokenString, TokenLBrace:
 			args, err := p.parseArgs()
 			if err != nil {
 				return nil, err
 			}
-			expr = &CallExpr{Callee: expr, Args: args}
+			expr = &CallExpr{Line: exprLine(expr), Callee: expr, Args: args}
 		case TokenColon:
 			p.advance()
 			name, err := p.expect(TokenName)
@@ -569,7 +600,7 @@ func (p *Parser) parsePrefixExpr() (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			expr = &MethodCallExpr{Receiver: expr, Name: name.Literal, Args: args}
+			expr = &MethodCallExpr{Line: exprLine(expr), Receiver: expr, Name: name.Literal, Args: args}
 		default:
 			return expr, nil
 		}
@@ -577,21 +608,36 @@ func (p *Parser) parsePrefixExpr() (Expr, error) {
 }
 
 func (p *Parser) parseArgs() ([]Expr, error) {
-	if _, err := p.expect(TokenLParen); err != nil {
-		return nil, err
-	}
-	args := make([]Expr, 0, 4)
-	if !p.match(TokenRParen) {
-		var err error
-		args, err = p.parseExprList()
+	switch p.current().Type {
+	case TokenLParen:
+		if _, err := p.expect(TokenLParen); err != nil {
+			return nil, err
+		}
+		args := make([]Expr, 0, 4)
+		if !p.match(TokenRParen) {
+			var err error
+			args, err = p.parseExprList()
+			if err != nil {
+				return nil, err
+			}
+		}
+		if _, err := p.expect(TokenRParen); err != nil {
+			return nil, err
+		}
+		return args, nil
+	case TokenString:
+		tok := p.current()
+		p.advance()
+		return []Expr{&StringExpr{Line: p.lineAt(tok.Offset), Value: tok.Literal}}, nil
+	case TokenLBrace:
+		table, err := p.parseTableExpr()
 		if err != nil {
 			return nil, err
 		}
+		return []Expr{table}, nil
+	default:
+		return nil, fmt.Errorf("expected call arguments at offset %d", p.current().Offset)
 	}
-	if _, err := p.expect(TokenRParen); err != nil {
-		return nil, err
-	}
-	return args, nil
 }
 
 func (p *Parser) parsePrimary() (Expr, error) {
@@ -599,33 +645,33 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	switch tok.Type {
 	case TokenName:
 		p.advance()
-		return &NameExpr{Name: tok.Literal}, nil
+		return &NameExpr{Line: p.lineAt(tok.Offset), Name: tok.Literal}, nil
 	case TokenNumber:
 		p.advance()
 		value, _ := strconv.ParseFloat(tok.Literal, 64)
-		return &NumberExpr{Value: value}, nil
+		return &NumberExpr{Line: p.lineAt(tok.Offset), Value: value}, nil
 	case TokenString:
 		p.advance()
-		return &StringExpr{Value: tok.Literal}, nil
+		return &StringExpr{Line: p.lineAt(tok.Offset), Value: tok.Literal}, nil
 	case TokenTrue:
 		p.advance()
-		return &BoolExpr{Value: true}, nil
+		return &BoolExpr{Line: p.lineAt(tok.Offset), Value: true}, nil
 	case TokenFalse:
 		p.advance()
-		return &BoolExpr{Value: false}, nil
+		return &BoolExpr{Line: p.lineAt(tok.Offset), Value: false}, nil
 	case TokenNil:
 		p.advance()
-		return &NilExpr{}, nil
+		return &NilExpr{Line: p.lineAt(tok.Offset)}, nil
 	case TokenEllipsis:
 		p.advance()
-		return &VarargExpr{}, nil
+		return &VarargExpr{Line: p.lineAt(tok.Offset)}, nil
 	case TokenFunction:
 		p.advance()
-		params, vararg, body, err := p.parseFunctionBody(false)
+		params, vararg, body, endLine, err := p.parseFunctionBody(false)
 		if err != nil {
 			return nil, err
 		}
-		return &FunctionExpr{Params: params, Vararg: vararg, Body: body}, nil
+		return &FunctionExpr{Line: p.lineAt(tok.Offset), EndLine: endLine, Params: params, Vararg: vararg, Body: body}, nil
 	case TokenLBrace:
 		return p.parseTableExpr()
 	case TokenLParen:
@@ -644,7 +690,8 @@ func (p *Parser) parsePrimary() (Expr, error) {
 }
 
 func (p *Parser) parseTableExpr() (Expr, error) {
-	if _, err := p.expect(TokenLBrace); err != nil {
+	braceTok, err := p.expect(TokenLBrace)
+	if err != nil {
 		return nil, err
 	}
 	fields := make([]TableField, 0, 4)
@@ -664,7 +711,7 @@ func (p *Parser) parseTableExpr() (Expr, error) {
 	if _, err := p.expect(TokenRBrace); err != nil {
 		return nil, err
 	}
-	return &TableExpr{Fields: fields}, nil
+	return &TableExpr{Line: p.lineAt(braceTok.Offset), Fields: fields}, nil
 }
 
 func (p *Parser) parseTableField() (TableField, error) {
@@ -744,4 +791,68 @@ func (p *Parser) isTerminator(terminators ...TokenType) bool {
 		}
 	}
 	return false
+}
+
+func (p *Parser) lineAt(offset int) int {
+	if len(p.lines) == 0 {
+		return 1
+	}
+	index := sort.Search(len(p.lines), func(i int) bool {
+		return p.lines[i] > offset
+	})
+	if index == 0 {
+		return 1
+	}
+	return index
+}
+
+func computeLineStarts(source string) []int {
+	lines := []int{0}
+	for index := 0; index < len(source); index++ {
+		switch source[index] {
+		case '\r':
+			if index+1 < len(source) && source[index+1] == '\n' {
+				index++
+			}
+			lines = append(lines, index+1)
+		case '\n':
+			lines = append(lines, index+1)
+		}
+	}
+	return lines
+}
+
+func exprLine(expr Expr) int {
+	switch value := expr.(type) {
+	case *NameExpr:
+		return value.Line
+	case *NumberExpr:
+		return value.Line
+	case *StringExpr:
+		return value.Line
+	case *BoolExpr:
+		return value.Line
+	case *NilExpr:
+		return value.Line
+	case *VarargExpr:
+		return value.Line
+	case *UnaryExpr:
+		return value.Line
+	case *BinaryExpr:
+		return value.Line
+	case *CallExpr:
+		return value.Line
+	case *MethodCallExpr:
+		return value.Line
+	case *FieldExpr:
+		return value.Line
+	case *FunctionExpr:
+		return value.Line
+	case *IndexExpr:
+		return value.Line
+	case *TableExpr:
+		return value.Line
+	default:
+		return 0
+	}
 }

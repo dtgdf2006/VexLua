@@ -26,5 +26,14 @@ func Register(runtime *rt.Runtime, machine *vm.VM, compiler SourceCompiler) erro
 	if err := registerCoroutine(runtime, machine); err != nil {
 		return err
 	}
+	if err := registerIO(runtime, machine); err != nil {
+		return err
+	}
+	if err := registerOS(runtime); err != nil {
+		return err
+	}
+	if err := registerDebug(runtime, machine); err != nil {
+		return err
+	}
 	return nil
 }

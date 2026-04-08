@@ -13,6 +13,7 @@ type HostFunction struct {
 	Name      string
 	Call      HostCall
 	CallMulti HostCallMulti
+	Roots     GCRootSource
 }
 
 type HostAdapter interface {
@@ -24,12 +25,19 @@ type HostProxy struct {
 	Name    string
 	Subject any
 	Adapter HostAdapter
+	Meta    Value
+	Env     Value
 }
 
 func (rt *Runtime) NewHostFunction(name string, fn HostCall) Value {
+	return rt.NewHostFunctionWithRoots(name, nil, fn)
+}
+
+func (rt *Runtime) NewHostFunctionWithRoots(name string, roots GCRootSource, fn HostCall) Value {
 	return HandleValue(rt.heap.NewHostFunction(HostFunction{
-		Name: name,
-		Call: fn,
+		Name:  name,
+		Roots: roots,
+		Call:  fn,
 		CallMulti: func(runtime *Runtime, args []Value) ([]Value, error) {
 			result, err := fn(runtime, args)
 			if err != nil {
@@ -41,8 +49,13 @@ func (rt *Runtime) NewHostFunction(name string, fn HostCall) Value {
 }
 
 func (rt *Runtime) NewHostFunctionMulti(name string, fn HostCallMulti) Value {
+	return rt.NewHostFunctionMultiWithRoots(name, nil, fn)
+}
+
+func (rt *Runtime) NewHostFunctionMultiWithRoots(name string, roots GCRootSource, fn HostCallMulti) Value {
 	return HandleValue(rt.heap.NewHostFunction(HostFunction{
-		Name: name,
+		Name:  name,
+		Roots: roots,
 		Call: func(runtime *Runtime, args []Value) (Value, error) {
 			results, err := fn(runtime, args)
 			if err != nil {
@@ -58,7 +71,7 @@ func (rt *Runtime) NewHostFunctionMulti(name string, fn HostCallMulti) Value {
 }
 
 func (rt *Runtime) NewHostProxy(name string, subject any, adapter HostAdapter) Value {
-	return HandleValue(rt.heap.NewHostProxy(HostProxy{Name: name, Subject: subject, Adapter: adapter}))
+	return HandleValue(rt.heap.NewHostProxy(HostProxy{Name: name, Subject: subject, Adapter: adapter, Meta: NilValue, Env: HandleValue(rt.globals)}))
 }
 
 func WrapFunction(rt *Runtime, name string, fn any) (Value, error) {

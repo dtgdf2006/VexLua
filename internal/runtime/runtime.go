@@ -6,20 +6,34 @@ import (
 )
 
 type Runtime struct {
-	heap        Heap
-	symbolIDs   map[string]uint32
-	symbolNames []string
-	stringIDs   map[string]Handle
-	globals     Handle
+	heap         Heap
+	symbolIDs    map[string]uint32
+	symbolNames  []string
+	stringIDs    map[string]Handle
+	globals      Handle
+	registry     Handle
+	stringMeta   Value
+	numberMeta   Value
+	boolMeta     Value
+	functionMeta Value
+	threadMeta   Value
+	userdataMeta Value
 }
 
 func NewRuntime() *Runtime {
 	rt := &Runtime{
-		symbolIDs:   make(map[string]uint32, 64),
-		symbolNames: make([]string, 0, 64),
-		stringIDs:   make(map[string]Handle, 64),
+		symbolIDs:    make(map[string]uint32, 64),
+		symbolNames:  make([]string, 0, 64),
+		stringIDs:    make(map[string]Handle, 64),
+		stringMeta:   NilValue,
+		numberMeta:   NilValue,
+		boolMeta:     NilValue,
+		functionMeta: NilValue,
+		threadMeta:   NilValue,
+		userdataMeta: NilValue,
 	}
 	rt.globals = rt.heap.NewTable(16)
+	rt.registry = rt.heap.NewTable(16)
 	return rt
 }
 
@@ -52,6 +66,14 @@ func (rt *Runtime) Globals() *Table {
 	return rt.heap.Table(rt.globals)
 }
 
+func (rt *Runtime) RegistryHandle() Handle {
+	return rt.registry
+}
+
+func (rt *Runtime) Registry() *Table {
+	return rt.heap.Table(rt.registry)
+}
+
 func (rt *Runtime) SetGlobal(name string, value Value) {
 	rt.SetGlobalSymbol(rt.InternSymbol(name), value)
 }
@@ -78,6 +100,21 @@ func (rt *Runtime) NewTableValue(capacity int) Value {
 	return HandleValue(rt.heap.NewTable(capacity))
 }
 
+func (rt *Runtime) NewThreadValue(state any) Value {
+	return HandleValue(rt.heap.NewThread(state, HandleValue(rt.globals)))
+}
+
+func (rt *Runtime) NewUserdataValue(value any, meta Value) Value {
+	return rt.NewUserdataValueWithEnv(value, meta, HandleValue(rt.globals))
+}
+
+func (rt *Runtime) NewUserdataValueWithEnv(value any, meta Value, env Value) Value {
+	if env.Kind() == KindNil {
+		env = HandleValue(rt.globals)
+	}
+	return HandleValue(rt.heap.NewUserdata(value, meta, env))
+}
+
 func (rt *Runtime) ToString(v Value) (string, bool) {
 	h, ok := v.Handle()
 	if !ok || h.Kind() != ObjectString {
@@ -87,6 +124,18 @@ func (rt *Runtime) ToString(v Value) (string, bool) {
 }
 
 func (rt *Runtime) GetMetatable(target Value) (Value, bool) {
+	switch target.Kind() {
+	case KindNumber:
+		if rt.numberMeta.Kind() == KindNil {
+			return NilValue, false
+		}
+		return rt.numberMeta, true
+	case KindBool:
+		if rt.boolMeta.Kind() == KindNil {
+			return NilValue, false
+		}
+		return rt.boolMeta, true
+	}
 	h, ok := target.Handle()
 	if !ok {
 		return NilValue, false
@@ -98,8 +147,103 @@ func (rt *Runtime) GetMetatable(target Value) (Value, bool) {
 			return NilValue, false
 		}
 		return meta, true
+	case ObjectString:
+		if rt.stringMeta.Kind() == KindNil {
+			return NilValue, false
+		}
+		return rt.stringMeta, true
+	case ObjectHostFunction, ObjectLuaClosure:
+		if rt.functionMeta.Kind() == KindNil {
+			return NilValue, false
+		}
+		return rt.functionMeta, true
+	case ObjectThread:
+		meta := rt.heap.Thread(h).Meta
+		if meta.Kind() != KindNil {
+			return meta, true
+		}
+		if rt.threadMeta.Kind() == KindNil {
+			return NilValue, false
+		}
+		return rt.threadMeta, true
+	case ObjectUserdata:
+		meta := rt.heap.Userdata(h).Meta
+		if meta.Kind() != KindNil {
+			return meta, true
+		}
+		if rt.userdataMeta.Kind() == KindNil {
+			return NilValue, false
+		}
+		return rt.userdataMeta, true
+	case ObjectHostProxy:
+		meta := rt.heap.HostProxy(h).Meta
+		if meta.Kind() != KindNil {
+			return meta, true
+		}
+		if rt.userdataMeta.Kind() == KindNil {
+			return NilValue, false
+		}
+		return rt.userdataMeta, true
 	default:
 		return NilValue, false
+	}
+}
+
+func (rt *Runtime) validateMetatable(meta Value) error {
+	if meta.Kind() != KindNil {
+		mh, ok := meta.Handle()
+		if !ok || mh.Kind() != ObjectTable {
+			return fmt.Errorf("metatable expects table or nil")
+		}
+	}
+	return nil
+}
+
+func (rt *Runtime) SetStringMetatable(meta Value) error {
+	if err := rt.validateMetatable(meta); err != nil {
+		return fmt.Errorf("string %w", err)
+	}
+	rt.stringMeta = meta
+	return nil
+}
+
+func (rt *Runtime) SetAnyMetatable(target Value, meta Value) error {
+	if err := rt.validateMetatable(meta); err != nil {
+		return err
+	}
+	switch target.Kind() {
+	case KindNumber:
+		rt.numberMeta = meta
+		return nil
+	case KindBool:
+		rt.boolMeta = meta
+		return nil
+	}
+	h, ok := target.Handle()
+	if !ok {
+		return fmt.Errorf("cannot set metatable for %s", target)
+	}
+	switch h.Kind() {
+	case ObjectTable:
+		rt.heap.Table(h).SetMetatable(meta)
+		return nil
+	case ObjectString:
+		rt.stringMeta = meta
+		return nil
+	case ObjectHostFunction, ObjectLuaClosure:
+		rt.functionMeta = meta
+		return nil
+	case ObjectThread:
+		rt.heap.Thread(h).Meta = meta
+		return nil
+	case ObjectUserdata:
+		rt.heap.Userdata(h).Meta = meta
+		return nil
+	case ObjectHostProxy:
+		rt.heap.HostProxy(h).Meta = meta
+		return nil
+	default:
+		return fmt.Errorf("cannot set metatable for %s", target)
 	}
 }
 
@@ -131,6 +275,24 @@ func (rt *Runtime) GetMetafield(target Value, name string) (Value, bool) {
 	return value, found
 }
 
+func (rt *Runtime) ApproxMemoryBytes() int64 {
+	total := rt.heap.ApproxBytes()
+	for _, name := range rt.symbolNames {
+		total += int64(len(name)) + 16
+	}
+	total += int64(len(rt.symbolIDs)+len(rt.stringIDs)) * 16
+	return total
+}
+
+func (rt *Runtime) FindLuaClosureValue(closure any) (Value, bool) {
+	for index, candidate := range rt.heap.luaClosures {
+		if candidate == closure {
+			return HandleValue(makeHandle(ObjectLuaClosure, uint32(index))), true
+		}
+	}
+	return NilValue, false
+}
+
 func (rt *Runtime) GetField(target Value, symbol uint32) (Value, uint32, bool, error) {
 	h, ok := target.Handle()
 	if !ok {
@@ -140,8 +302,15 @@ func (rt *Runtime) GetField(target Value, symbol uint32) (Value, uint32, bool, e
 	case ObjectTable:
 		value, slot, found := rt.heap.Table(h).GetSymbol(symbol)
 		return value, slot, found, nil
+	case ObjectString:
+		return NilValue, 0, false, nil
+	case ObjectThread, ObjectUserdata, ObjectLuaClosure, ObjectHostFunction:
+		return NilValue, 0, false, fmt.Errorf("attempt to index unsupported object kind %s", h.Kind())
 	case ObjectHostProxy:
 		proxy := rt.heap.HostProxy(h)
+		if proxy.Adapter == nil {
+			return NilValue, 0, false, fmt.Errorf("attempt to index unsupported object kind %s", h.Kind())
+		}
 		value, found, err := proxy.Adapter.GetField(rt, proxy.Subject, rt.SymbolName(symbol))
 		return value, 0, found, err
 	default:
@@ -164,9 +333,16 @@ func (rt *Runtime) GetTable(target Value, key Value) (Value, bool, error) {
 		}
 		value, found := rt.heap.Table(h).RawGet(key)
 		return value, found, nil
+	case ObjectString:
+		return NilValue, false, nil
+	case ObjectThread, ObjectUserdata, ObjectLuaClosure, ObjectHostFunction:
+		return NilValue, false, fmt.Errorf("attempt to index unsupported object kind %s", h.Kind())
 	case ObjectHostProxy:
+		proxy := rt.heap.HostProxy(h)
+		if proxy.Adapter == nil {
+			return NilValue, false, fmt.Errorf("attempt to index unsupported object kind %s", h.Kind())
+		}
 		if name, ok := rt.ToString(key); ok {
-			proxy := rt.heap.HostProxy(h)
 			value, found, err := proxy.Adapter.GetField(rt, proxy.Subject, name)
 			return value, found, err
 		}

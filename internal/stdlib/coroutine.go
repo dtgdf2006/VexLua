@@ -66,7 +66,8 @@ func registerCoroutine(runtime *rt.Runtime, machine *vm.VM) error {
 		if err != nil {
 			return rt.NilValue, err
 		}
-		return runtime.NewHostFunctionMulti("coroutine.wrap.fn", func(runtime *rt.Runtime, innerArgs []rt.Value) ([]rt.Value, error) {
+		threadValue := coroutineValue(runtime, co)
+		return runtime.NewHostFunctionMultiWithRoots("coroutine.wrap.fn", rt.StaticGCRoots{threadValue}, func(runtime *rt.Runtime, innerArgs []rt.Value) ([]rt.Value, error) {
 			return machine.ResumeCoroutineMulti(co, innerArgs)
 		}), nil
 	})

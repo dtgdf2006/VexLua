@@ -48,33 +48,43 @@ func (c *Compiler) CompileSource(source string) (*bytecode.Proto, error) {
 func (c *Compiler) CompileFunction(fn *ir.Function) (*bytecode.Proto, error) {
 	fc := &funcCompiler{
 		runtime:   c.runtime,
-		proto:     bytecode.NewProto(fn.Name, max(1, fn.Locals), 0),
+		proto:     bytecode.NewProto(fn.Name, max(2, fn.Locals), 0),
 		nextTemp:  fn.Locals,
-		maxStack:  max(1, fn.Locals),
+		maxStack:  max(2, fn.Locals),
 		childSlot: make(map[*ir.Function]int),
 	}
 	fc.proto.Scripted = true
+	fc.proto.LineDefined = fn.LineDefined
+	fc.proto.LastLineDefined = fn.LastLineDefined
 	fc.proto.NumParams = len(fn.Params)
 	fc.proto.Vararg = fn.Vararg
+	for _, param := range fn.Params {
+		fc.proto.LocalsDebug = append(fc.proto.LocalsDebug, bytecode.LocalVar{Name: param, StartPC: 0, EndPC: -1})
+	}
+	fc.setLine(fn.LineDefined)
 	fc.nilConst = fc.proto.AddConstant(rt.NilValue)
 	fc.zeroConst = fc.proto.AddConstant(rt.NumberValue(0))
 	for _, up := range fn.Upvalues {
-		fc.proto.Upvalues = append(fc.proto.Upvalues, bytecode.UpvalueDesc{InParentLocal: up.InParentLocal, Index: uint16(up.Index)})
+		fc.proto.Upvalues = append(fc.proto.Upvalues, bytecode.UpvalueDesc{Name: up.Name, InParentLocal: up.InParentLocal, Index: uint16(up.Index)})
 	}
 	for _, stmt := range fn.Body {
 		if err := fc.compileStmt(stmt); err != nil {
 			return nil, err
 		}
 	}
-	retReg := fc.allocTemp()
-	fc.proto.Emit(bytecode.OpLoadConst, uint16(retReg), 0, 0, int32(fc.nilConst))
-	fc.proto.Emit(bytecode.OpReturn, uint16(retReg), 0, 0, 0)
+	fc.proto.Emit(bytecode.OpReturnMulti, 0, 0, 0, 0)
+	for i := range fc.proto.LocalsDebug {
+		if fc.proto.LocalsDebug[i].EndPC < 0 {
+			fc.proto.LocalsDebug[i].EndPC = len(fc.proto.Code) - 1
+		}
+	}
 	fc.proto.MaxStack = fc.maxStack
 	fc.proto.InlineCaches = fc.nextIC
 	return fc.proto, nil
 }
 
 func (c *funcCompiler) compileStmt(stmt ir.Stmt) error {
+	c.setStmtLine(stmt)
 	switch s := stmt.(type) {
 	case *ir.LocalAssignStmt:
 		return c.compileAssignSlots(s.Slots, s.Values)
@@ -99,6 +109,13 @@ func (c *funcCompiler) compileStmt(stmt ir.Stmt) error {
 		return c.compileWhileStmt(s)
 	case *ir.RepeatStmt:
 		return c.compileRepeatStmt(s)
+	case *ir.DoStmt:
+		for _, bodyStmt := range s.Body {
+			if err := c.compileStmt(bodyStmt); err != nil {
+				return err
+			}
+		}
+		return nil
 	case *ir.ForNumericStmt:
 		return c.compileForNumericStmt(s)
 	case *ir.ForGenericStmt:
@@ -298,6 +315,7 @@ func (c *funcCompiler) detectGenericIteratorIntrinsic(exprs []ir.Expr) (string, 
 }
 
 func (c *funcCompiler) compileExprTo(target int, expr ir.Expr) error {
+	c.setExprLine(expr)
 	switch e := expr.(type) {
 	case *ir.VarExpr:
 		switch e.Ref.Kind {
@@ -352,6 +370,23 @@ func (c *funcCompiler) compileExprTo(target int, expr ir.Expr) error {
 			return c.compileAndExpr(target, e)
 		case "OR":
 			return c.compileOrExpr(target, e)
+		case "PLUS":
+			if constIdx, ok := c.numericLiteralConstant(e.Right); ok {
+				leftReg, err := c.compileExprOperand(target, e.Left)
+				if err != nil {
+					return err
+				}
+				c.proto.Emit(bytecode.OpAddConst, uint16(target), uint16(leftReg), 0, int32(constIdx))
+				return nil
+			}
+			if constIdx, ok := c.numericLiteralConstant(e.Left); ok {
+				rightReg, err := c.compileExprOperand(target, e.Right)
+				if err != nil {
+					return err
+				}
+				c.proto.Emit(bytecode.OpAddConst, uint16(target), uint16(rightReg), 0, int32(constIdx))
+				return nil
+			}
 		}
 		if err := c.compileExprTo(target, e.Left); err != nil {
 			return err
@@ -547,6 +582,16 @@ func (c *funcCompiler) compileReturnValues(values []ir.Expr) error {
 		c.proto.Emit(bytecode.OpReturnMulti, 0, 0, 0, 0)
 		return nil
 	}
+	if len(values) == 1 {
+		switch value := values[0].(type) {
+		case *ir.CallExpr:
+			if !c.isCoroutineYield(value) {
+				return c.compileTailCallExpr(value)
+			}
+		case *ir.MethodCallExpr:
+			return c.compileTailMethodCallExpr(value)
+		}
+	}
 	prefixCount := len(values)
 	if c.isMultiExpr(values[len(values)-1]) {
 		prefixCount--
@@ -598,6 +643,7 @@ func (c *funcCompiler) compileExprListInto(start int, values []ir.Expr, want int
 }
 
 func (c *funcCompiler) compileExprToCount(start int, expr ir.Expr, count int) error {
+	c.setExprLine(expr)
 	switch e := expr.(type) {
 	case *ir.CallExpr:
 		if c.isCoroutineYield(e) {
@@ -621,6 +667,7 @@ func (c *funcCompiler) compileExprToCount(start int, expr ir.Expr, count int) er
 }
 
 func (c *funcCompiler) compilePendingExpr(expr ir.Expr) error {
+	c.setExprLine(expr)
 	switch e := expr.(type) {
 	case *ir.CallExpr:
 		if c.isCoroutineYield(e) {
@@ -638,6 +685,7 @@ func (c *funcCompiler) compilePendingExpr(expr ir.Expr) error {
 }
 
 func (c *funcCompiler) compileYieldExpr(resumeStart int, expr *ir.CallExpr, resumeCount int) error {
+	c.setLine(expr.Line)
 	yieldStart, yieldCount, appendPending, err := c.compileCallArgs(expr.Args)
 	if err != nil {
 		return err
@@ -651,6 +699,7 @@ func (c *funcCompiler) compileCallExprSingle(target int, expr *ir.CallExpr) erro
 }
 
 func (c *funcCompiler) compileCallExprCount(target int, expr *ir.CallExpr, count int) error {
+	c.setLine(expr.Line)
 	calleeReg := c.allocTemp()
 	if err := c.compileExprTo(calleeReg, expr.Callee); err != nil {
 		return err
@@ -667,11 +716,26 @@ func (c *funcCompiler) compileCallExprCount(target int, expr *ir.CallExpr, count
 	return nil
 }
 
+func (c *funcCompiler) compileTailCallExpr(expr *ir.CallExpr) error {
+	c.setLine(expr.Line)
+	calleeReg := c.allocTemp()
+	if err := c.compileExprTo(calleeReg, expr.Callee); err != nil {
+		return err
+	}
+	argStart, argCount, appendPending, err := c.compileCallArgs(expr.Args)
+	if err != nil {
+		return err
+	}
+	c.proto.Emit(bytecode.OpTailCall, 0, uint16(calleeReg), uint16(argStart), bytecode.PackCallCountsWithPending(argCount, 0, appendPending))
+	return nil
+}
+
 func (c *funcCompiler) compileMethodCallExprSingle(target int, expr *ir.MethodCallExpr) error {
 	return c.compileMethodCallExprCount(target, expr, 1)
 }
 
 func (c *funcCompiler) compileMethodCallExprCount(target int, expr *ir.MethodCallExpr, count int) error {
+	c.setLine(expr.Line)
 	receiverReg := c.allocTemp()
 	if err := c.compileExprTo(receiverReg, expr.Receiver); err != nil {
 		return err
@@ -685,6 +749,20 @@ func (c *funcCompiler) compileMethodCallExprCount(target int, expr *ir.MethodCal
 		return nil
 	}
 	c.proto.Emit(bytecode.OpCallMulti, uint16(target), uint16(calleeReg), uint16(argStart), bytecode.PackCallCountsWithPending(argCount, count, appendPending))
+	return nil
+}
+
+func (c *funcCompiler) compileTailMethodCallExpr(expr *ir.MethodCallExpr) error {
+	c.setLine(expr.Line)
+	receiverReg := c.allocTemp()
+	if err := c.compileExprTo(receiverReg, expr.Receiver); err != nil {
+		return err
+	}
+	calleeReg, argStart, argCount, appendPending, err := c.compileMethodCallWindow(receiverReg, expr.Name, expr.Args)
+	if err != nil {
+		return err
+	}
+	c.proto.Emit(bytecode.OpTailCall, 0, uint16(calleeReg), uint16(argStart), bytecode.PackCallCountsWithPending(argCount, 0, appendPending))
 	return nil
 }
 
@@ -817,6 +895,28 @@ func (c *funcCompiler) literalValue(v any) (rt.Value, error) {
 	}
 }
 
+func (c *funcCompiler) numericLiteralConstant(expr ir.Expr) (int, bool) {
+	literal, ok := expr.(*ir.LiteralExpr)
+	if !ok {
+		return 0, false
+	}
+	number, ok := literal.Value.(float64)
+	if !ok {
+		return 0, false
+	}
+	return c.proto.AddConstant(rt.NumberValue(number)), true
+}
+
+func (c *funcCompiler) compileExprOperand(target int, expr ir.Expr) (int, error) {
+	if local, ok := expr.(*ir.VarExpr); ok && local.Ref.Kind == ir.VarLocal {
+		return local.Ref.Index, nil
+	}
+	if err := c.compileExprTo(target, expr); err != nil {
+		return 0, err
+	}
+	return target, nil
+}
+
 func (c *funcCompiler) isCoroutineYield(call *ir.CallExpr) bool {
 	field, ok := call.Callee.(*ir.FieldExpr)
 	if !ok || field.Name != "yield" {
@@ -837,6 +937,64 @@ func (c *funcCompiler) emit(op bytecode.Op, a, b, cArg uint16, d int32) int {
 
 func (c *funcCompiler) patchJump(index int, target int) {
 	c.proto.Code[index].D = int32(target)
+}
+
+func (c *funcCompiler) setLine(line int) {
+	if line > 0 {
+		c.proto.SetCurrentLine(line)
+	}
+}
+
+func (c *funcCompiler) setStmtLine(stmt ir.Stmt) {
+	switch value := stmt.(type) {
+	case *ir.LocalAssignStmt:
+		c.setLine(value.Line)
+	case *ir.BreakStmt:
+		c.setLine(value.Line)
+	case *ir.AssignStmt:
+		c.setLine(value.Line)
+	case *ir.ReturnStmt:
+		c.setLine(value.Line)
+	case *ir.ExprStmt:
+		c.setLine(value.Line)
+	case *ir.IfStmt:
+		c.setLine(value.Line)
+	case *ir.WhileStmt:
+		c.setLine(value.Line)
+	case *ir.RepeatStmt:
+		c.setLine(value.Line)
+	case *ir.DoStmt:
+		c.setLine(value.Line)
+	case *ir.ForNumericStmt:
+		c.setLine(value.Line)
+	case *ir.ForGenericStmt:
+		c.setLine(value.Line)
+	}
+}
+
+func (c *funcCompiler) setExprLine(expr ir.Expr) {
+	switch value := expr.(type) {
+	case *ir.VarExpr:
+		c.setLine(value.Line)
+	case *ir.LiteralExpr:
+		c.setLine(value.Line)
+	case *ir.VarargExpr:
+		c.setLine(value.Line)
+	case *ir.UnaryExpr:
+		c.setLine(value.Line)
+	case *ir.BinaryExpr:
+		c.setLine(value.Line)
+	case *ir.CallExpr:
+		c.setLine(value.Line)
+	case *ir.MethodCallExpr:
+		c.setLine(value.Line)
+	case *ir.FieldExpr:
+		c.setLine(value.Line)
+	case *ir.IndexExpr:
+		c.setLine(value.Line)
+	case *ir.TableExpr:
+		c.setLine(value.Line)
+	}
 }
 
 func max(a, b int) int {

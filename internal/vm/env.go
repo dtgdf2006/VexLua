@@ -46,6 +46,40 @@ func (m *VM) GetFunctionEnv(value rt.Value) (rt.Value, error) {
 	}
 }
 
+func (m *VM) GetEnv(value rt.Value) (rt.Value, error) {
+	h, ok := value.Handle()
+	if !ok {
+		return rt.NilValue, fmt.Errorf("getfenv expects function, thread, or userdata")
+	}
+	switch h.Kind() {
+	case rt.ObjectLuaClosure:
+		closure := m.runtime.Heap().LuaClosure(h).(*LuaClosure)
+		return m.envOf(closure), nil
+	case rt.ObjectHostFunction:
+		return m.globalEnv(), nil
+	case rt.ObjectThread:
+		thread := m.runtime.Heap().Thread(h)
+		if thread.Env.Kind() == rt.KindNil {
+			return m.globalEnv(), nil
+		}
+		return thread.Env, nil
+	case rt.ObjectUserdata:
+		userdata := m.runtime.Heap().Userdata(h)
+		if userdata.Env.Kind() == rt.KindNil {
+			return m.globalEnv(), nil
+		}
+		return userdata.Env, nil
+	case rt.ObjectHostProxy:
+		proxy := m.runtime.Heap().HostProxy(h)
+		if proxy.Env.Kind() == rt.KindNil {
+			return m.globalEnv(), nil
+		}
+		return proxy.Env, nil
+	default:
+		return rt.NilValue, fmt.Errorf("getfenv expects function, thread, or userdata")
+	}
+}
+
 func (m *VM) SetFunctionEnv(value rt.Value, env rt.Value) error {
 	if err := m.validateEnv(env); err != nil {
 		return err
@@ -66,6 +100,35 @@ func (m *VM) SetFunctionEnv(value rt.Value, env rt.Value) error {
 	}
 }
 
+func (m *VM) SetEnv(value rt.Value, env rt.Value) error {
+	if err := m.validateEnv(env); err != nil {
+		return err
+	}
+	h, ok := value.Handle()
+	if !ok {
+		return fmt.Errorf("setfenv expects function, thread, or userdata")
+	}
+	switch h.Kind() {
+	case rt.ObjectLuaClosure:
+		closure := m.runtime.Heap().LuaClosure(h).(*LuaClosure)
+		closure.Env = env
+		return nil
+	case rt.ObjectHostFunction:
+		return fmt.Errorf("setfenv does not support host functions")
+	case rt.ObjectThread:
+		m.runtime.Heap().Thread(h).Env = env
+		return nil
+	case rt.ObjectUserdata:
+		m.runtime.Heap().Userdata(h).Env = env
+		return nil
+	case rt.ObjectHostProxy:
+		m.runtime.Heap().HostProxy(h).Env = env
+		return nil
+	default:
+		return fmt.Errorf("setfenv expects function, thread, or userdata")
+	}
+}
+
 func (m *VM) CallValue(callee rt.Value, args []rt.Value) ([]rt.Value, error) {
 	return m.callValueMulti(callee, args)
 }
@@ -77,6 +140,15 @@ func (m *VM) Less(left rt.Value, right rt.Value) (bool, error) {
 func (m *VM) RunningCoroutine() *Coroutine {
 	for i := len(m.activeCoros) - 1; i >= 0; i-- {
 		if m.activeCoros[i] != nil && m.activeCoros[i].visible {
+			return m.activeCoros[i]
+		}
+	}
+	return nil
+}
+
+func (m *VM) currentCoroutine() *Coroutine {
+	for i := len(m.activeCoros) - 1; i >= 0; i-- {
+		if m.activeCoros[i] != nil {
 			return m.activeCoros[i]
 		}
 	}

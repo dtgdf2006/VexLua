@@ -18,18 +18,20 @@ type resolver struct {
 }
 
 func Lower(chunk *frontend.Chunk) (*Function, error) {
-	res := newResolver(nil, "chunk", nil, false)
+	res := newResolver(nil, "chunk", nil, true)
 	body, err := res.lowerBlock(chunk.Statements)
 	if err != nil {
 		return nil, err
 	}
 	return &Function{
-		Name:     "chunk",
-		Params:   nil,
-		Vararg:   false,
-		Body:     body,
-		Locals:   res.nextLocal,
-		Upvalues: res.upvalues,
+		Name:            "chunk",
+		Params:          nil,
+		Vararg:          true,
+		Body:            body,
+		Locals:          res.nextLocal,
+		Upvalues:        res.upvalues,
+		LineDefined:     0,
+		LastLineDefined: 0,
 	}, nil
 }
 
@@ -72,9 +74,9 @@ func (r *resolver) lowerStmt(stmt frontend.Stmt) (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &LocalAssignStmt{Slots: slots, Values: values}, nil
+		return &LocalAssignStmt{Line: s.Line, Slots: slots, Values: values}, nil
 	case *frontend.BreakStmt:
-		return &BreakStmt{}, nil
+		return &BreakStmt{Line: s.Line}, nil
 	case *frontend.AssignStmt:
 		targets := make([]AssignTarget, 0, len(s.Targets))
 		for _, targetExpr := range s.Targets {
@@ -88,7 +90,7 @@ func (r *resolver) lowerStmt(stmt frontend.Stmt) (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &AssignStmt{Targets: targets, Values: values}, nil
+		return &AssignStmt{Line: s.Line, Targets: targets, Values: values}, nil
 	case *frontend.FunctionStmt:
 		closure, err := r.lowerFunctionStmt(s)
 		if err != nil {
@@ -112,7 +114,7 @@ func (r *resolver) lowerStmt(stmt frontend.Stmt) (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &IfStmt{Clauses: clauses, ElseBody: elseBody}, nil
+		return &IfStmt{Line: s.Line, Clauses: clauses, ElseBody: elseBody}, nil
 	case *frontend.WhileStmt:
 		cond, err := r.lowerExpr(s.Cond)
 		if err != nil {
@@ -122,7 +124,7 @@ func (r *resolver) lowerStmt(stmt frontend.Stmt) (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &WhileStmt{Cond: cond, Body: body}, nil
+		return &WhileStmt{Line: s.Line, Cond: cond, Body: body}, nil
 	case *frontend.RepeatStmt:
 		body, err := r.lowerNestedBlock(s.Body)
 		if err != nil {
@@ -132,7 +134,13 @@ func (r *resolver) lowerStmt(stmt frontend.Stmt) (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &RepeatStmt{Body: body, Cond: cond}, nil
+		return &RepeatStmt{Line: s.Line, Body: body, Cond: cond}, nil
+	case *frontend.DoStmt:
+		body, err := r.lowerNestedBlock(s.Body)
+		if err != nil {
+			return nil, err
+		}
+		return &DoStmt{Line: s.Line, Body: body}, nil
 	case *frontend.ForNumericStmt:
 		start, err := r.lowerExpr(s.Start)
 		if err != nil {
@@ -153,7 +161,7 @@ func (r *resolver) lowerStmt(stmt frontend.Stmt) (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ForNumericStmt{Slot: slot, Start: start, Limit: limit, Step: step, Body: body}, nil
+		return &ForNumericStmt{Line: s.Line, Slot: slot, Start: start, Limit: limit, Step: step, Body: body}, nil
 	case *frontend.ForGenericStmt:
 		exprs, err := r.lowerExprList(s.Exprs)
 		if err != nil {
@@ -172,19 +180,19 @@ func (r *resolver) lowerStmt(stmt frontend.Stmt) (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ForGenericStmt{IteratorSlot: iterSlot, StateSlot: stateSlot, ControlSlot: controlSlot, VarSlots: varSlots, Exprs: exprs, Body: body}, nil
+		return &ForGenericStmt{Line: s.Line, IteratorSlot: iterSlot, StateSlot: stateSlot, ControlSlot: controlSlot, VarSlots: varSlots, Exprs: exprs, Body: body}, nil
 	case *frontend.ReturnStmt:
 		values, err := r.lowerExprList(s.Values)
 		if err != nil {
 			return nil, err
 		}
-		return &ReturnStmt{Values: values}, nil
+		return &ReturnStmt{Line: s.Line, Values: values}, nil
 	case *frontend.ExprStmt:
 		expr, err := r.lowerExpr(s.Expr)
 		if err != nil {
 			return nil, err
 		}
-		return &ExprStmt{Expr: expr}, nil
+		return &ExprStmt{Line: s.Line, Expr: expr}, nil
 	default:
 		return nil, fmt.Errorf("unsupported statement %T", stmt)
 	}
@@ -208,13 +216,13 @@ func (r *resolver) snapshotLocals() map[string]int {
 func (r *resolver) lowerFunctionStmt(stmt *frontend.FunctionStmt) (Stmt, error) {
 	if stmt.Local {
 		slot := r.declareLocal(stmt.Name)
-		fn, err := r.lowerFunction(stmt.Name, stmt.Params, stmt.Vararg, stmt.Body)
+		fn, err := r.lowerFunction(stmt.Name, stmt.Params, stmt.Vararg, stmt.Body, stmt.Line, stmt.EndLine)
 		if err != nil {
 			return nil, err
 		}
-		return &AssignStmt{Targets: []AssignTarget{&VarTarget{Ref: VarRef{Name: stmt.Name, Kind: VarLocal, Index: slot}}}, Values: []Expr{&ClosureExpr{Fn: fn}}}, nil
+		return &AssignStmt{Line: stmt.Line, Targets: []AssignTarget{&VarTarget{Line: stmt.Line, Ref: VarRef{Name: stmt.Name, Kind: VarLocal, Index: slot}}}, Values: []Expr{&ClosureExpr{Fn: fn}}}, nil
 	}
-	fn, err := r.lowerFunction("function", stmt.Params, stmt.Vararg, stmt.Body)
+	fn, err := r.lowerFunction("function", stmt.Params, stmt.Vararg, stmt.Body, stmt.Line, stmt.EndLine)
 	if err != nil {
 		return nil, err
 	}
@@ -222,35 +230,37 @@ func (r *resolver) lowerFunctionStmt(stmt *frontend.FunctionStmt) (Stmt, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &AssignStmt{Targets: []AssignTarget{target}, Values: []Expr{&ClosureExpr{Fn: fn}}}, nil
+	return &AssignStmt{Line: stmt.Line, Targets: []AssignTarget{target}, Values: []Expr{&ClosureExpr{Fn: fn}}}, nil
 }
 
-func (r *resolver) lowerFunction(name string, params []string, vararg bool, body []frontend.Stmt) (*Function, error) {
+func (r *resolver) lowerFunction(name string, params []string, vararg bool, body []frontend.Stmt, lineDefined int, lastLineDefined int) (*Function, error) {
 	child := newResolver(r, name, params, vararg)
 	loweredBody, err := child.lowerBlock(body)
 	if err != nil {
 		return nil, err
 	}
 	return &Function{
-		Name:     name,
-		Params:   append([]string(nil), params...),
-		Vararg:   vararg,
-		Body:     loweredBody,
-		Locals:   child.nextLocal,
-		Upvalues: child.upvalues,
+		Name:            name,
+		Params:          append([]string(nil), params...),
+		Vararg:          vararg,
+		Body:            loweredBody,
+		Locals:          child.nextLocal,
+		Upvalues:        child.upvalues,
+		LineDefined:     lineDefined,
+		LastLineDefined: lastLineDefined,
 	}, nil
 }
 
 func (r *resolver) lowerTarget(expr frontend.Expr) (AssignTarget, error) {
 	switch target := expr.(type) {
 	case *frontend.NameExpr:
-		return &VarTarget{Ref: r.resolveName(target.Name)}, nil
+		return &VarTarget{Line: target.Line, Ref: r.resolveName(target.Name)}, nil
 	case *frontend.FieldExpr:
 		value, err := r.lowerExpr(target.Target)
 		if err != nil {
 			return nil, err
 		}
-		return &FieldTarget{Target: value, Name: target.Name}, nil
+		return &FieldTarget{Line: target.Line, Target: value, Name: target.Name}, nil
 	case *frontend.IndexExpr:
 		value, err := r.lowerExpr(target.Target)
 		if err != nil {
@@ -260,7 +270,7 @@ func (r *resolver) lowerTarget(expr frontend.Expr) (AssignTarget, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &IndexTarget{Target: value, Key: key}, nil
+		return &IndexTarget{Line: target.Line, Target: value, Key: key}, nil
 	default:
 		return nil, fmt.Errorf("invalid assignment target %T", expr)
 	}
@@ -269,26 +279,26 @@ func (r *resolver) lowerTarget(expr frontend.Expr) (AssignTarget, error) {
 func (r *resolver) lowerExpr(expr frontend.Expr) (Expr, error) {
 	switch e := expr.(type) {
 	case *frontend.NameExpr:
-		return &VarExpr{Ref: r.resolveName(e.Name)}, nil
+		return &VarExpr{Line: e.Line, Ref: r.resolveName(e.Name)}, nil
 	case *frontend.NumberExpr:
-		return &LiteralExpr{Value: e.Value}, nil
+		return &LiteralExpr{Line: e.Line, Value: e.Value}, nil
 	case *frontend.StringExpr:
-		return &LiteralExpr{Value: e.Value}, nil
+		return &LiteralExpr{Line: e.Line, Value: e.Value}, nil
 	case *frontend.BoolExpr:
-		return &LiteralExpr{Value: e.Value}, nil
+		return &LiteralExpr{Line: e.Line, Value: e.Value}, nil
 	case *frontend.NilExpr:
-		return &LiteralExpr{Value: nil}, nil
+		return &LiteralExpr{Line: e.Line, Value: nil}, nil
 	case *frontend.VarargExpr:
 		if !r.vararg {
 			return nil, fmt.Errorf("cannot use '...' outside vararg function")
 		}
-		return &VarargExpr{}, nil
+		return &VarargExpr{Line: e.Line}, nil
 	case *frontend.UnaryExpr:
 		expr, err := r.lowerExpr(e.Expr)
 		if err != nil {
 			return nil, err
 		}
-		return &UnaryExpr{Op: e.Op.String(), Expr: expr}, nil
+		return &UnaryExpr{Line: e.Line, Op: e.Op.String(), Expr: expr}, nil
 	case *frontend.BinaryExpr:
 		left, err := r.lowerExpr(e.Left)
 		if err != nil {
@@ -298,7 +308,7 @@ func (r *resolver) lowerExpr(expr frontend.Expr) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &BinaryExpr{Op: e.Op.String(), Left: left, Right: right}, nil
+		return &BinaryExpr{Line: e.Line, Op: e.Op.String(), Left: left, Right: right}, nil
 	case *frontend.CallExpr:
 		callee, err := r.lowerExpr(e.Callee)
 		if err != nil {
@@ -312,7 +322,7 @@ func (r *resolver) lowerExpr(expr frontend.Expr) (Expr, error) {
 			}
 			args = append(args, lowered)
 		}
-		return &CallExpr{Callee: callee, Args: args}, nil
+		return &CallExpr{Line: e.Line, Callee: callee, Args: args}, nil
 	case *frontend.MethodCallExpr:
 		receiver, err := r.lowerExpr(e.Receiver)
 		if err != nil {
@@ -326,13 +336,13 @@ func (r *resolver) lowerExpr(expr frontend.Expr) (Expr, error) {
 			}
 			args = append(args, lowered)
 		}
-		return &MethodCallExpr{Receiver: receiver, Name: e.Name, Args: args}, nil
+		return &MethodCallExpr{Line: e.Line, Receiver: receiver, Name: e.Name, Args: args}, nil
 	case *frontend.FieldExpr:
 		target, err := r.lowerExpr(e.Target)
 		if err != nil {
 			return nil, err
 		}
-		return &FieldExpr{Target: target, Name: e.Name}, nil
+		return &FieldExpr{Line: e.Line, Target: target, Name: e.Name}, nil
 	case *frontend.IndexExpr:
 		target, err := r.lowerExpr(e.Target)
 		if err != nil {
@@ -342,7 +352,7 @@ func (r *resolver) lowerExpr(expr frontend.Expr) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &IndexExpr{Target: target, Key: key}, nil
+		return &IndexExpr{Line: e.Line, Target: target, Key: key}, nil
 	case *frontend.TableExpr:
 		fields := make([]TableField, 0, len(e.Fields))
 		for _, field := range e.Fields {
@@ -360,9 +370,9 @@ func (r *resolver) lowerExpr(expr frontend.Expr) (Expr, error) {
 			}
 			fields = append(fields, lowered)
 		}
-		return &TableExpr{Fields: fields}, nil
+		return &TableExpr{Line: e.Line, Fields: fields}, nil
 	case *frontend.FunctionExpr:
-		fn, err := r.lowerFunction("lambda", e.Params, e.Vararg, e.Body)
+		fn, err := r.lowerFunction("lambda", e.Params, e.Vararg, e.Body, e.Line, e.EndLine)
 		if err != nil {
 			return nil, err
 		}

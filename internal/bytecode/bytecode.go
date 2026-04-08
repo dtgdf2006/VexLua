@@ -39,6 +39,7 @@ const (
 	OpLessEqual
 	OpNot
 	OpCall
+	OpTailCall
 	OpCallMulti
 	OpVararg
 	OpYield
@@ -56,8 +57,15 @@ const (
 )
 
 type UpvalueDesc struct {
+	Name          string
 	InParentLocal bool
 	Index         uint16
+}
+
+type LocalVar struct {
+	Name    string
+	StartPC int
+	EndPC   int
 }
 
 type Instr struct {
@@ -69,16 +77,22 @@ type Instr struct {
 }
 
 type Proto struct {
-	Name         string
-	MaxStack     int
-	InlineCaches int
-	NumParams    int
-	Vararg       bool
-	Scripted     bool
-	Constants    []rt.Value
-	Children     []*Proto
-	Upvalues     []UpvalueDesc
-	Code         []Instr
+	Name            string
+	Source          string
+	MaxStack        int
+	InlineCaches    int
+	NumParams       int
+	Vararg          bool
+	Scripted        bool
+	LineDefined     int
+	LastLineDefined int
+	Constants       []rt.Value
+	Children        []*Proto
+	Upvalues        []UpvalueDesc
+	LocalsDebug     []LocalVar
+	Code            []Instr
+	LineInfo        []int
+	currentLine     int
 }
 
 func NewProto(name string, maxStack int, inlineCaches int) *Proto {
@@ -88,8 +102,10 @@ func NewProto(name string, maxStack int, inlineCaches int) *Proto {
 		InlineCaches: inlineCaches,
 		Children:     make([]*Proto, 0, 2),
 		Upvalues:     make([]UpvalueDesc, 0, 2),
+		LocalsDebug:  make([]LocalVar, 0, 2),
 		Constants:    make([]rt.Value, 0, 8),
 		Code:         make([]Instr, 0, 16),
+		LineInfo:     make([]int, 0, 16),
 	}
 }
 
@@ -105,6 +121,28 @@ func (p *Proto) AddConstant(v rt.Value) int {
 
 func (p *Proto) Emit(op Op, a, b, c uint16, d int32) {
 	p.Code = append(p.Code, Instr{Op: op, A: a, B: b, C: c, D: d})
+	p.LineInfo = append(p.LineInfo, p.currentLine)
+}
+
+func (p *Proto) SetCurrentLine(line int) {
+	p.currentLine = line
+}
+
+func (p *Proto) CurrentLine(pc int) int {
+	if pc < 0 || pc >= len(p.LineInfo) {
+		return -1
+	}
+	if p.LineInfo[pc] <= 0 {
+		return -1
+	}
+	return p.LineInfo[pc]
+}
+
+func (p *Proto) SetSourceRecursive(source string) {
+	p.Source = source
+	for _, child := range p.Children {
+		child.SetSourceRecursive(source)
+	}
 }
 
 func (op Op) String() string {
@@ -169,6 +207,8 @@ func (op Op) String() string {
 		return "NOT"
 	case OpCall:
 		return "CALL"
+	case OpTailCall:
+		return "TAILCALL"
 	case OpCallMulti:
 		return "CALL_MULTI"
 	case OpVararg:

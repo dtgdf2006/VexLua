@@ -10,6 +10,8 @@ const (
 	ObjectHostFunction
 	ObjectHostProxy
 	ObjectLuaClosure
+	ObjectThread
+	ObjectUserdata
 )
 
 type Handle uint64
@@ -44,17 +46,36 @@ func (k ObjectKind) String() string {
 		return "host-proxy"
 	case ObjectLuaClosure:
 		return "lua-closure"
+	case ObjectThread:
+		return "thread"
+	case ObjectUserdata:
+		return "userdata"
 	default:
 		return "object"
 	}
+}
+
+type ThreadObject struct {
+	State any
+	Meta  Value
+	Env   Value
+}
+
+type Userdata struct {
+	Value     any
+	Meta      Value
+	Env       Value
+	Finalized bool
 }
 
 type Heap struct {
 	strings       []string
 	tables        []*Table
 	hostFunctions []HostFunction
-	hostProxies   []HostProxy
+	hostProxies   []*HostProxy
 	luaClosures   []any
+	threads       []*ThreadObject
+	userdatas     []*Userdata
 }
 
 func (h *Heap) NewString(v string) Handle {
@@ -90,12 +111,12 @@ func (h *Heap) HostFunction(handle Handle) *HostFunction {
 
 func (h *Heap) NewHostProxy(proxy HostProxy) Handle {
 	idx := uint32(len(h.hostProxies))
-	h.hostProxies = append(h.hostProxies, proxy)
+	h.hostProxies = append(h.hostProxies, &proxy)
 	return makeHandle(ObjectHostProxy, idx)
 }
 
 func (h *Heap) HostProxy(handle Handle) *HostProxy {
-	return &h.hostProxies[handle.Index()]
+	return h.hostProxies[handle.Index()]
 }
 
 func (h *Heap) NewLuaClosure(closure any) Handle {
@@ -106,4 +127,59 @@ func (h *Heap) NewLuaClosure(closure any) Handle {
 
 func (h *Heap) LuaClosure(handle Handle) any {
 	return h.luaClosures[handle.Index()]
+}
+
+func (h *Heap) NewThread(state any, env Value) Handle {
+	idx := uint32(len(h.threads))
+	h.threads = append(h.threads, &ThreadObject{State: state, Meta: NilValue, Env: env})
+	return makeHandle(ObjectThread, idx)
+}
+
+func (h *Heap) Thread(handle Handle) *ThreadObject {
+	return h.threads[handle.Index()]
+}
+
+func (h *Heap) NewUserdata(value any, meta Value, env Value) Handle {
+	idx := uint32(len(h.userdatas))
+	h.userdatas = append(h.userdatas, &Userdata{Value: value, Meta: meta, Env: env})
+	return makeHandle(ObjectUserdata, idx)
+}
+
+func (h *Heap) Userdata(handle Handle) *Userdata {
+	return h.userdatas[handle.Index()]
+}
+
+func (h *Heap) ApproxBytes() int64 {
+	var total int64
+	for _, s := range h.strings {
+		total += int64(len(s))
+	}
+	total += int64(len(h.strings)) * 16
+	for _, table := range h.tables {
+		if table != nil {
+			total += table.ApproxBytes()
+		}
+	}
+	total += int64(len(h.hostFunctions)) * 64
+	for _, proxy := range h.hostProxies {
+		if proxy != nil {
+			total += 96
+		}
+	}
+	for _, closure := range h.luaClosures {
+		if closure != nil {
+			total += 96
+		}
+	}
+	for _, thread := range h.threads {
+		if thread != nil {
+			total += 96
+		}
+	}
+	for _, userdata := range h.userdatas {
+		if userdata != nil {
+			total += 96
+		}
+	}
+	return total
 }
