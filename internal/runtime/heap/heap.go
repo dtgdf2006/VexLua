@@ -2,14 +2,14 @@ package heap
 
 import (
 	"fmt"
-	"unsafe"
 
 	"vexlua/internal/runtime/value"
 )
 
 const (
-	DefaultPageSize uint64  = 64 * 1024
-	DefaultHeapBase uintptr = 0x1000_0000_0000
+	DefaultPageSize          uint64  = 64 * 1024
+	DefaultHeapBase          uintptr = 0x1000_0000_0000
+	DefaultNativeReserveSize uint64  = 1 * 1024 * 1024 * 1024
 )
 
 type Allocation struct {
@@ -36,8 +36,7 @@ type Heap struct {
 	pages       []*page
 	allocations map[value.HeapOff64]allocationSpan
 	nextPage    uint64
-	nativeArena []byte
-	nativeData  []byte
+	native      nativeArena
 }
 
 func New(base uintptr, pageSize uint64) (*Heap, error) {
@@ -56,7 +55,15 @@ func New(base uintptr, pageSize uint64) (*Heap, error) {
 		allocations: make(map[value.HeapOff64]allocationSpan),
 		nextPage:    value.ObjectAlignment,
 	}
-	h.ensureNativeSize(value.ObjectAlignment)
+	reserveSize := DefaultNativeReserveSize
+	if reserveSize < h.pageSize {
+		reserveSize = h.pageSize
+	}
+	native, err := newNativeArena(reserveSize, value.ObjectAlignment)
+	if err != nil {
+		return nil, err
+	}
+	h.native = native
 	return h, nil
 }
 
@@ -73,8 +80,10 @@ func (heap *Heap) Base() uintptr {
 }
 
 func (heap *Heap) NativeBase() uintptr {
-	heap.ensureNativeSize(value.ObjectAlignment)
-	return uintptr(unsafe.Pointer(&heap.nativeData[0]))
+	if heap == nil || heap.native == nil {
+		return 0
+	}
+	return heap.native.Base()
 }
 
 func (heap *Heap) PageSize() uint64 {
@@ -145,6 +154,9 @@ func (heap *Heap) NativeAddressForOffset(offset value.HeapOff64) (uintptr, error
 	if _, err := heap.Resolve(offset, 1); err != nil {
 		return 0, err
 	}
+	if err := heap.native.EnsureCommitted(uint64(offset) + 1); err != nil {
+		return 0, err
+	}
 	return heap.NativeBase() + uintptr(offset), nil
 }
 
@@ -155,10 +167,10 @@ func (heap *Heap) ResolveNative(offset value.HeapOff64, size uint64) ([]byte, er
 	if _, err := heap.Resolve(offset, size); err != nil {
 		return nil, err
 	}
-	heap.ensureNativeSize(uint64(offset) + size)
-	start := int(offset)
-	end := start + int(size)
-	return heap.nativeData[start:end], nil
+	if err := heap.native.EnsureCommitted(uint64(offset) + size); err != nil {
+		return nil, err
+	}
+	return heap.native.Bytes(uint64(offset), size)
 }
 
 func (heap *Heap) OffsetForAddress(address uintptr) (value.HeapOff64, error) {
@@ -245,10 +257,14 @@ func (heap *Heap) SyncNative(offset value.HeapOff64, bytes []byte) error {
 	if _, err := heap.Resolve(offset, uint64(len(bytes))); err != nil {
 		return err
 	}
-	heap.ensureNativeSize(uint64(offset) + uint64(len(bytes)))
-	start := int(offset)
-	end := start + len(bytes)
-	copy(heap.nativeData[start:end], bytes)
+	if err := heap.native.EnsureCommitted(uint64(offset) + uint64(len(bytes))); err != nil {
+		return err
+	}
+	nativeBytes, err := heap.native.Bytes(uint64(offset), uint64(len(bytes)))
+	if err != nil {
+		return err
+	}
+	copy(nativeBytes, bytes)
 	return nil
 }
 
@@ -297,32 +313,6 @@ func (heap *Heap) findPage(offset uint64, size uint64) (*page, uint64) {
 
 func (page *page) remaining() uint64 {
 	return uint64(len(page.data)) - page.used
-}
-
-func (heap *Heap) ensureNativeSize(size uint64) {
-	if size <= uint64(len(heap.nativeData)) {
-		return
-	}
-	newSize := alignUp(size, value.ObjectAlignment)
-	backing, data := allocAlignedBytes(int(newSize), value.ObjectAlignment)
-	copy(data, heap.nativeData)
-	heap.nativeArena = backing
-	heap.nativeData = data
-}
-
-func allocAlignedBytes(size int, alignment uintptr) ([]byte, []byte) {
-	if size <= 0 {
-		size = 1
-	}
-	padding := int(alignment)
-	if padding < 1 {
-		padding = 1
-	}
-	backing := make([]byte, size+padding)
-	base := uintptr(unsafe.Pointer(&backing[0]))
-	aligned := (base + alignment - 1) &^ (alignment - 1)
-	start := int(aligned - base)
-	return backing, backing[start : start+size]
 }
 
 func alignUp(valueToAlign uint64, alignment uint64) uint64 {

@@ -1,7 +1,9 @@
 package heap_test
 
 import (
+	"runtime"
 	"testing"
+	"unsafe"
 
 	"vexlua/internal/runtime/heap"
 	"vexlua/internal/runtime/value"
@@ -133,5 +135,103 @@ func TestHeapSyncsNativeMirrorAtLogicalOffset(t *testing.T) {
 	}
 	if nativeAddress-uintptr(alloc.Offset) != h.NativeBase() {
 		t.Fatalf("native base mismatch: address=%#x offset=%#x base=%#x", nativeAddress, uint64(alloc.Offset), h.NativeBase())
+	}
+}
+
+func TestHeapNativeBaseRemainsStableAcrossCommitGrowth(t *testing.T) {
+	h := heap.MustNew(heap.DefaultHeapBase, 64)
+	first, err := h.AllocObject(value.CommonHeader{Kind: value.KindProto, SizeBytes: 0x20})
+	if err != nil {
+		t.Fatalf("first allocation: %v", err)
+	}
+	copy(first.Bytes[:8], []byte{1, 3, 5, 7, 9, 11, 13, 15})
+	if err := h.SyncNative(first.Offset, first.Bytes); err != nil {
+		t.Fatalf("sync first allocation: %v", err)
+	}
+	base := h.NativeBase()
+	large, err := h.Alloc(256 * 1024)
+	if err != nil {
+		t.Fatalf("large allocation: %v", err)
+	}
+	copy(large.Bytes[:8], []byte{2, 4, 6, 8, 10, 12, 14, 16})
+	if err := h.SyncNative(large.Offset, large.Bytes); err != nil {
+		t.Fatalf("sync large allocation: %v", err)
+	}
+	if h.NativeBase() != base {
+		t.Fatalf("native base changed across commit growth: got %#x want %#x", h.NativeBase(), base)
+	}
+}
+
+func TestHeapNativeAddressRemainsValidAfterCommitGrowth(t *testing.T) {
+	h := heap.MustNew(heap.DefaultHeapBase, 64)
+	first, err := h.AllocObject(value.CommonHeader{Kind: value.KindProto, SizeBytes: 0x20})
+	if err != nil {
+		t.Fatalf("first allocation: %v", err)
+	}
+	copy(first.Bytes[:8], []byte{42, 41, 40, 39, 38, 37, 36, 35})
+	if err := h.SyncNative(first.Offset, first.Bytes); err != nil {
+		t.Fatalf("sync first allocation: %v", err)
+	}
+	nativeBytes, err := h.ResolveNative(first.Offset, 8)
+	if err != nil {
+		t.Fatalf("resolve native bytes: %v", err)
+	}
+	nativeAddress, err := h.NativeAddressForOffset(first.Offset)
+	if err != nil {
+		t.Fatalf("native address: %v", err)
+	}
+	nativePtr := unsafe.Pointer(&nativeBytes[0])
+	if uintptr(nativePtr) != nativeAddress {
+		t.Fatalf("native pointer mismatch: ptr=%#x address=%#x", uintptr(nativePtr), nativeAddress)
+	}
+	large, err := h.Alloc(256 * 1024)
+	if err != nil {
+		t.Fatalf("large allocation: %v", err)
+	}
+	copy(large.Bytes[:8], []byte{1, 1, 2, 3, 5, 8, 13, 21})
+	if err := h.SyncNative(large.Offset, large.Bytes); err != nil {
+		t.Fatalf("sync large allocation: %v", err)
+	}
+	bytesAtAddress := unsafe.Slice((*byte)(nativePtr), 8)
+	var got [8]byte
+	copy(got[:], bytesAtAddress)
+	if got != [8]byte{42, 41, 40, 39, 38, 37, 36, 35} {
+		t.Fatalf("native bytes at original address = %v, want [42 41 40 39 38 37 36 35]", got)
+	}
+}
+
+func TestHeapPublishedNativeAddressesSurviveGC(t *testing.T) {
+	h := heap.MustNew(heap.DefaultHeapBase, 64)
+	alloc, err := h.AllocObject(value.CommonHeader{Kind: value.KindProto, SizeBytes: 0x20})
+	if err != nil {
+		t.Fatalf("allocation: %v", err)
+	}
+	copy(alloc.Bytes[:8], []byte{9, 8, 7, 6, 5, 4, 3, 2})
+	if err := h.SyncNative(alloc.Offset, alloc.Bytes); err != nil {
+		t.Fatalf("sync allocation: %v", err)
+	}
+	nativeBytes, err := h.ResolveNative(alloc.Offset, 8)
+	if err != nil {
+		t.Fatalf("resolve native bytes: %v", err)
+	}
+	base := h.NativeBase()
+	nativeAddress, err := h.NativeAddressForOffset(alloc.Offset)
+	if err != nil {
+		t.Fatalf("native address: %v", err)
+	}
+	nativePtr := unsafe.Pointer(&nativeBytes[0])
+	runtime.GC()
+	if h.NativeBase() != base {
+		t.Fatalf("native base changed after GC: got %#x want %#x", h.NativeBase(), base)
+	}
+	bytesAtAddress := unsafe.Slice((*byte)(nativePtr), 8)
+	var got [8]byte
+	copy(got[:], bytesAtAddress)
+	if got != [8]byte{9, 8, 7, 6, 5, 4, 3, 2} {
+		t.Fatalf("native bytes after GC = %v, want [9 8 7 6 5 4 3 2]", got)
+	}
+	runtime.KeepAlive(h)
+	if nativeAddress-uintptr(alloc.Offset) != base {
+		t.Fatalf("published native address base mismatch after GC: address=%#x offset=%#x base=%#x", nativeAddress, uint64(alloc.Offset), base)
 	}
 }
