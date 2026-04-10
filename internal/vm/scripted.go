@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"vexlua/internal/bytecode"
+	"vexlua/internal/jit"
 	rt "vexlua/internal/runtime"
 )
 
@@ -54,6 +55,9 @@ type Coroutine struct {
 type callFrame struct {
 	state           *protoState
 	closure         *LuaClosure
+	compiledUnit    jit.CompiledUnit
+	nativeFrame     jit.NativeFrameState
+	nativeUpvalues  []jit.NativeUpvalue
 	regs            []rt.Value
 	base            int
 	stackSize       int
@@ -82,28 +86,41 @@ type callFrame struct {
 	tailHookEvent   string
 	skipTailUnwind  bool
 	openUpvalues    []*upvalue
+	nativeUpInline  [2]jit.NativeUpvalue
+}
+
+type upvalueCell struct {
+	value rt.Value
 }
 
 type upvalue struct {
+	cell   upvalueCell
 	stack  []rt.Value
 	index  int
-	closed rt.Value
 	isOpen bool
+}
+
+func resizeOpenUpvalues(slots []*upvalue, size int) []*upvalue {
+	if cap(slots) < size {
+		return make([]*upvalue, size)
+	}
+	slots = slots[:size]
+	clear(slots)
+	return slots
 }
 
 func (u *upvalue) Get() rt.Value {
 	if u.isOpen {
 		return u.stack[u.index]
 	}
-	return u.closed
+	return u.cell.value
 }
 
 func (u *upvalue) Set(v rt.Value) {
 	if u.isOpen {
 		u.stack[u.index] = v
-		return
 	}
-	u.closed = v
+	u.cell.value = v
 }
 
 func newLuaClosure(proto *bytecode.Proto) *LuaClosure {
@@ -233,21 +250,16 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 		}
 		if frame.pc == 0 {
 			state.runs++
-			if !co.hook.enabled() {
-				if err := m.maybeCompile(state, proto); err != nil {
-					return nil, err
-				}
-				if state.compiled != nil {
-					result, err := state.compiled.Run(frame.regs)
-					if err != nil {
-						return nil, err
-					}
-					if err := m.returnFromFrame(co, frame.singleResult(result)); err != nil {
-						return nil, err
-					}
-					continue
-				}
+		}
+		handled, err := m.maybeRunCompiledFrame(co, frame)
+		if err != nil {
+			return nil, err
+		}
+		if handled {
+			if co.status == CoroutineSuspended {
+				return append([]rt.Value(nil), co.yieldedResult...), nil
 			}
+			continue
 		}
 		if frame.pc >= len(proto.Code) {
 			if err := m.returnFromFrame(co, frame.singleResult(rt.NilValue)); err != nil {
@@ -464,10 +476,10 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			for i := 0; i < prefix; i++ {
 				table.SetIndex(start+i, frame.regs[int(instr.A)+1+i])
 			}
-			for i, value := range frame.pendingResults {
+			for i, value := range frame.pendingValues() {
 				table.SetIndex(start+prefix+i, value)
 			}
-			frame.pendingResults = frame.pendingResults[:0]
+			frame.clearPendingResults()
 		case bytecode.OpAdd:
 			result, err := m.addValues(frame.regs[instr.B], frame.regs[instr.C])
 			if err != nil {
@@ -634,7 +646,7 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			callee := frame.regs[instr.B]
 			args := frame.callArgs(int(instr.C), argCount, appendPending)
 			if appendPending {
-				frame.pendingResults = frame.pendingResults[:0]
+				frame.clearPendingResults()
 			}
 			resolvedCallee, resolvedArgs, err := m.resolveCallTarget(callee, args)
 			if err != nil {
@@ -686,7 +698,7 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 					return nil, err
 				}
 				if appendPending {
-					frame.pendingResults = frame.pendingResults[:0]
+					frame.clearPendingResults()
 				}
 				continue
 			}
@@ -696,7 +708,7 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			restore()
 			frame.endGCCall()
 			if appendPending {
-				frame.pendingResults = frame.pendingResults[:0]
+				frame.clearPendingResults()
 			}
 			if err != nil {
 				return nil, err
@@ -704,7 +716,7 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			frame.storeResults(int(instr.A), resultCount, results)
 		case bytecode.OpVararg:
 			count := int(instr.B)
-			frame.storeResults(int(instr.A), count, frame.varargs)
+			frame.storeResults(int(instr.A), count, frame.varargValues())
 		case bytecode.OpYield:
 			yieldCount, resumeCount, appendPending := bytecode.UnpackCallSpec(instr.D)
 			co.status = CoroutineSuspended
@@ -712,7 +724,7 @@ func (m *VM) executeCoroutineUntil(co *Coroutine, targetDepth int) ([]rt.Value, 
 			co.resumeCount = resumeCount
 			co.setYieldedResults(frame.callArgs(int(instr.B), yieldCount, appendPending))
 			if appendPending {
-				frame.pendingResults = frame.pendingResults[:0]
+				frame.clearPendingResults()
 			}
 			return append([]rt.Value(nil), co.yieldedResult...), nil
 		case bytecode.OpJump:
@@ -776,13 +788,15 @@ func (m *VM) tailCallFrame(co *Coroutine, frame *callFrame, closure *LuaClosure,
 	frame.state = state
 	co.stackTop = frame.base
 	frame.closure = closure
+	frame.compiledUnit = nil
 	frame.stackSize = closure.Proto.MaxStack
 	frame.regs = m.reserveRegisterWindow(co, frame.base, frame.stackSize)
 	co.stackTop = frame.base + frame.stackSize
 	frame.pc = 0
 	frame.openCount = 0
-	frame.varargs = frame.varargs[:0]
-	frame.pendingResults = frame.pendingResults[:0]
+	frame.nativeFrame.Reset()
+	frame.clearVarargs()
+	frame.clearPendingResults()
 	frame.argScratch = frame.argScratch[:0]
 	frame.resultScratch = frame.resultScratch[:0]
 	frame.gcRoots = frame.gcRoots[:0]
@@ -796,11 +810,7 @@ func (m *VM) tailCallFrame(co *Coroutine, frame *callFrame, closure *LuaClosure,
 	frame.tailCalls = 0
 	frame.lastHookLine = -1
 	frame.lastHookPC = -1
-	if len(frame.openUpvalues) != closure.Proto.MaxStack {
-		frame.openUpvalues = make([]*upvalue, closure.Proto.MaxStack)
-	} else {
-		clear(frame.openUpvalues)
-	}
+	frame.openUpvalues = resizeOpenUpvalues(frame.openUpvalues, closure.Proto.MaxStack)
 	m.bindFrameArgs(frame, boundArgs)
 }
 
@@ -921,7 +931,7 @@ func (f *callFrame) captureUpvalue(slot int) *upvalue {
 	if uv := f.openUpvalues[slot]; uv != nil {
 		return uv
 	}
-	uv := &upvalue{stack: f.regs, index: slot, isOpen: true}
+	uv := &upvalue{cell: upvalueCell{value: f.regs[slot]}, stack: f.regs, index: slot, isOpen: true}
 	f.openUpvalues[slot] = uv
 	f.openCount++
 	return uv
@@ -944,7 +954,7 @@ func (f *callFrame) closeUpvaluesFrom(start int) {
 	for i := start; i < len(f.openUpvalues); i++ {
 		uv := f.openUpvalues[i]
 		if uv != nil && uv.isOpen {
-			uv.closed = uv.stack[uv.index]
+			uv.cell.value = uv.stack[uv.index]
 			uv.stack = nil
 			uv.isOpen = false
 			f.openCount--
@@ -976,6 +986,7 @@ func (m *VM) acquireFrame(co *Coroutine, closure *LuaClosure, returnReg int, ret
 	}
 	frame.state = state
 	frame.closure = closure
+	frame.compiledUnit = nil
 	frame.base = co.stackTop
 	frame.stackSize = closure.Proto.MaxStack
 	frame.regs = m.reserveRegisterWindow(co, frame.base, frame.stackSize)
@@ -987,8 +998,9 @@ func (m *VM) acquireFrame(co *Coroutine, closure *LuaClosure, returnReg int, ret
 	frame.returnReg = returnReg
 	frame.returnCount = returnCount
 	frame.openCount = 0
-	frame.varargs = frame.varargs[:0]
-	frame.pendingResults = frame.pendingResults[:0]
+	frame.nativeFrame.Reset()
+	frame.clearVarargs()
+	frame.clearPendingResults()
 	frame.gcRoots = frame.gcRoots[:0]
 	frame.gcOverwriteReg = -1
 	frame.gcOverwriteCnt = 0
@@ -996,9 +1008,7 @@ func (m *VM) acquireFrame(co *Coroutine, closure *LuaClosure, returnReg int, ret
 	frame.gcFrameDead = false
 	frame.tailPending = false
 	frame.skipTailUnwind = false
-	if len(frame.openUpvalues) != closure.Proto.MaxStack {
-		frame.openUpvalues = make([]*upvalue, closure.Proto.MaxStack)
-	}
+	frame.openUpvalues = resizeOpenUpvalues(frame.openUpvalues, closure.Proto.MaxStack)
 	co.stackTop += frame.stackSize
 	return frame
 }
@@ -1013,6 +1023,7 @@ func (m *VM) releaseFrame(frame *callFrame) {
 	frame.stackSize = 0
 	frame.state = nil
 	frame.closure = nil
+	frame.compiledUnit = nil
 	frame.pc = 0
 	frame.tailCalls = 0
 	frame.tailLoss = 0
@@ -1021,8 +1032,9 @@ func (m *VM) releaseFrame(frame *callFrame) {
 	frame.returnReg = 0
 	frame.returnCount = 0
 	frame.openCount = 0
-	frame.varargs = frame.varargs[:0]
-	frame.pendingResults = frame.pendingResults[:0]
+	frame.nativeFrame.Reset()
+	frame.clearVarargs()
+	frame.clearPendingResults()
 	frame.argScratch = frame.argScratch[:0]
 	frame.resultScratch = frame.resultScratch[:0]
 	frame.gcRoots = frame.gcRoots[:0]
@@ -1109,7 +1121,7 @@ func (f *callFrame) storeResults(start int, count int, results []rt.Value) {
 		f.setPendingResults(results)
 		return
 	}
-	f.pendingResults = f.pendingResults[:0]
+	f.clearPendingResults()
 	for i := 0; i < count; i++ {
 		value := rt.NilValue
 		if i < len(results) {
@@ -1125,24 +1137,101 @@ func (f *callFrame) callArgs(start int, count int, appendPending bool) []rt.Valu
 	if !appendPending {
 		return f.regs[start : start+count]
 	}
-	if len(f.pendingResults) == 0 {
+	pendingCount := f.pendingResultCount()
+	if pendingCount == 0 {
 		return f.regs[start : start+count]
 	}
 	if count == 0 {
-		return f.pendingResults
+		return f.pendingValues()
 	}
-	args := f.borrowArgScratch(count + len(f.pendingResults))
+	args := f.borrowArgScratch(count + pendingCount)
 	args = append(args, f.regs[start:start+count]...)
-	args = append(args, f.pendingResults...)
+	args = f.appendPendingResults(args)
 	return args
+}
+
+func (f *callFrame) pendingResultCount() int {
+	if len(f.pendingResults) != 0 || f.nativeFrame.Pending.Count == 0 {
+		return len(f.pendingResults)
+	}
+	return int(f.nativeFrame.Pending.Count)
+}
+
+func (f *callFrame) appendPendingResults(dst []rt.Value) []rt.Value {
+	if len(f.pendingResults) != 0 {
+		return append(dst, f.pendingResults...)
+	}
+	return appendNativeMultiResultBuffer(dst, &f.nativeFrame.Pending)
+}
+
+func (f *callFrame) pendingValues() []rt.Value {
+	count := f.pendingResultCount()
+	if count == 0 {
+		return nil
+	}
+	values := f.borrowResultScratch(count)
+	return f.appendPendingResults(values)
+}
+
+func (f *callFrame) firstPendingResult() (rt.Value, bool) {
+	if len(f.pendingResults) != 0 {
+		return f.pendingResults[0], true
+	}
+	if f.nativeFrame.Pending.Count == 0 {
+		return rt.NilValue, false
+	}
+	return f.nativeFrame.Pending.Inline[0], true
+}
+
+func (f *callFrame) clearPendingResults() {
+	f.pendingResults = f.pendingResults[:0]
+	f.nativeFrame.Pending.Reset()
 }
 
 func (f *callFrame) setPendingResults(results []rt.Value) {
 	f.pendingResults = storeOwnedValues(f.pendingResults, f.pendingInline[:], results)
+	syncNativeMultiResultBuffer(&f.nativeFrame.Pending, f.pendingResults)
 }
 
 func (f *callFrame) setVarargs(values []rt.Value) {
 	f.varargs = storeOwnedValues(f.varargs, f.varargsInline[:], values)
+	syncNativeMultiResultBuffer(&f.nativeFrame.Varargs, f.varargs)
+	f.nativeFrame.VarargCount = uint32(len(f.varargs))
+}
+
+func (f *callFrame) varargCount() int {
+	if len(f.varargs) != 0 || f.nativeFrame.Varargs.Count == 0 {
+		return len(f.varargs)
+	}
+	return int(f.nativeFrame.Varargs.Count)
+}
+
+func (f *callFrame) appendVarargs(dst []rt.Value) []rt.Value {
+	if len(f.varargs) != 0 {
+		return append(dst, f.varargs...)
+	}
+	return appendNativeMultiResultBuffer(dst, &f.nativeFrame.Varargs)
+}
+
+func (f *callFrame) varargValues() []rt.Value {
+	count := f.varargCount()
+	if count == 0 {
+		return nil
+	}
+	values := f.borrowArgScratch(count)
+	return f.appendVarargs(values)
+}
+
+func (f *callFrame) clearVarargs() {
+	f.varargs = f.varargs[:0]
+	f.nativeFrame.VarargCount = 0
+	f.nativeFrame.Varargs.Reset()
+}
+
+func (f *callFrame) syncNativeFrameBuffers() {
+	syncNativeMultiResultBuffer(&f.nativeFrame.Pending, f.pendingResults)
+	syncNativeMultiResultBuffer(&f.nativeFrame.Varargs, f.varargs)
+	f.nativeFrame.VarargCount = uint32(len(f.varargs))
 }
 
 func (f *callFrame) borrowArgScratch(size int) []rt.Value {
@@ -1175,15 +1264,16 @@ func (f *callFrame) copyArgs(args []rt.Value) []rt.Value {
 }
 
 func (f *callFrame) returnResults(start int, count int) []rt.Value {
-	if len(f.pendingResults) == 0 {
+	pendingCount := f.pendingResultCount()
+	if pendingCount == 0 {
 		return f.regs[start : start+count]
 	}
 	if count == 0 {
-		return f.pendingResults
+		return f.pendingValues()
 	}
-	results := f.borrowResultScratch(count + len(f.pendingResults))
+	results := f.borrowResultScratch(count + pendingCount)
 	results = append(results, f.regs[start:start+count]...)
-	results = append(results, f.pendingResults...)
+	results = f.appendPendingResults(results)
 	return results
 }
 
@@ -1702,10 +1792,10 @@ func (m *VM) callValue(callee rt.Value, args []rt.Value) (rt.Value, error) {
 				}
 				caller := co.frames[targetDepth-1]
 				result := rt.NilValue
-				if len(caller.pendingResults) > 0 {
-					result = caller.pendingResults[0]
+				if pending, ok := caller.firstPendingResult(); ok {
+					result = pending
 				}
-				caller.pendingResults = caller.pendingResults[:0]
+				caller.clearPendingResults()
 				return result, nil
 			}
 			co := newCoroutine(m, resolvedCallee)
@@ -1822,8 +1912,8 @@ func (m *VM) callValueMulti(callee rt.Value, args []rt.Value) ([]rt.Value, error
 					return append([]rt.Value(nil), co.lastResults...), nil
 				}
 				caller := co.frames[targetDepth-1]
-				results := append([]rt.Value(nil), caller.pendingResults...)
-				caller.pendingResults = caller.pendingResults[:0]
+				results := append([]rt.Value(nil), caller.pendingValues()...)
+				caller.clearPendingResults()
 				return results, nil
 			}
 			co := newCoroutine(m, resolvedCallee)

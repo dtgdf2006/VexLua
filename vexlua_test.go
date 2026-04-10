@@ -2,7 +2,6 @@ package vexlua
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -14,8 +13,6 @@ import (
 	"time"
 
 	"vexlua/internal/bytecode"
-	"vexlua/internal/jit"
-	amd64jit "vexlua/internal/jit/amd64"
 )
 
 type benchBox struct {
@@ -46,20 +43,6 @@ func runProtoRepeated(t *testing.T, engine *Engine, proto *bytecode.Proto, runs 
 		}
 	}
 	return result
-}
-
-func protoJITSupportForTest(t *testing.T, proto *bytecode.Proto) bool {
-	t.Helper()
-	compiler := amd64jit.NewCompiler()
-	_, err := compiler.Compile(proto)
-	if err == nil {
-		return true
-	}
-	if errors.Is(err, jit.ErrUnsupported) {
-		return false
-	}
-	t.Fatalf("jit compile probe for %q failed: %v", proto.Name, err)
-	return false
 }
 
 func TestBridgeAndProxy(t *testing.T) {
@@ -114,29 +97,22 @@ func TestQuickeningAndIC(t *testing.T) {
 	}
 }
 
-func TestJITSumLoop(t *testing.T) {
-	engine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 2})
+func TestHotSumLoopQuickens(t *testing.T) {
+	engine := New()
 	proto := engine.BuildSumLoop(10000)
-	var result Value
-	var err error
-	for i := 0; i < 4; i++ {
-		result, err = engine.Run(proto)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
+	result := runProtoRepeated(t, engine, proto, 4)
 	want := float64(10000*10001) / 2
 	if math.Abs(result.Number()-want) > 0.001 {
 		t.Fatalf("sum loop = %v, want %v", result.Number(), want)
 	}
 	stats := engine.Stats(proto)
-	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" && !stats.JITCompiled {
-		t.Fatalf("expected JIT compilation on windows amd64, got %+v", stats)
+	if stats.QuickenedOps == 0 {
+		t.Fatalf("expected hot sum loop to quicken, got %+v", stats)
 	}
 }
 
-func TestScriptedNumericForCanJIT(t *testing.T) {
-	engine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 2})
+func TestScriptedNumericForQuickens(t *testing.T) {
+	engine := New()
 	proto, err := engine.CompileString(`
 local sum = 0
 for i = 1, 1000 do
@@ -147,24 +123,18 @@ return sum
 	if err != nil {
 		t.Fatal(err)
 	}
-	var result Value
-	for i := 0; i < 4; i++ {
-		result, err = engine.Run(proto)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
+	result := runProtoRepeated(t, engine, proto, 4)
 	if got := result.Number(); got != 500500 {
 		t.Fatalf("scripted numeric-for result = %v, want 500500", got)
 	}
 	stats := engine.Stats(proto)
-	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" && !stats.JITCompiled {
-		t.Fatalf("expected scripted proto to reach JIT on windows amd64, got %+v", stats)
+	if stats.QuickenedOps == 0 {
+		t.Fatalf("expected scripted numeric-for to quicken, got %+v", stats)
 	}
 }
 
-func TestScriptedWhileLoopCanJIT(t *testing.T) {
-	engine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 2})
+func TestScriptedWhileLoopQuickens(t *testing.T) {
+	engine := New()
 	proto := compileNamedForTest(t, engine, "@jit_while.lua", `
 local i = 1
 local sum = 0
@@ -179,13 +149,13 @@ return sum
 		t.Fatalf("scripted while result = %v, want 500500", got)
 	}
 	stats := engine.Stats(proto)
-	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" && !stats.JITCompiled {
-		t.Fatalf("expected while-loop proto to reach JIT on windows amd64, got %+v", stats)
+	if stats.QuickenedOps == 0 {
+		t.Fatalf("expected scripted while-loop to quicken, got %+v", stats)
 	}
 }
 
-func TestDoStringCachedNumericForCanJIT(t *testing.T) {
-	engine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 2})
+func TestDoStringCachedNumericForQuickens(t *testing.T) {
+	engine := New()
 	source := `
 local sum = 0
 for i = 1, 1000 do
@@ -207,12 +177,12 @@ return sum
 		t.Fatal("expected DoString numeric-for source to be cached")
 	}
 	stats := engine.Stats(proto)
-	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" && !stats.JITCompiled {
-		t.Fatalf("expected cached DoString proto to reach JIT on windows amd64, got %+v", stats)
+	if stats.QuickenedOps == 0 {
+		t.Fatalf("expected cached DoString proto to quicken, got %+v", stats)
 	}
 }
 
-func TestJITFallbackPreservesUnsupportedScriptSemantics(t *testing.T) {
+func TestWarmExecutionPreservesScriptSemantics(t *testing.T) {
 	testCases := []struct {
 		name   string
 		source string
@@ -306,32 +276,28 @@ return (localDemo() and 1 or 0)
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			interp := NewWithOptions(Options{EnableJIT: false, HotThreshold: 1024})
-			jitEngine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 1})
-			interpProto := compileNamedForTest(t, interp, "@jit_fallback_"+testCase.name+".lua", testCase.source)
-			jitProto := compileNamedForTest(t, jitEngine, "@jit_fallback_"+testCase.name+".lua", testCase.source)
+			cold := New()
+			warm := New()
+			coldProto := compileNamedForTest(t, cold, "@jit_fallback_"+testCase.name+".lua", testCase.source)
+			warmProto := compileNamedForTest(t, warm, "@jit_fallback_"+testCase.name+".lua", testCase.source)
 
-			interpResult := runProtoRepeated(t, interp, interpProto, 1)
-			jitResult := runProtoRepeated(t, jitEngine, jitProto, 4)
-			interpFormatted := interp.FormatValue(interpResult)
-			jitFormatted := jitEngine.FormatValue(jitResult)
-			if interpFormatted != testCase.want {
-				t.Fatalf("interpreter result for %s = %q, want %q", testCase.name, interpFormatted, testCase.want)
+			coldResult := runProtoRepeated(t, cold, coldProto, 1)
+			warmResult := runProtoRepeated(t, warm, warmProto, 4)
+			coldFormatted := cold.FormatValue(coldResult)
+			warmFormatted := warm.FormatValue(warmResult)
+			if coldFormatted != testCase.want {
+				t.Fatalf("cold result for %s = %q, want %q", testCase.name, coldFormatted, testCase.want)
 			}
-			if jitFormatted != interpFormatted {
-				t.Fatalf("jit-enabled result for %s = %q, want %q", testCase.name, jitFormatted, interpFormatted)
-			}
-			stats := jitEngine.Stats(jitProto)
-			if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" && !protoJITSupportForTest(t, jitProto) && stats.JITCompiled {
-				t.Fatalf("unsupported proto %s unexpectedly reached JIT: %+v", testCase.name, stats)
+			if warmFormatted != coldFormatted {
+				t.Fatalf("warm result for %s = %q, want %q", testCase.name, warmFormatted, coldFormatted)
 			}
 		})
 	}
 }
 
-func TestUnsupportedProtoDoesNotBlockLaterJITCompilation(t *testing.T) {
-	engine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 1})
-	unsupported := compileNamedForTest(t, engine, "@jit_unsupported_closure.lua", `
+func TestEarlierScriptsDoNotBlockLaterQuickening(t *testing.T) {
+	engine := New()
+	earlier := compileNamedForTest(t, engine, "@jit_unsupported_closure.lua", `
 local seed = 40
 local function make()
 	local offset = 2
@@ -352,17 +318,17 @@ end
 return sum
 `)
 
-	unsupportedResult := runProtoRepeated(t, engine, unsupported, 3)
-	if got := engine.FormatValue(unsupportedResult); got != "42" {
-		t.Fatalf("unsupported proto result = %q, want 42", got)
+	earlierResult := runProtoRepeated(t, engine, earlier, 3)
+	if got := engine.FormatValue(earlierResult); got != "42" {
+		t.Fatalf("earlier proto result = %q, want 42", got)
 	}
 	supportedResult := runProtoRepeated(t, engine, supported, 4)
 	if got := supportedResult.Number(); got != 500500 {
 		t.Fatalf("supported proto result = %v, want 500500", got)
 	}
 	stats := engine.Stats(supported)
-	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" && !stats.JITCompiled {
-		t.Fatalf("expected supported proto to still reach JIT after unsupported proto, got %+v", stats)
+	if stats.QuickenedOps == 0 {
+		t.Fatalf("expected supported proto to quicken after earlier script, got %+v", stats)
 	}
 }
 
@@ -2070,8 +2036,8 @@ func BenchmarkInterpreterSumLoop(b *testing.B) {
 	}
 }
 
-func BenchmarkJITSumLoop(b *testing.B) {
-	engine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 2})
+func BenchmarkHotSumLoop(b *testing.B) {
+	engine := New()
 	proto := engine.BuildSumLoop(20000)
 	for i := 0; i < 4; i++ {
 		if _, err := engine.Run(proto); err != nil {

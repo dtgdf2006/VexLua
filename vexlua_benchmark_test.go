@@ -11,16 +11,16 @@ func BenchmarkSystematic(b *testing.B) {
 		for _, work := range benchmarks.ScriptWorkloads() {
 			work := work
 			b.Run(work.Name, func(b *testing.B) {
-				benchmarkCompiledWorkload(b, work, false)
+				benchmarkCompiledWorkload(b, work, false, false)
 			})
 		}
 	})
 
-	b.Run("run_jit", func(b *testing.B) {
+	b.Run("run_vexarc", func(b *testing.B) {
 		for _, work := range benchmarks.ScriptWorkloads() {
 			work := work
 			b.Run(work.Name, func(b *testing.B) {
-				benchmarkCompiledWorkload(b, work, true)
+				benchmarkCompiledWorkload(b, work, true, true)
 			})
 		}
 	})
@@ -40,12 +40,11 @@ func BenchmarkSystematic(b *testing.B) {
 	})
 }
 
-func benchmarkCompiledWorkload(b *testing.B, work benchmarks.Workload, enableJIT bool) {
-	hotThreshold := uint32(1024)
-	if enableJIT {
-		hotThreshold = 2
+func benchmarkCompiledWorkload(b *testing.B, work benchmarks.Workload, warmup bool, enableVexarc bool) {
+	engine := New()
+	if enableVexarc {
+		engine = NewWithOptions(Options{EnableJIT: true, HotThreshold: 1})
 	}
-	engine := NewWithOptions(Options{EnableJIT: enableJIT, HotThreshold: hotThreshold})
 	proto, err := engine.CompileStringNamed(work.Source, "@bench_"+work.Name+".lua")
 	if err != nil {
 		b.Fatal(err)
@@ -57,7 +56,7 @@ func benchmarkCompiledWorkload(b *testing.B, work benchmarks.Workload, enableJIT
 	if got := engine.FormatValue(result); !benchmarks.MatchesExpected(got, work.Expected) {
 		b.Fatalf("benchmark %s initial result = %q, want %q", work.Name, got, work.Expected)
 	}
-	if enableJIT {
+	if warmup {
 		for i := 0; i < 6; i++ {
 			if _, err := engine.Run(proto); err != nil {
 				b.Fatal(err)
@@ -78,7 +77,7 @@ func benchmarkCompiledWorkload(b *testing.B, work benchmarks.Workload, enableJIT
 }
 
 func benchmarkCachedSourceWorkload(b *testing.B, work benchmarks.Workload) {
-	engine := NewWithOptions(Options{EnableJIT: true, HotThreshold: 2})
+	engine := New()
 	result, err := engine.DoString(work.Source)
 	if err != nil {
 		b.Fatal(err)
@@ -100,7 +99,7 @@ func benchmarkCachedSourceWorkload(b *testing.B, work benchmarks.Workload) {
 }
 
 func benchmarkHostFunctionCall(b *testing.B) {
-	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 1024})
+	engine := New()
 	if err := engine.RegisterFunc("double", func(v float64) float64 { return v * 2 }); err != nil {
 		b.Fatal(err)
 	}
@@ -135,7 +134,7 @@ return sum
 }
 
 func benchmarkHostObjectMethod(b *testing.B) {
-	engine := NewWithOptions(Options{EnableJIT: false, HotThreshold: 1024})
+	engine := New()
 	if err := engine.RegisterObject("box", &benchBox{Bias: 2.5}); err != nil {
 		b.Fatal(err)
 	}

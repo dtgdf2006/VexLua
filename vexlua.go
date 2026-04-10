@@ -5,7 +5,7 @@ import (
 	"vexlua/internal/chunk51"
 	bccompiler "vexlua/internal/compiler"
 	"vexlua/internal/jit"
-	amd64jit "vexlua/internal/jit/amd64"
+	"vexlua/internal/jit/vexarc"
 	rt "vexlua/internal/runtime"
 	"vexlua/internal/stdlib"
 	"vexlua/internal/vm"
@@ -13,6 +13,11 @@ import (
 
 type Value = rt.Value
 
+// Options controls the experimental compiled-tier scaffolding.
+//
+// Today EnableJIT wires the current vexarc baseline tier. Stable numeric/table
+// hot paths can execute in compiled code, while broader Lua semantics still rely
+// on helper calls and side exits back to the interpreter.
 type Options struct {
 	EnableJIT    bool
 	HotThreshold uint32
@@ -27,30 +32,31 @@ type Engine struct {
 }
 
 type ProgramStats struct {
-	Runs         uint32
-	JITCompiled  bool
-	QuickenedOps int
+	Runs                uint32
+	QuickenedOps        int
+	CompiledEnters      uint32
+	CompiledDirectCalls uint32
+	CompiledHelperCalls uint32
+	CompiledReturns     uint32
+	CompiledFallbacks   uint32
 }
 
 const sourceCacheLimit = 64
 
 func New() *Engine {
-	return NewWithOptions(Options{
-		EnableJIT:    true,
-		HotThreshold: 8,
-	})
+	return NewWithOptions(Options{})
 }
 
 func NewWithOptions(opts Options) *Engine {
 	runtime := rt.NewRuntime()
 	sourceCompiler := bccompiler.New(runtime)
-	var nativeCompiler jit.Compiler
+	var compiledCompiler jit.Compiler
 	if opts.EnableJIT {
-		nativeCompiler = amd64jit.NewCompiler()
+		compiledCompiler = vexarc.NewCompiler()
 	}
 	engine := &Engine{
 		runtime:  runtime,
-		machine:  vm.New(runtime, nativeCompiler, opts.HotThreshold),
+		machine:  vm.New(runtime, compiledCompiler, opts.HotThreshold),
 		compiler: sourceCompiler,
 		sources:  make(map[string]*bytecode.Proto, sourceCacheLimit),
 		order:    make([]string, 0, sourceCacheLimit),
@@ -168,9 +174,13 @@ func (e *Engine) LoadProto(data []byte) (*bytecode.Proto, error) {
 func (e *Engine) Stats(proto *bytecode.Proto) ProgramStats {
 	stats := e.machine.Stats(proto)
 	return ProgramStats{
-		Runs:         stats.Runs,
-		JITCompiled:  stats.JITCompiled,
-		QuickenedOps: stats.QuickenedOps,
+		Runs:                stats.Runs,
+		QuickenedOps:        stats.QuickenedOps,
+		CompiledEnters:      stats.CompiledEnters,
+		CompiledDirectCalls: stats.CompiledDirectCalls,
+		CompiledHelperCalls: stats.CompiledHelperCalls,
+		CompiledReturns:     stats.CompiledReturns,
+		CompiledFallbacks:   stats.CompiledFallbacks,
 	}
 }
 

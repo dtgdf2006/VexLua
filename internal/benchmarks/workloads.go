@@ -27,7 +27,7 @@ return sum
 `,
 		Expected: "200010000",
 		Notes:    "数值 for 循环与算术",
-		Tags:     []string{"core", "numeric"},
+		Tags:     []string{"core", "numeric", "vexarc"},
 	},
 	{
 		Name: "table_array_sum",
@@ -46,7 +46,7 @@ return sum
 `,
 		Expected: "100100000",
 		Notes:    "数组形 table 访问与顺序遍历",
-		Tags:     []string{"core", "numeric", "table"},
+		Tags:     []string{"core", "numeric", "table", "vexarc"},
 	},
 	{
 		Name: "table_field_sum",
@@ -60,7 +60,7 @@ return sum
 `,
 		Expected: "300000",
 		Notes:    "table 字段访问与 inline cache 热点",
-		Tags:     []string{"core", "table"},
+		Tags:     []string{"core", "table", "vexarc"},
 	},
 	{
 		Name: "method_dispatch",
@@ -77,7 +77,7 @@ return sum
 `,
 		Expected: "205000",
 		Notes:    "方法查找、self 注入与调用开销",
-		Tags:     []string{"core", "call", "table"},
+		Tags:     []string{"core", "call", "table", "vexarc"},
 	},
 	{
 		Name: "closure_upvalue",
@@ -99,6 +99,27 @@ return sum
 		Expected: "210000",
 		Notes:    "闭包、upvalue 与函数调用",
 		Tags:     []string{"core", "closure", "call"},
+	},
+	{
+		Name: "closure_upvalue_mutation",
+		Source: `
+local function make()
+	local x = 0
+	return function(v)
+		x = x + v
+		return x
+	end
+end
+local fn = make()
+local sum = 0
+for i = 1, 5000 do
+	sum = sum + fn(1)
+end
+return sum
+`,
+		Expected: "12502500",
+		Notes:    "闭包、upvalue 读写与状态累积",
+		Tags:     []string{"extended", "closure", "call", "vexarc"},
 	},
 	{
 		Name: "generic_for_pairs",
@@ -197,7 +218,7 @@ return sum
 `,
 		Expected: "12567500",
 		Notes:    "__index/__newindex/__add 元方法分发",
-		Tags:     []string{"extended", "metatable", "table", "call"},
+		Tags:     []string{"extended", "metatable", "table", "call", "vexarc"},
 	},
 	{
 		Name: "string_find_match",
@@ -213,7 +234,7 @@ return sum
 `,
 		Expected: "835000",
 		Notes:    "string.find/string.match 捕获与返回值",
-		Tags:     []string{"extended", "string", "stdlib"},
+		Tags:     []string{"extended", "string", "stdlib", "vexarc"},
 	},
 	{
 		Name: "string_gsub",
@@ -228,7 +249,7 @@ return total
 `,
 		Expected: "155000",
 		Notes:    "string.gsub 模式匹配与替换",
-		Tags:     []string{"extended", "string", "stdlib"},
+		Tags:     []string{"extended", "string", "stdlib", "vexarc"},
 	},
 	{
 		Name: "coroutine_resume",
@@ -258,7 +279,7 @@ return sum
 `,
 		Expected: "15000",
 		Notes:    "coroutine.create/resume/yield 切换开销",
-		Tags:     []string{"extended", "coroutine", "iterator", "stdlib"},
+		Tags:     []string{"extended", "coroutine", "iterator", "stdlib", "vexarc"},
 	},
 	{
 		Name: "coroutine_steady_state",
@@ -283,7 +304,7 @@ return sum
 `,
 		Expected: "12502500",
 		Notes:    "steady-state resume/yield 热路径",
-		Tags:     []string{"extended", "coroutine", "call"},
+		Tags:     []string{"extended", "coroutine", "call", "vexarc"},
 	},
 	{
 		Name: "table_sort",
@@ -298,7 +319,7 @@ return sum
 `,
 		Expected: "38000",
 		Notes:    "table.sort 与短数组排序热点",
-		Tags:     []string{"extended", "table", "stdlib"},
+		Tags:     []string{"extended", "table", "stdlib", "vexarc"},
 	},
 }
 

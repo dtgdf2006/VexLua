@@ -148,13 +148,13 @@ return out .. (9 % 4) .. (2 ^ 3)
 	}
 	duration := time.Since(start)
 	stats := engine.Stats(loopDemo)
-	fmt.Printf("sum loop => %s, runs=%d, quickened=%d, jit=%v, elapsed=%s\n", sum, stats.Runs, stats.QuickenedOps, stats.JITCompiled, duration)
+	fmt.Printf("sum loop => %s, runs=%d, quickened=%d, elapsed=%s\n", sum, stats.Runs, stats.QuickenedOps, duration)
 }
 
 func printResult(label string, engine *vexlua.Engine, proto *bytecode.Proto) {
 	result := mustValue(engine.Run(proto))
 	stats := engine.Stats(proto)
-	fmt.Printf("%s => %s, runs=%d, quickened=%d, jit=%v\n", label, engine.FormatValue(result), stats.Runs, stats.QuickenedOps, stats.JITCompiled)
+	fmt.Printf("%s => %s, runs=%d, quickened=%d\n", label, engine.FormatValue(result), stats.Runs, stats.QuickenedOps)
 }
 
 func printSourceResult(label string, engine *vexlua.Engine, source string) {

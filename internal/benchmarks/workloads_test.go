@@ -18,7 +18,7 @@ func TestSelectWorkloadsTags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := joinWorkloadNames(selected), "vararg_multret_chain,tailcall_chain,metatable_dispatch,string_find_match,string_gsub,coroutine_resume,coroutine_steady_state,table_sort"; got != want {
+	if got, want := joinWorkloadNames(selected), "closure_upvalue_mutation,vararg_multret_chain,tailcall_chain,metatable_dispatch,string_find_match,string_gsub,coroutine_resume,coroutine_steady_state,table_sort"; got != want {
 		t.Fatalf("extended workloads = %q, want %q", got, want)
 	}
 }
@@ -40,6 +40,16 @@ func TestSelectWorkloadsNewSemanticTags(t *testing.T) {
 	}
 	if got, want := joinWorkloadNames(selected), "vararg_multret_chain,tailcall_chain,metatable_dispatch"; got != want {
 		t.Fatalf("semantic workloads = %q, want %q", got, want)
+	}
+}
+
+func TestSelectWorkloadsVexarcTag(t *testing.T) {
+	selected, err := SelectWorkloads("vexarc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := joinWorkloadNames(selected), "numeric_for_sum,table_array_sum,table_field_sum,method_dispatch,closure_upvalue_mutation,metatable_dispatch,string_find_match,string_gsub,coroutine_resume,coroutine_steady_state,table_sort"; got != want {
+		t.Fatalf("vexarc workloads = %q, want %q", got, want)
 	}
 }
 

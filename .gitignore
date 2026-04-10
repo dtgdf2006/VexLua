@@ -5,8 +5,11 @@
 reference
 
 *.log
+*.md
 
 *.pprof
+*.cpu
+*.mem
 
 *.exe
 

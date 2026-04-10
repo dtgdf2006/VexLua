@@ -9,23 +9,37 @@ import (
 )
 
 type Stats struct {
-	Runs         uint32
-	JITCompiled  bool
-	QuickenedOps int
+	Runs                uint32
+	QuickenedOps        int
+	CompiledEnters      uint32
+	CompiledDirectCalls uint32
+	CompiledHelperCalls uint32
+	CompiledReturns     uint32
+	CompiledFallbacks   uint32
 }
 
 type protoState struct {
-	runs         uint32
-	quickenedOps int
-	fieldCaches  []rt.FieldCache
-	compiled     jit.Program
-	jitFailed    bool
-	activeLines  []int
-	liveRegs     [][]uint64
-	regs         []rt.Value
-	rootClosure  rt.Value
-	framePool    []*callFrame
-	singletons   map[*bytecode.Proto]rt.Value
+	runs                uint32
+	quickenedOps        int
+	compiledEnters      uint32
+	compiledDirectCalls uint32
+	compiledHelperCalls uint32
+	compiledReturns     uint32
+	compiledFallbacks   uint32
+	fieldCaches         []rt.FieldCache
+	callCaches          []jit.DirectCallCache
+	directCallUnits     []jit.CompiledUnit
+	compiled            jit.CompiledUnit
+	compiledQuickenedAt int
+	compileFailed       bool
+	nativeThread        jit.NativeThreadState
+	nativeFrame         jit.NativeFrameState
+	activeLines         []int
+	liveRegs            [][]uint64
+	regs                []rt.Value
+	rootClosure         rt.Value
+	framePool           []*callFrame
+	singletons          map[*bytecode.Proto]rt.Value
 }
 
 type VM struct {
@@ -52,9 +66,13 @@ func New(runtime *rt.Runtime, compiler jit.Compiler, hotThreshold uint32) *VM {
 func (m *VM) Stats(proto *bytecode.Proto) Stats {
 	state := m.stateFor(proto)
 	return Stats{
-		Runs:         state.runs,
-		JITCompiled:  state.compiled != nil,
-		QuickenedOps: state.quickenedOps,
+		Runs:                state.runs,
+		QuickenedOps:        state.quickenedOps,
+		CompiledEnters:      state.compiledEnters,
+		CompiledDirectCalls: state.compiledDirectCalls,
+		CompiledHelperCalls: state.compiledHelperCalls,
+		CompiledReturns:     state.compiledReturns,
+		CompiledFallbacks:   state.compiledFallbacks,
 	}
 }
 
@@ -70,33 +88,15 @@ func (m *VM) Run(proto *bytecode.Proto) (rt.Value, error) {
 		clear(state.regs)
 	}
 	regs := state.regs
-	if err := m.maybeCompile(state, proto); err != nil {
-		return rt.NilValue, err
-	}
-	if state.compiled != nil {
-		return state.compiled.Run(regs)
-	}
-	return m.interpret(proto, state, regs)
-}
-
-func (m *VM) maybeCompile(state *protoState, proto *bytecode.Proto) error {
-	if state.compiled != nil || state.jitFailed || m.compiler == nil || state.runs < m.hotThreshold {
-		return nil
-	}
-	compiled, err := m.compiler.Compile(proto)
-	if err == nil {
-		state.compiled = compiled
-		return nil
-	}
-	if err == jit.ErrUnsupported {
-		state.jitFailed = true
-		return nil
-	}
-	return err
+	return m.runCompiledOrInterpret(proto, state, regs)
 }
 
 func (m *VM) interpret(proto *bytecode.Proto, state *protoState, regs []rt.Value) (rt.Value, error) {
-	for pc := 0; pc < len(proto.Code); pc++ {
+	return m.interpretFromPC(proto, state, regs, 0)
+}
+
+func (m *VM) interpretFromPC(proto *bytecode.Proto, state *protoState, regs []rt.Value, startPC int) (rt.Value, error) {
+	for pc := startPC; pc < len(proto.Code); pc++ {
 		instr := &proto.Code[pc]
 		switch instr.Op {
 		case bytecode.OpNoop:

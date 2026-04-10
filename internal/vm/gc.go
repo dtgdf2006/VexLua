@@ -99,9 +99,9 @@ func (m *VM) appendFrameRoots(dst []rt.Value, frame *callFrame, overwriteReg int
 	if frameDead {
 		return dst
 	}
-	dst = append(dst, frame.varargs...)
+	dst = frame.appendVarargs(dst)
 	if !overwritePending {
-		dst = append(dst, frame.pendingResults...)
+		dst = frame.appendPendingResults(dst)
 	}
 	live := m.frameLiveRegs(frame)
 	if len(live) == 0 {

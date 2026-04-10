@@ -1,6 +1,9 @@
 package runtime
 
-import "fmt"
+import (
+	"fmt"
+	"unsafe"
+)
 
 type ObjectKind uint8
 
@@ -97,6 +100,17 @@ func (h *Heap) NewTable(capacity int) Handle {
 
 func (h *Heap) Table(handle Handle) *Table {
 	return h.tables[handle.Index()]
+}
+
+func (h *Heap) TablesBase() uintptr {
+	if len(h.tables) == 0 {
+		return 0
+	}
+	return uintptr(unsafe.Pointer(&h.tables[0]))
+}
+
+func (h *Heap) TablesLen() int {
+	return len(h.tables)
 }
 
 func (h *Heap) NewHostFunction(fn HostFunction) Handle {
