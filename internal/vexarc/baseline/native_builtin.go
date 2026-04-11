@@ -7,6 +7,7 @@ import (
 	rthost "vexlua/internal/runtime/host"
 	rtproto "vexlua/internal/runtime/proto"
 	rtstate "vexlua/internal/runtime/state"
+	rtstring "vexlua/internal/runtime/string"
 	rttable "vexlua/internal/runtime/table"
 	rtupvalue "vexlua/internal/runtime/upvalue"
 	"vexlua/internal/runtime/value"
@@ -16,6 +17,8 @@ import (
 
 const builtinBodyCallBlockBaseOffset = 0x10
 
+const builtinTerminalExitStackAdjust = abi.StubCallBlockSize + 16
+
 const (
 	builtinScratchTableRefOffset = rtstate.StubCallBlockFrameOffset
 	builtinScratchPayload0Offset = rtstate.StubCallBlockArg0Offset
@@ -24,72 +27,11 @@ const (
 	builtinScratchPayload3Offset = rtstate.StubCallBlockArg3Offset
 )
 
-func buildBuiltinReturnBody(result abi.BuiltinResult, aux uint32) []byte {
+func buildBuiltinEntryVeneer(body uintptr) []byte {
 	assembler := amd64.NewAssembler(16)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(result))
-	if aux == 0 {
-		assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	} else {
-		assembler.MoveRegImm32(amd64.RegRDX, aux)
-	}
-	assembler.Ret()
-	return assembler.Buffer().Bytes()
-}
-
-func buildBuiltinEntryThunk(body uintptr, dispatchAux uint32) []byte {
-	assembler := amd64.NewAssembler(128)
-	continuePath := assembler.NewLabel()
-	dispatchPath := assembler.NewLabel()
-	deoptPath := assembler.NewLabel()
-	returnPath := assembler.NewLabel()
-	errorPath := assembler.NewLabel()
-
 	assembler.MoveRegImm64(amd64.RegR10, uint64(body))
 	assembler.CallReg(amd64.RegR10)
-	assembler.CmpRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultContinue))
-	assembler.Jcc(amd64.CondEqual, continuePath)
-	assembler.CmpRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultDispatchToRuntime))
-	assembler.Jcc(amd64.CondEqual, dispatchPath)
-	assembler.CmpRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultDeopt))
-	assembler.Jcc(amd64.CondEqual, deoptPath)
-	assembler.CmpRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultReturn))
-	assembler.Jcc(amd64.CondEqual, returnPath)
-	assembler.CmpRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultError))
-	assembler.Jcc(amd64.CondEqual, errorPath)
-
-	_ = assembler.Bind(errorPath)
-	assembler.MoveRegImm32(amd64.RegRAX, compiledStatusError)
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	assembler.AddRegImm32(amd64.RegRSP, int32(abi.StubCallBlockSize+8))
 	assembler.Ret()
-
-	_ = assembler.Bind(continuePath)
-	assembler.MoveRegMem64(amd64.RegR10, amd64.RegRSP, 0)
-	assembler.AddRegImm32(amd64.RegRSP, int32(abi.StubCallBlockSize+8))
-	assembler.JmpReg(amd64.RegR10)
-
-	_ = assembler.Bind(dispatchPath)
-	if dispatchAux == 0 {
-		assembler.MoveRegImm32(amd64.RegRAX, compiledStatusError)
-		assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	} else {
-		assembler.MoveRegImm32(amd64.RegRAX, compiledStatusStub)
-		assembler.MoveRegImm32(amd64.RegRDX, dispatchAux)
-	}
-	assembler.AddRegImm32(amd64.RegRSP, int32(abi.StubCallBlockSize+8))
-	assembler.Ret()
-
-	_ = assembler.Bind(deoptPath)
-	assembler.MoveRegImm32(amd64.RegRAX, compiledStatusDeopt)
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	assembler.AddRegImm32(amd64.RegRSP, int32(abi.StubCallBlockSize+8))
-	assembler.Ret()
-
-	_ = assembler.Bind(returnPath)
-	assembler.MoveRegImm32(amd64.RegRAX, compiledStatusOK)
-	assembler.AddRegImm32(amd64.RegRSP, int32(abi.StubCallBlockSize+8))
-	assembler.Ret()
-
 	return assembler.Buffer().Bytes()
 }
 
@@ -100,6 +42,8 @@ func buildGetUpvalueBuiltinBody() []byte {
 	errorPath := assembler.NewLabel()
 	storeResult := assembler.NewLabel()
 
+	emitLoadBuiltinCallArg64(assembler, amd64.RegR8, rtstate.StubCallBlockArg2Offset)
+	emitStoreBuiltinScratch64(assembler, builtinScratchPayload3Offset, amd64.RegR8)
 	emitLoadClosureObjectFromFrame(assembler, amd64.RegRAX)
 	assembler.MoveRegMem64(amd64.RegR9, amd64.RegRAX, rtclosure.UpvaluesDataOffset)
 	assembler.CmpRegImm32(amd64.RegR9, 0)
@@ -109,6 +53,7 @@ func buildGetUpvalueBuiltinBody() []byte {
 	assembler.ShiftLeftRegImm8(amd64.RegR8, 3)
 	assembler.AddRegReg(amd64.RegR9, amd64.RegR8)
 	assembler.MoveRegMem64(amd64.RegR10, amd64.RegR9, 0)
+	assembler.MoveRegReg(amd64.RegRBX, amd64.RegR10)
 	emitDecodeHeapRefFromRaw(assembler, amd64.RegR10)
 	assembler.MoveRegMem32(amd64.RegRCX, amd64.RegR10, rtupvalue.StateOffset)
 	assembler.CmpRegImm32(amd64.RegRCX, uint32(rtupvalue.StateClosed))
@@ -122,10 +67,16 @@ func buildGetUpvalueBuiltinBody() []byte {
 	assembler.CmpRegImm32(amd64.RegRDX, 0)
 	assembler.Jcc(amd64.CondEqual, errorPath)
 	assembler.MoveRegMem64(amd64.RegRAX, amd64.RegRDX, 0)
+	assembler.MoveRegReg(amd64.RegRDX, amd64.RegRAX)
+	emitUpdateUpvalueFeedbackEligible(assembler, feedback.SlotGetUpvalue, feedback.AccessUpvalueOpen, amd64.RegRBX, amd64.RegRDX)
+	assembler.MoveRegReg(amd64.RegRAX, amd64.RegRDX)
 	assembler.Jmp(storeResult)
 
 	_ = assembler.Bind(loadClosed)
 	assembler.MoveRegMem64(amd64.RegRAX, amd64.RegR10, rtupvalue.ClosedValueOffset)
+	assembler.MoveRegReg(amd64.RegRDX, amd64.RegRAX)
+	emitUpdateUpvalueFeedbackEligible(assembler, feedback.SlotGetUpvalue, feedback.AccessUpvalueClosed, amd64.RegRBX, amd64.RegRDX)
+	assembler.MoveRegReg(amd64.RegRAX, amd64.RegRDX)
 
 	_ = assembler.Bind(storeResult)
 	emitLoadBuiltinCallArg64(assembler, amd64.RegR8, rtstate.StubCallBlockArg0Offset)
@@ -133,15 +84,11 @@ func buildGetUpvalueBuiltinBody() []byte {
 	assembler.MoveRegReg(amd64.RegR9, amd64.RegsBaseRegister)
 	assembler.AddRegReg(amd64.RegR9, amd64.RegR8)
 	assembler.MoveMemReg64(amd64.RegR9, 0, amd64.RegRAX)
-	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, 0)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultContinue))
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	assembler.Ret()
+	emitReturnBuiltinContinuation(assembler, true)
 
 	_ = assembler.Bind(errorPath)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultError))
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	assembler.Ret()
+	emitUpdateUpvalueFeedbackIneligible(assembler, feedback.SlotGetUpvalue)
+	emitExitBuiltinStatus(assembler, compiledStatusError, true)
 	return assembler.Buffer().Bytes()
 }
 
@@ -152,6 +99,8 @@ func buildSetUpvalueBuiltinBody() []byte {
 	errorPath := assembler.NewLabel()
 	done := assembler.NewLabel()
 
+	emitLoadBuiltinCallArg64(assembler, amd64.RegR8, rtstate.StubCallBlockArg2Offset)
+	emitStoreBuiltinScratch64(assembler, builtinScratchPayload3Offset, amd64.RegR8)
 	emitLoadBuiltinCallArg64(assembler, amd64.RegR8, rtstate.StubCallBlockArg0Offset)
 	assembler.ShiftLeftRegImm8(amd64.RegR8, 3)
 	assembler.MoveRegReg(amd64.RegR9, amd64.RegsBaseRegister)
@@ -167,6 +116,7 @@ func buildSetUpvalueBuiltinBody() []byte {
 	assembler.ShiftLeftRegImm8(amd64.RegR8, 3)
 	assembler.AddRegReg(amd64.RegR10, amd64.RegR8)
 	assembler.MoveRegMem64(amd64.RegR10, amd64.RegR10, 0)
+	assembler.MoveRegReg(amd64.RegRBX, amd64.RegR10)
 	emitDecodeHeapRefFromRaw(assembler, amd64.RegR10)
 	assembler.MoveRegMem32(amd64.RegRCX, amd64.RegR10, rtupvalue.StateOffset)
 	assembler.CmpRegImm32(amd64.RegRCX, uint32(rtupvalue.StateClosed))
@@ -180,21 +130,19 @@ func buildSetUpvalueBuiltinBody() []byte {
 	assembler.CmpRegImm32(amd64.RegRDX, 0)
 	assembler.Jcc(amd64.CondEqual, errorPath)
 	assembler.MoveMemReg64(amd64.RegRDX, 0, amd64.RegRAX)
+	emitUpdateUpvalueFeedbackEligible(assembler, feedback.SlotSetUpvalue, feedback.AccessUpvalueOpen, amd64.RegRBX, amd64.RegRAX)
 	assembler.Jmp(done)
 
 	_ = assembler.Bind(storeClosed)
 	assembler.MoveMemReg64(amd64.RegR10, rtupvalue.ClosedValueOffset, amd64.RegRAX)
+	emitUpdateUpvalueFeedbackEligible(assembler, feedback.SlotSetUpvalue, feedback.AccessUpvalueClosed, amd64.RegRBX, amd64.RegRAX)
 
 	_ = assembler.Bind(done)
-	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, 0)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultContinue))
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	assembler.Ret()
+	emitReturnBuiltinContinuation(assembler, true)
 
 	_ = assembler.Bind(errorPath)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultError))
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	assembler.Ret()
+	emitUpdateUpvalueFeedbackIneligible(assembler, feedback.SlotSetUpvalue)
+	emitExitBuiltinStatus(assembler, compiledStatusError, true)
 	return assembler.Buffer().Bytes()
 }
 
@@ -209,15 +157,10 @@ func buildForPrepBuiltinBody() []byte {
 	emitLoadNumberFromSlotAddress(assembler, amd64.RegR10, amd64.RegRAX, amd64.RegRCX, amd64.XMM2, errorPath)
 	assembler.SubsdXmmXmm(amd64.XMM0, amd64.XMM2)
 	assembler.MoveMemXmm64(amd64.RegR9, 0, amd64.XMM0)
-	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, 0)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultContinue))
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	assembler.Ret()
+	emitReturnBuiltinContinuation(assembler, true)
 
 	_ = assembler.Bind(errorPath)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultError))
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	assembler.Ret()
+	emitExitBuiltinStatus(assembler, compiledStatusError, true)
 	return assembler.Buffer().Bytes()
 }
 
@@ -258,20 +201,199 @@ func buildForLoopBuiltinBody() []byte {
 	assembler.AddRegImm32(amd64.RegR10, int32(value.TValueSize*3))
 	assembler.MoveMemXmm64(amd64.RegR10, 0, amd64.XMM0)
 	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, execCtxFlagAlternateResume)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultContinue))
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	assembler.Ret()
+	emitReturnBuiltinContinuation(assembler, false)
 
 	_ = assembler.Bind(exitLoop)
 	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, 0)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultContinue))
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	assembler.Ret()
+	emitReturnBuiltinContinuation(assembler, false)
 
 	_ = assembler.Bind(errorPath)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultError))
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	assembler.Ret()
+	emitExitBuiltinStatus(assembler, compiledStatusError, true)
+	return assembler.Buffer().Bytes()
+}
+
+func buildNewTableBuiltinBody() []byte {
+	assembler := amd64.NewAssembler(32)
+	emitExitCurrentBuiltinToRuntime(assembler, true)
+	return assembler.Buffer().Bytes()
+}
+
+func buildSelfBuiltinBody() []byte {
+	assembler := amd64.NewAssembler(1792)
+	tablePath := assembler.NewLabel()
+	lookupLoop := assembler.NewLabel()
+	nextEntry := assembler.NewLabel()
+	foundEntry := assembler.NewLabel()
+	notFound := assembler.NewLabel()
+	storeResult := assembler.NewLabel()
+	keyDeopt := assembler.NewLabel()
+	blockedMissDeopt := assembler.NewLabel()
+	deoptPath := assembler.NewLabel()
+
+	emitLoadBuiltinCallArg64(assembler, amd64.RegR8, rtstate.StubCallBlockArg1Offset)
+	emitLoadRegisterValueFromIndexReg(assembler, amd64.RegR8, amd64.RegRDX, amd64.RegR10)
+	emitLoadBuiltinCallArg64(assembler, amd64.RegR9, rtstate.StubCallBlockArg0Offset)
+	assembler.AddRegImm32(amd64.RegR9, 1)
+	assembler.ShiftLeftRegImm8(amd64.RegR9, 3)
+	assembler.MoveRegReg(amd64.RegR10, amd64.RegsBaseRegister)
+	assembler.AddRegReg(amd64.RegR10, amd64.RegR9)
+	assembler.MoveMemReg64(amd64.RegR10, 0, amd64.RegRDX)
+
+	emitLoadBuiltinCallArg64(assembler, amd64.RegR9, rtstate.StubCallBlockArg2Offset)
+	emitLoadRKValueFromOperandReg(assembler, amd64.RegR9, amd64.RegRCX, amd64.RegRAX, amd64.RegR10)
+
+	assembler.MoveRegReg(amd64.RegRAX, amd64.RegRDX)
+	assembler.ShiftRightRegImm8(amd64.RegRAX, value.TagShift)
+	assembler.CmpRegImm32(amd64.RegRAX, shiftedBoxedTag(value.TagTableRef))
+	assembler.Jcc(amd64.CondEqual, tablePath)
+	assembler.Jmp(deoptPath)
+
+	_ = assembler.Bind(tablePath)
+	assembler.MoveRegReg(amd64.RegRAX, amd64.RegRCX)
+	assembler.ShiftRightRegImm8(amd64.RegRAX, value.TagShift)
+	assembler.CmpRegImm32(amd64.RegRAX, shiftedBoxedTag(value.TagStringRef))
+	assembler.Jcc(amd64.CondNotEqual, keyDeopt)
+	assembler.MoveRegReg(amd64.RegRAX, amd64.RegRDX)
+	emitExtractHeapRefPayloadFromTValue(assembler, amd64.RegRAX, amd64.RegRAX)
+	emitDecodeHeapRefFromRaw(assembler, amd64.RegRAX)
+	assembler.MoveRegReg(amd64.RegRBX, amd64.RegRAX)
+	assembler.MoveRegImm64(amd64.RegRDX, uint64(value.NilValue().Bits()))
+	assembler.MoveRegMem64(amd64.RegR9, amd64.RegRAX, rttable.EntriesDataOffset)
+	assembler.CmpRegImm32(amd64.RegR9, 0)
+	assembler.Jcc(amd64.CondEqual, notFound)
+	assembler.AddRegReg(amd64.RegR9, amd64.HeapBaseRegister)
+	assembler.MoveRegMem32(amd64.RegR10, amd64.RegRAX, rttable.HashCapacityOffset)
+	emitStoreBuiltinScratch32(assembler, builtinScratchPayload1Offset, amd64.RegR10)
+	assembler.XorRegReg(amd64.RegR8, amd64.RegR8)
+
+	_ = assembler.Bind(lookupLoop)
+	emitLoadBuiltinScratch32(assembler, amd64.RegR10, builtinScratchPayload1Offset)
+	assembler.CmpRegReg(amd64.RegR8, amd64.RegR10)
+	assembler.Jcc(amd64.CondAboveEqual, notFound)
+	assembler.MoveRegMem64(amd64.RegR10, amd64.RegR9, rttable.EntryKeyOffset)
+	assembler.CmpRegReg(amd64.RegR10, amd64.RegRCX)
+	assembler.Jcc(amd64.CondNotEqual, nextEntry)
+	assembler.MoveRegMem64(amd64.RegR10, amd64.RegR9, rttable.EntryValueOffset)
+	assembler.CmpRegReg(amd64.RegR10, amd64.RegRDX)
+	assembler.Jcc(amd64.CondEqual, nextEntry)
+	assembler.MoveRegReg(amd64.RegRDX, amd64.RegR10)
+	assembler.MoveRegImm32(amd64.RegRAX, 1)
+	assembler.Jmp(foundEntry)
+
+	_ = assembler.Bind(nextEntry)
+	assembler.AddRegImm32(amd64.RegR9, rttable.EntrySize)
+	assembler.AddRegImm32(amd64.RegR8, 1)
+	assembler.Jmp(lookupLoop)
+
+	_ = assembler.Bind(notFound)
+	assembler.XorRegReg(amd64.RegRAX, amd64.RegRAX)
+	assembler.XorRegReg(amd64.RegR8, amd64.RegR8)
+
+	_ = assembler.Bind(foundEntry)
+	assembler.MoveRegMem32(amd64.RegR10, amd64.RegRBX, rttable.FlagsOffset)
+	assembler.AndRegImm32(amd64.RegR10, uint32(rttable.FlagIndexFastPathBlocked|rttable.FlagWeakKeys|rttable.FlagWeakValues|rttable.FlagRehashing))
+	assembler.CmpRegImm32(amd64.RegRAX, 0)
+	assembler.Jcc(amd64.CondNotEqual, storeResult)
+	assembler.CmpRegImm32(amd64.RegR10, 0)
+	assembler.Jcc(amd64.CondNotEqual, blockedMissDeopt)
+	assembler.Jmp(storeResult)
+
+	_ = assembler.Bind(storeResult)
+	emitStoreResultRegisterFromCallArgReg(assembler, rtstate.StubCallBlockArg0Offset, amd64.RegRDX, amd64.RegR9, amd64.RegR10)
+	emitReturnBuiltinContinuation(assembler, true)
+
+	_ = assembler.Bind(keyDeopt)
+	assembler.Jmp(deoptPath)
+
+	_ = assembler.Bind(blockedMissDeopt)
+	assembler.Jmp(deoptPath)
+
+	_ = assembler.Bind(deoptPath)
+	emitExitBuiltinStatus(assembler, compiledStatusDeopt, true)
+	return assembler.Buffer().Bytes()
+}
+
+func buildLenBuiltinBody() []byte {
+	assembler := amd64.NewAssembler(256)
+	stringPath := assembler.NewLabel()
+	tablePath := assembler.NewLabel()
+	deoptPath := assembler.NewLabel()
+
+	emitLoadBuiltinCallArg64(assembler, amd64.RegR8, rtstate.StubCallBlockArg1Offset)
+	emitLoadRegisterValueFromIndexReg(assembler, amd64.RegR8, amd64.RegRAX, amd64.RegR9)
+	assembler.MoveRegReg(amd64.RegR10, amd64.RegRAX)
+	assembler.ShiftRightRegImm8(amd64.RegR10, value.TagShift)
+	assembler.CmpRegImm32(amd64.RegR10, shiftedBoxedTag(value.TagStringRef))
+	assembler.Jcc(amd64.CondEqual, stringPath)
+	assembler.CmpRegImm32(amd64.RegR10, shiftedBoxedTag(value.TagTableRef))
+	assembler.Jcc(amd64.CondEqual, tablePath)
+	assembler.Jmp(deoptPath)
+
+	_ = assembler.Bind(stringPath)
+	emitExtractHeapRefPayloadFromTValue(assembler, amd64.RegRDX, amd64.RegRAX)
+	emitDecodeHeapRefFromRaw(assembler, amd64.RegRDX)
+	assembler.MoveRegMem32(amd64.RegRCX, amd64.RegRDX, rtstring.LengthOffset)
+	assembler.Cvtsi2sdXmmReg64(amd64.XMM0, amd64.RegRCX)
+	emitStoreResultRegisterFromCallArgXmm(assembler, rtstate.StubCallBlockArg0Offset, amd64.XMM0, amd64.RegR8, amd64.RegR9)
+	emitReturnBuiltinContinuation(assembler, true)
+
+	_ = assembler.Bind(tablePath)
+	emitExtractHeapRefPayloadFromTValue(assembler, amd64.RegRDX, amd64.RegRAX)
+	emitDecodeHeapRefFromRaw(assembler, amd64.RegRDX)
+	assembler.MoveRegMem32(amd64.RegRCX, amd64.RegRDX, rttable.FlagsOffset)
+	assembler.AndRegImm32(amd64.RegRCX, uint32(rttable.FlagHasMetatable))
+	assembler.CmpRegImm32(amd64.RegRCX, 0)
+	assembler.Jcc(amd64.CondNotEqual, deoptPath)
+	assembler.MoveRegMem32(amd64.RegRCX, amd64.RegRDX, rttable.ArrayLenHintOffset)
+	assembler.Cvtsi2sdXmmReg64(amd64.XMM0, amd64.RegRCX)
+	emitStoreResultRegisterFromCallArgXmm(assembler, rtstate.StubCallBlockArg0Offset, amd64.XMM0, amd64.RegR8, amd64.RegR9)
+	emitReturnBuiltinContinuation(assembler, true)
+
+	_ = assembler.Bind(deoptPath)
+	emitExitBuiltinStatus(assembler, compiledStatusDeopt, true)
+	return assembler.Buffer().Bytes()
+}
+
+func buildConcatBuiltinBody() []byte {
+	assembler := amd64.NewAssembler(320)
+	loop := assembler.NewLabel()
+	checkBoxed := assembler.NewLabel()
+	boundaryPath := assembler.NewLabel()
+	deoptPath := assembler.NewLabel()
+
+	emitLoadBuiltinCallArg64(assembler, amd64.RegR8, rtstate.StubCallBlockArg1Offset)
+	emitLoadBuiltinCallArg64(assembler, amd64.RegR9, rtstate.StubCallBlockArg2Offset)
+	assembler.CmpRegReg(amd64.RegR8, amd64.RegR9)
+	assembler.Jcc(amd64.CondAbove, deoptPath)
+	emitStoreBuiltinScratch64(assembler, builtinScratchPayload1Offset, amd64.RegR9)
+
+	_ = assembler.Bind(loop)
+	emitLoadRegisterValueFromIndexReg(assembler, amd64.RegR8, amd64.RegRAX, amd64.RegRBX)
+	assembler.MoveRegReg(amd64.RegR10, amd64.RegRAX)
+	assembler.ShiftRightRegImm8(amd64.RegR10, 48)
+	assembler.CmpRegImm32(amd64.RegR10, 0xFFFF)
+	assembler.Jcc(amd64.CondEqual, checkBoxed)
+	assembler.AddRegImm32(amd64.RegR8, 1)
+	emitLoadBuiltinScratch64(assembler, amd64.RegR9, builtinScratchPayload1Offset)
+	assembler.CmpRegReg(amd64.RegR8, amd64.RegR9)
+	assembler.Jcc(amd64.CondBelowEqual, loop)
+	assembler.Jmp(boundaryPath)
+
+	_ = assembler.Bind(checkBoxed)
+	assembler.MoveRegReg(amd64.RegR10, amd64.RegRAX)
+	assembler.ShiftRightRegImm8(amd64.RegR10, value.TagShift)
+	assembler.CmpRegImm32(amd64.RegR10, shiftedBoxedTag(value.TagStringRef))
+	assembler.Jcc(amd64.CondNotEqual, deoptPath)
+	assembler.AddRegImm32(amd64.RegR8, 1)
+	emitLoadBuiltinScratch64(assembler, amd64.RegR9, builtinScratchPayload1Offset)
+	assembler.CmpRegReg(amd64.RegR8, amd64.RegR9)
+	assembler.Jcc(amd64.CondBelowEqual, loop)
+
+	_ = assembler.Bind(boundaryPath)
+	emitExitCurrentBuiltinToRuntime(assembler, true)
+
+	_ = assembler.Bind(deoptPath)
+	emitExitBuiltinStatus(assembler, compiledStatusDeopt, true)
 	return assembler.Buffer().Bytes()
 }
 
@@ -293,7 +415,6 @@ func buildLuaCallBuiltinBody() []byte {
 	emitStoreBuiltinScratch64(assembler, builtinScratchTableRefOffset, amd64.RegRAX)
 	emitLoadBuiltinCallArg64(assembler, amd64.RegR8, rtstate.StubCallBlockArg0Offset)
 	emitStoreBuiltinScratch64(assembler, builtinScratchPayload0Offset, amd64.RegR8)
-	emitStoreBuiltinScratch64(assembler, builtinScratchPayload3Offset, amd64.RegR13)
 	emitLoadBuiltinCallArg64(assembler, amd64.RegR9, rtstate.StubCallBlockArg1Offset)
 	assembler.CmpRegImm32(amd64.RegR9, 0)
 	assembler.Jcc(amd64.CondEqual, runtimeDispatch)
@@ -310,9 +431,12 @@ func buildLuaCallBuiltinBody() []byte {
 	assembler.Jcc(amd64.CondEqual, luaClosure)
 	assembler.CmpRegImm32(amd64.RegRAX, shiftedBoxedTag(value.TagHostFunctionRef))
 	assembler.Jcc(amd64.CondEqual, hostDispatch)
+	emitUpdateCallFeedbackIneligible(assembler, feedback.SlotCall)
 	assembler.Jmp(runtimeDispatch)
 
 	_ = assembler.Bind(hostDispatch)
+	emitExtractHeapRefPayloadFromTValue(assembler, amd64.RegRCX, amd64.RegRDX)
+	emitUpdateCallFeedbackEligible(assembler, feedback.SlotCall, feedback.AccessCallHostFunction, amd64.RegRDX, amd64.RegRCX)
 	emitRefreshHostObjectWrapper(assembler, amd64.RegRDX, amd64.RegRAX, amd64.RegR8, amd64.RegR10)
 	assembler.MoveRegMem32(amd64.RegRCX, amd64.RegRAX, rthost.WrapperFlagsOffset)
 	assembler.AndRegImm32(amd64.RegRCX, uint32(rthost.WrapperFlagCallable))
@@ -337,6 +461,8 @@ func buildLuaCallBuiltinBody() []byte {
 	assembler.Jmp(runtimeDispatch)
 
 	_ = assembler.Bind(luaClosure)
+	emitExtractHeapRefPayloadFromTValue(assembler, amd64.RegRCX, amd64.RegRDX)
+	emitUpdateCallFeedbackEligible(assembler, feedback.SlotCall, feedback.AccessCallLuaClosure, amd64.RegRDX, amd64.RegRCX)
 	emitExtractHeapRefPayloadFromTValue(assembler, amd64.RegRAX, amd64.RegRDX)
 	emitDecodeHeapRefFromRaw(assembler, amd64.RegRAX)
 	assembler.MoveRegMem64(amd64.RegRBX, amd64.RegRAX, rtclosure.ProtoOffset)
@@ -447,6 +573,7 @@ func buildLuaCallBuiltinBody() []byte {
 	assembler.MoveMemReg64(amd64.RegRCX, rtstate.CallFrameResultBaseOffset, amd64.RegRDX)
 	emitLoadThreadStateHeader(assembler, amd64.RegRAX)
 	emitStoreThreadCurrentFrame(assembler, amd64.RegRAX, amd64.RegRCX)
+	emitStoreBuiltinScratch64(assembler, builtinScratchPayload3Offset, amd64.RegR13)
 	assembler.MoveRegReg(amd64.RegR13, amd64.RegRCX)
 	assembler.MoveRegReg(amd64.RegR12, amd64.RegR9)
 	assembler.MoveRegMem64(amd64.RegR8, amd64.RegR8, rtproto.CompiledEntryOff)
@@ -474,11 +601,8 @@ func buildLuaCallBuiltinBody() []byte {
 	emitCopyResultsWithNilFill(assembler, amd64.RegR8, amd64.RegR9, amd64.RegRCX, amd64.RegRBX)
 
 	_ = assembler.Bind(noResults)
-	emitLoadBuiltinScratch64(assembler, amd64.RegR13, builtinScratchPayload3Offset)
-	emitLoadBuiltinScratch64(assembler, amd64.RegR12, builtinScratchPayload2Offset)
-	emitLoadThreadStateHeader(assembler, amd64.RegRAX)
-	emitStoreThreadCurrentFrame(assembler, amd64.RegRAX, amd64.RegR13)
-	emitReturnBuiltinStatus(assembler, abi.BuiltinResultContinue)
+	emitRestoreCallerFrameFromScratch(assembler)
+	emitReturnBuiltinContinuation(assembler, true)
 
 	_ = assembler.Bind(callStub)
 	emitReturnNestedCallDispatch(assembler, execCtxFlagNestedCallPending, true, amd64.RegRDX)
@@ -490,7 +614,7 @@ func buildLuaCallBuiltinBody() []byte {
 	emitReturnNestedCallDispatch(assembler, execCtxFlagNestedCallPending|execCtxFlagNestedCallError, false, amd64.RegRDX)
 
 	_ = assembler.Bind(runtimeDispatch)
-	emitReturnBuiltinStatus(assembler, abi.BuiltinResultDispatchToRuntime)
+	emitExitCurrentBuiltinToRuntime(assembler, true)
 	return assembler.Buffer().Bytes()
 }
 
@@ -514,7 +638,6 @@ func buildTailCallBuiltinBody() []byte {
 	emitLoadBuiltinCallArg64(assembler, amd64.RegR8, rtstate.StubCallBlockArg0Offset)
 	emitStoreBuiltinScratch64(assembler, builtinScratchPayload0Offset, amd64.RegR8)
 	emitStoreBuiltinScratch64(assembler, builtinScratchPayload2Offset, amd64.RegR12)
-	emitStoreBuiltinScratch64(assembler, builtinScratchPayload3Offset, amd64.RegR13)
 	emitLoadBuiltinCallArg64(assembler, amd64.RegR9, rtstate.StubCallBlockArg1Offset)
 	assembler.CmpRegImm32(amd64.RegR9, 0)
 	assembler.Jcc(amd64.CondEqual, runtimeDispatch)
@@ -528,13 +651,18 @@ func buildTailCallBuiltinBody() []byte {
 	assembler.Jcc(amd64.CondEqual, luaClosure)
 	assembler.CmpRegImm32(amd64.RegRAX, shiftedBoxedTag(value.TagHostFunctionRef))
 	assembler.Jcc(amd64.CondEqual, hostDispatch)
+	emitUpdateCallFeedbackIneligible(assembler, feedback.SlotTailCall)
 	assembler.Jmp(runtimeDispatch)
 
 	_ = assembler.Bind(hostDispatch)
+	emitExtractHeapRefPayloadFromTValue(assembler, amd64.RegRCX, amd64.RegRDX)
+	emitUpdateCallFeedbackEligible(assembler, feedback.SlotTailCall, feedback.AccessCallHostFunction, amd64.RegRDX, amd64.RegRCX)
 	emitRefreshHostObjectWrapper(assembler, amd64.RegRDX, amd64.RegRAX, amd64.RegR8, amd64.RegR10)
 	assembler.Jmp(runtimeDispatch)
 
 	_ = assembler.Bind(luaClosure)
+	emitExtractHeapRefPayloadFromTValue(assembler, amd64.RegRCX, amd64.RegRDX)
+	emitUpdateCallFeedbackEligible(assembler, feedback.SlotTailCall, feedback.AccessCallLuaClosure, amd64.RegRDX, amd64.RegRCX)
 	emitExtractHeapRefPayloadFromTValue(assembler, amd64.RegRAX, amd64.RegRDX)
 	emitDecodeHeapRefFromRaw(assembler, amd64.RegRAX)
 	assembler.MoveRegMem64(amd64.RegRBX, amd64.RegRAX, rtclosure.ProtoOffset)
@@ -633,6 +761,7 @@ func buildTailCallBuiltinBody() []byte {
 	assembler.MoveMemReg64(amd64.RegRCX, rtstate.CallFrameResultBaseOffset, amd64.RegRDX)
 	emitLoadThreadStateHeader(assembler, amd64.RegRAX)
 	emitStoreThreadCurrentFrame(assembler, amd64.RegRAX, amd64.RegRCX)
+	emitStoreBuiltinScratch64(assembler, builtinScratchPayload3Offset, amd64.RegR13)
 	assembler.MoveRegReg(amd64.RegR13, amd64.RegRCX)
 	assembler.MoveRegReg(amd64.RegR12, amd64.RegR9)
 	assembler.MoveRegMem64(amd64.RegR8, amd64.RegR8, rtproto.CompiledEntryOff)
@@ -652,13 +781,8 @@ func buildTailCallBuiltinBody() []byte {
 	assembler.MoveRegMem64(amd64.RegR9, amd64.RegR13, rtstate.CallFrameResultBaseOffset)
 	assembler.MoveRegReg(amd64.RegRCX, amd64.RegRDX)
 	emitCopySlots(assembler, amd64.RegR8, amd64.RegR9, amd64.RegRCX)
-	emitLoadBuiltinScratch64(assembler, amd64.RegRAX, builtinScratchPayload3Offset)
-	emitLoadBuiltinScratch64(assembler, amd64.RegR12, builtinScratchPayload2Offset)
-	assembler.MoveRegReg(amd64.RegR13, amd64.RegRAX)
-	emitLoadThreadStateHeader(assembler, amd64.RegR10)
-	emitStoreThreadCurrentFrame(assembler, amd64.RegR10, amd64.RegR13)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultReturn))
-	assembler.Ret()
+	emitRestoreCallerFrameFromScratch(assembler)
+	emitExitBuiltinStatusWithRegAux(assembler, compiledStatusOK, amd64.RegRDX, true)
 
 	_ = assembler.Bind(callStub)
 	emitReturnNestedCallDispatch(assembler, execCtxFlagNestedCallPending, true, amd64.RegRDX)
@@ -670,7 +794,7 @@ func buildTailCallBuiltinBody() []byte {
 	emitReturnNestedCallDispatch(assembler, execCtxFlagNestedCallPending|execCtxFlagNestedCallError, false, amd64.RegRDX)
 
 	_ = assembler.Bind(runtimeDispatch)
-	emitReturnBuiltinStatus(assembler, abi.BuiltinResultDispatchToRuntime)
+	emitExitCurrentBuiltinToRuntime(assembler, true)
 	return assembler.Buffer().Bytes()
 }
 
@@ -822,17 +946,17 @@ func emitGenericStringKeyGetFlow(assembler *amd64.Assembler, slotKind feedback.S
 	assembler.Jcc(amd64.CondNotEqual, blockedMissDeopt)
 	emitUpdateTableFeedbackIneligible(assembler, slotKind)
 	emitStoreResultRegisterFromScratchIndex(assembler, amd64.RegRDX)
-	emitReturnBuiltinStatus(assembler, abi.BuiltinResultContinue)
+	emitReturnBuiltinContinuation(assembler, true)
 
 	_ = assembler.Bind(eligibleContinue)
 	emitUpdateTableFeedbackEligibleHash(assembler, slotKind, amd64.RegRCX, amd64.RegR8)
 	emitStoreResultRegisterFromScratchIndex(assembler, amd64.RegRDX)
-	emitReturnBuiltinStatus(assembler, abi.BuiltinResultContinue)
+	emitReturnBuiltinContinuation(assembler, true)
 
 	_ = assembler.Bind(ineligibleContinue)
 	emitUpdateTableFeedbackIneligible(assembler, slotKind)
 	emitStoreResultRegisterFromScratchIndex(assembler, amd64.RegRDX)
-	emitReturnBuiltinStatus(assembler, abi.BuiltinResultContinue)
+	emitReturnBuiltinContinuation(assembler, true)
 
 	_ = assembler.Bind(blockedMissDeopt)
 	emitUpdateTableFeedbackIneligible(assembler, slotKind)
@@ -843,10 +967,10 @@ func emitGenericStringKeyGetFlow(assembler *amd64.Assembler, slotKind feedback.S
 	assembler.Jmp(deoptPath)
 
 	_ = assembler.Bind(dispatchPath)
-	emitReturnBuiltinStatus(assembler, abi.BuiltinResultDispatchToRuntime)
+	emitExitCurrentBuiltinToRuntime(assembler, true)
 
 	_ = assembler.Bind(deoptPath)
-	emitReturnBuiltinStatus(assembler, abi.BuiltinResultDeopt)
+	emitExitBuiltinStatus(assembler, compiledStatusDeopt, true)
 }
 
 func emitGenericStringKeySetFlow(assembler *amd64.Assembler, slotKind feedback.SlotKind) {
@@ -927,21 +1051,21 @@ func emitGenericStringKeySetFlow(assembler *amd64.Assembler, slotKind feedback.S
 
 	_ = assembler.Bind(eligibleContinue)
 	emitUpdateTableFeedbackEligibleHash(assembler, slotKind, amd64.RegRCX, amd64.RegR8)
-	emitReturnBuiltinStatus(assembler, abi.BuiltinResultContinue)
+	emitReturnBuiltinContinuation(assembler, true)
 
 	_ = assembler.Bind(ineligibleContinue)
 	emitUpdateTableFeedbackIneligible(assembler, slotKind)
-	emitReturnBuiltinStatus(assembler, abi.BuiltinResultContinue)
+	emitReturnBuiltinContinuation(assembler, true)
 
 	_ = assembler.Bind(unsupportedDeopt)
 	emitUpdateTableFeedbackIneligible(assembler, slotKind)
 	assembler.Jmp(deoptPath)
 
 	_ = assembler.Bind(dispatchPath)
-	emitReturnBuiltinStatus(assembler, abi.BuiltinResultDispatchToRuntime)
+	emitExitCurrentBuiltinToRuntime(assembler, true)
 
 	_ = assembler.Bind(deoptPath)
-	emitReturnBuiltinStatus(assembler, abi.BuiltinResultDeopt)
+	emitExitBuiltinStatus(assembler, compiledStatusDeopt, true)
 }
 
 func emitUpdateTableFeedbackEligibleHash(assembler *amd64.Assembler, slotKind feedback.SlotKind, keyReg amd64.Register, slotIndexReg amd64.Register) {
@@ -962,24 +1086,24 @@ func emitUpdateTableFeedbackEligibleHash(assembler *amd64.Assembler, slotKind fe
 	assembler.Jmp(writeMegamorphic)
 
 	_ = assembler.Bind(compareMonomorphic)
-	assembler.MoveRegMem64(amd64.RegR10, amd64.RegR9, feedback.CellTableRefOffset)
+	assembler.MoveRegMem64(amd64.RegR10, amd64.RegR9, feedback.CellHeapRefOffset)
 	emitLoadBuiltinScratch64(assembler, amd64.RegRAX, builtinScratchTableRefOffset)
 	assembler.CmpRegReg(amd64.RegR10, amd64.RegRAX)
 	assembler.Jcc(amd64.CondNotEqual, writeMegamorphic)
-	assembler.MoveRegMem64(amd64.RegR10, amd64.RegR9, feedback.CellKeyBitsOffset)
+	assembler.MoveRegMem64(amd64.RegR10, amd64.RegR9, feedback.CellValueBitsOffset)
 	assembler.CmpRegReg(amd64.RegR10, keyReg)
 	assembler.Jcc(amd64.CondNotEqual, writeMegamorphic)
 
 	_ = assembler.Bind(writeCandidate)
 	assembler.MoveMemImm32(amd64.RegR9, feedback.CellStateOffset, feedback.PackCellPrefix(feedback.StateMonomorphic, feedback.AccessHash, slotKind))
 	emitLoadBuiltinScratch64(assembler, amd64.RegR10, builtinScratchTableRefOffset)
-	assembler.MoveMemReg64(amd64.RegR9, feedback.CellTableRefOffset, amd64.RegR10)
+	assembler.MoveMemReg64(amd64.RegR9, feedback.CellHeapRefOffset, amd64.RegR10)
 	emitDecodeHeapRefFromRaw(assembler, amd64.RegR10)
 	assembler.MoveRegMem32(amd64.RegRAX, amd64.RegR10, rttable.TableVersionOffset)
-	assembler.MoveMemReg32(amd64.RegR9, feedback.CellTableVersionOffset, amd64.RegRAX)
-	assembler.MoveMemReg32(amd64.RegR9, feedback.CellCachedIndexOffset, slotIndexReg)
-	assembler.MoveMemImm32(amd64.RegR9, feedback.CellReservedOffset, 0)
-	assembler.MoveMemReg64(amd64.RegR9, feedback.CellKeyBitsOffset, keyReg)
+	assembler.MoveMemReg32(amd64.RegR9, feedback.CellPayload32AOffset, amd64.RegRAX)
+	assembler.MoveMemReg32(amd64.RegR9, feedback.CellPayload32BOffset, slotIndexReg)
+	assembler.MoveMemImm32(amd64.RegR9, feedback.CellPayload32COffset, 0)
+	assembler.MoveMemReg64(amd64.RegR9, feedback.CellValueBitsOffset, keyReg)
 	assembler.Jmp(done)
 
 	_ = assembler.Bind(writeMegamorphic)
@@ -1009,14 +1133,136 @@ func emitUpdateTableFeedbackIneligible(assembler *amd64.Assembler, slotKind feed
 	_ = assembler.Bind(done)
 }
 
+func emitUpdateCallFeedbackEligible(assembler *amd64.Assembler, slotKind feedback.SlotKind, accessKind feedback.AccessKind, targetValueReg amd64.Register, targetRefReg amd64.Register) {
+	noVector := assembler.NewLabel()
+	compareMonomorphic := assembler.NewLabel()
+	writeCandidate := assembler.NewLabel()
+	writeMegamorphic := assembler.NewLabel()
+	done := assembler.NewLabel()
+
+	emitLoadFeedbackCellBaseFromCallArg(assembler, amd64.RegR9, amd64.RegRAX, rtstate.StubCallBlockArg3Offset, noVector)
+	assembler.MoveRegMem32(amd64.RegRAX, amd64.RegR9, feedback.CellStateOffset)
+	assembler.CmpRegImm32(amd64.RegRAX, feedback.PackCellPrefix(feedback.StateMegamorphic, feedback.AccessInvalid, slotKind))
+	assembler.Jcc(amd64.CondEqual, done)
+	assembler.CmpRegImm32(amd64.RegRAX, feedback.PackCellPrefix(feedback.StateGeneric, feedback.AccessInvalid, slotKind))
+	assembler.Jcc(amd64.CondEqual, writeCandidate)
+	assembler.CmpRegImm32(amd64.RegRAX, feedback.PackCellPrefix(feedback.StateMonomorphic, accessKind, slotKind))
+	assembler.Jcc(amd64.CondEqual, compareMonomorphic)
+	assembler.Jmp(writeMegamorphic)
+
+	_ = assembler.Bind(compareMonomorphic)
+	assembler.MoveRegMem64(amd64.RegR10, amd64.RegR9, feedback.CellHeapRefOffset)
+	assembler.CmpRegReg(amd64.RegR10, targetRefReg)
+	assembler.Jcc(amd64.CondNotEqual, writeMegamorphic)
+	assembler.MoveRegMem64(amd64.RegR10, amd64.RegR9, feedback.CellValueBitsOffset)
+	assembler.CmpRegReg(amd64.RegR10, targetValueReg)
+	assembler.Jcc(amd64.CondNotEqual, writeCandidate)
+	assembler.Jmp(done)
+
+	_ = assembler.Bind(writeCandidate)
+	assembler.MoveMemImm32(amd64.RegR9, feedback.CellStateOffset, feedback.PackCellPrefix(feedback.StateMonomorphic, accessKind, slotKind))
+	assembler.MoveMemImm32(amd64.RegR9, feedback.CellPayload32AOffset, 0)
+	assembler.MoveMemImm32(amd64.RegR9, feedback.CellPayload32BOffset, 0)
+	assembler.MoveMemImm32(amd64.RegR9, feedback.CellPayload32COffset, 0)
+	assembler.MoveMemReg64(amd64.RegR9, feedback.CellHeapRefOffset, targetRefReg)
+	assembler.MoveMemReg64(amd64.RegR9, feedback.CellValueBitsOffset, targetValueReg)
+	assembler.Jmp(done)
+
+	_ = assembler.Bind(writeMegamorphic)
+	emitWriteMegamorphicFeedbackCell(assembler, amd64.RegR9, amd64.RegR10, slotKind)
+
+	_ = assembler.Bind(noVector)
+	_ = assembler.Bind(done)
+}
+
+func emitUpdateCallFeedbackIneligible(assembler *amd64.Assembler, slotKind feedback.SlotKind) {
+	noVector := assembler.NewLabel()
+	writeMegamorphic := assembler.NewLabel()
+	done := assembler.NewLabel()
+
+	emitLoadFeedbackCellBaseFromCallArg(assembler, amd64.RegR9, amd64.RegRAX, rtstate.StubCallBlockArg3Offset, noVector)
+	assembler.MoveRegMem32(amd64.RegRAX, amd64.RegR9, feedback.CellStateOffset)
+	assembler.CmpRegImm32(amd64.RegRAX, feedback.PackCellPrefix(feedback.StateMonomorphic, feedback.AccessCallLuaClosure, slotKind))
+	assembler.Jcc(amd64.CondEqual, writeMegamorphic)
+	assembler.CmpRegImm32(amd64.RegRAX, feedback.PackCellPrefix(feedback.StateMonomorphic, feedback.AccessCallHostFunction, slotKind))
+	assembler.Jcc(amd64.CondEqual, writeMegamorphic)
+	assembler.Jmp(done)
+
+	_ = assembler.Bind(writeMegamorphic)
+	emitWriteMegamorphicFeedbackCell(assembler, amd64.RegR9, amd64.RegR10, slotKind)
+
+	_ = assembler.Bind(noVector)
+	_ = assembler.Bind(done)
+}
+
+func emitUpdateUpvalueFeedbackEligible(assembler *amd64.Assembler, slotKind feedback.SlotKind, accessKind feedback.AccessKind, upvalueRefReg amd64.Register, observedValueReg amd64.Register) {
+	noVector := assembler.NewLabel()
+	compareMonomorphic := assembler.NewLabel()
+	writeCandidate := assembler.NewLabel()
+	writeMegamorphic := assembler.NewLabel()
+	done := assembler.NewLabel()
+
+	emitLoadFeedbackCellBaseFromScratch(assembler, amd64.RegR9, amd64.RegRAX, noVector)
+	assembler.MoveRegMem32(amd64.RegRAX, amd64.RegR9, feedback.CellStateOffset)
+	assembler.CmpRegImm32(amd64.RegRAX, feedback.PackCellPrefix(feedback.StateMegamorphic, feedback.AccessInvalid, slotKind))
+	assembler.Jcc(amd64.CondEqual, done)
+	assembler.CmpRegImm32(amd64.RegRAX, feedback.PackCellPrefix(feedback.StateGeneric, feedback.AccessInvalid, slotKind))
+	assembler.Jcc(amd64.CondEqual, writeCandidate)
+	assembler.CmpRegImm32(amd64.RegRAX, feedback.PackCellPrefix(feedback.StateMonomorphic, feedback.AccessUpvalueOpen, slotKind))
+	assembler.Jcc(amd64.CondEqual, compareMonomorphic)
+	assembler.CmpRegImm32(amd64.RegRAX, feedback.PackCellPrefix(feedback.StateMonomorphic, feedback.AccessUpvalueClosed, slotKind))
+	assembler.Jcc(amd64.CondEqual, compareMonomorphic)
+	assembler.Jmp(writeMegamorphic)
+
+	_ = assembler.Bind(compareMonomorphic)
+	assembler.MoveRegMem64(amd64.RegR10, amd64.RegR9, feedback.CellHeapRefOffset)
+	assembler.CmpRegReg(amd64.RegR10, upvalueRefReg)
+	assembler.Jcc(amd64.CondNotEqual, writeMegamorphic)
+
+	_ = assembler.Bind(writeCandidate)
+	assembler.MoveMemImm32(amd64.RegR9, feedback.CellStateOffset, feedback.PackCellPrefix(feedback.StateMonomorphic, accessKind, slotKind))
+	assembler.MoveMemImm32(amd64.RegR9, feedback.CellPayload32AOffset, 0)
+	assembler.MoveMemImm32(amd64.RegR9, feedback.CellPayload32BOffset, 0)
+	assembler.MoveMemImm32(amd64.RegR9, feedback.CellPayload32COffset, 0)
+	assembler.MoveMemReg64(amd64.RegR9, feedback.CellHeapRefOffset, upvalueRefReg)
+	assembler.MoveMemReg64(amd64.RegR9, feedback.CellValueBitsOffset, observedValueReg)
+	assembler.Jmp(done)
+
+	_ = assembler.Bind(writeMegamorphic)
+	emitWriteMegamorphicFeedbackCell(assembler, amd64.RegR9, amd64.RegR10, slotKind)
+
+	_ = assembler.Bind(noVector)
+	_ = assembler.Bind(done)
+}
+
+func emitUpdateUpvalueFeedbackIneligible(assembler *amd64.Assembler, slotKind feedback.SlotKind) {
+	noVector := assembler.NewLabel()
+	writeMegamorphic := assembler.NewLabel()
+	done := assembler.NewLabel()
+
+	emitLoadFeedbackCellBaseFromScratch(assembler, amd64.RegR9, amd64.RegRAX, noVector)
+	assembler.MoveRegMem32(amd64.RegRAX, amd64.RegR9, feedback.CellStateOffset)
+	assembler.CmpRegImm32(amd64.RegRAX, feedback.PackCellPrefix(feedback.StateMonomorphic, feedback.AccessUpvalueOpen, slotKind))
+	assembler.Jcc(amd64.CondEqual, writeMegamorphic)
+	assembler.CmpRegImm32(amd64.RegRAX, feedback.PackCellPrefix(feedback.StateMonomorphic, feedback.AccessUpvalueClosed, slotKind))
+	assembler.Jcc(amd64.CondEqual, writeMegamorphic)
+	assembler.Jmp(done)
+
+	_ = assembler.Bind(writeMegamorphic)
+	emitWriteMegamorphicFeedbackCell(assembler, amd64.RegR9, amd64.RegR10, slotKind)
+
+	_ = assembler.Bind(noVector)
+	_ = assembler.Bind(done)
+}
+
 func emitWriteMegamorphicFeedbackCell(assembler *amd64.Assembler, cellBaseReg amd64.Register, scratchReg amd64.Register, slotKind feedback.SlotKind) {
 	assembler.MoveMemImm32(cellBaseReg, feedback.CellStateOffset, feedback.PackCellPrefix(feedback.StateMegamorphic, feedback.AccessInvalid, slotKind))
-	assembler.MoveMemImm32(cellBaseReg, feedback.CellTableVersionOffset, 0)
-	assembler.MoveMemImm32(cellBaseReg, feedback.CellCachedIndexOffset, 0)
-	assembler.MoveMemImm32(cellBaseReg, feedback.CellReservedOffset, 0)
+	assembler.MoveMemImm32(cellBaseReg, feedback.CellPayload32AOffset, 0)
+	assembler.MoveMemImm32(cellBaseReg, feedback.CellPayload32BOffset, 0)
+	assembler.MoveMemImm32(cellBaseReg, feedback.CellPayload32COffset, 0)
 	assembler.XorRegReg(scratchReg, scratchReg)
-	assembler.MoveMemReg64(cellBaseReg, feedback.CellTableRefOffset, scratchReg)
-	assembler.MoveMemReg64(cellBaseReg, feedback.CellKeyBitsOffset, scratchReg)
+	assembler.MoveMemReg64(cellBaseReg, feedback.CellHeapRefOffset, scratchReg)
+	assembler.MoveMemReg64(cellBaseReg, feedback.CellValueBitsOffset, scratchReg)
 }
 
 func emitLoadFeedbackCellBaseFromScratch(assembler *amd64.Assembler, dstReg amd64.Register, slotReg amd64.Register, noVector *amd64.Label) {
@@ -1027,6 +1273,18 @@ func emitLoadFeedbackCellBaseFromScratch(assembler *amd64.Assembler, dstReg amd6
 	assembler.AddRegReg(dstReg, amd64.HeapBaseRegister)
 	assembler.AddRegImm32(dstReg, int32(feedback.HeaderSize))
 	emitLoadBuiltinScratch64(assembler, slotReg, builtinScratchPayload3Offset)
+	assembler.ShiftLeftRegImm8(slotReg, 5)
+	assembler.AddRegReg(dstReg, slotReg)
+}
+
+func emitLoadFeedbackCellBaseFromCallArg(assembler *amd64.Assembler, dstReg amd64.Register, slotReg amd64.Register, slotArgOffset int32, noVector *amd64.Label) {
+	emitLoadClosureObjectFromFrame(assembler, dstReg)
+	assembler.MoveRegMem64(dstReg, dstReg, rtclosure.FeedbackVectorOff)
+	assembler.CmpRegImm32(dstReg, 0)
+	assembler.Jcc(amd64.CondEqual, noVector)
+	assembler.AddRegReg(dstReg, amd64.HeapBaseRegister)
+	assembler.AddRegImm32(dstReg, int32(feedback.HeaderSize))
+	emitLoadBuiltinCallArg64(assembler, slotReg, slotArgOffset)
 	assembler.ShiftLeftRegImm8(slotReg, 5)
 	assembler.AddRegReg(dstReg, slotReg)
 }
@@ -1141,11 +1399,38 @@ func emitStoreResultRegisterFromScratchIndex(assembler *amd64.Assembler, resultR
 	assembler.MoveMemReg64(amd64.RegR10, 0, resultReg)
 }
 
-func emitReturnBuiltinStatus(assembler *amd64.Assembler, result abi.BuiltinResult) {
-	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, 0)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(result))
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
+func emitReturnBuiltinContinuation(assembler *amd64.Assembler, clearFlags bool) {
+	if clearFlags {
+		assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, 0)
+	}
 	assembler.Ret()
+}
+
+func emitExitBuiltinStatus(assembler *amd64.Assembler, status uint32, clearFlags bool) {
+	if clearFlags {
+		assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, 0)
+	}
+	assembler.MoveRegImm32(amd64.RegRAX, status)
+	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
+	assembler.AddRegImm32(amd64.RegRSP, int32(builtinTerminalExitStackAdjust))
+	assembler.Ret()
+}
+
+func emitExitBuiltinStatusWithRegAux(assembler *amd64.Assembler, status uint32, auxReg amd64.Register, clearFlags bool) {
+	if clearFlags {
+		assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, 0)
+	}
+	assembler.MoveRegImm32(amd64.RegRAX, status)
+	if auxReg != amd64.RegRDX {
+		assembler.MoveRegReg(amd64.RegRDX, auxReg)
+	}
+	assembler.AddRegImm32(amd64.RegRSP, int32(builtinTerminalExitStackAdjust))
+	assembler.Ret()
+}
+
+func emitExitCurrentBuiltinToRuntime(assembler *amd64.Assembler, clearFlags bool) {
+	emitLoadBuiltinCallStubID32(assembler, amd64.RegRDX)
+	emitExitBuiltinStatusWithRegAux(assembler, compiledStatusStub, amd64.RegRDX, clearFlags)
 }
 
 func shiftedBoxedTag(tag value.Tag) uint32 {
@@ -1154,6 +1439,14 @@ func shiftedBoxedTag(tag value.Tag) uint32 {
 
 func emitLoadBuiltinCallArg64(assembler *amd64.Assembler, dst amd64.Register, offset int32) {
 	assembler.MoveRegMem64(dst, amd64.RegRSP, builtinBodyCallBlockBaseOffset+offset)
+}
+
+func emitLoadBuiltinCallStubID32(assembler *amd64.Assembler, dst amd64.Register) {
+	assembler.MoveRegMem32(dst, amd64.RegRSP, builtinBodyCallBlockBaseOffset+rtstate.StubCallBlockStubIDOffset)
+}
+
+func emitLoadBuiltinCallFlags32(assembler *amd64.Assembler, dst amd64.Register) {
+	assembler.MoveRegMem32(dst, amd64.RegRSP, builtinBodyCallBlockBaseOffset+rtstate.StubCallBlockFlagsOffset)
 }
 
 func emitLoadClosureObjectFromFrame(assembler *amd64.Assembler, dst amd64.Register) {
@@ -1184,6 +1477,44 @@ func emitLoadNumberFromSlotAddress(assembler *amd64.Assembler, addrReg amd64.Reg
 	assembler.MoveXmmMem64(dst, addrReg, 0)
 }
 
+func emitLoadNumberFromValueReg(assembler *amd64.Assembler, valueReg amd64.Register, tagReg amd64.Register, dst amd64.XMMRegister, errorPath *amd64.Label) {
+	assembler.MoveRegReg(tagReg, valueReg)
+	assembler.ShiftRightRegImm8(tagReg, 48)
+	assembler.CmpRegImm32(tagReg, 0xFFFF)
+	assembler.Jcc(amd64.CondEqual, errorPath)
+	assembler.MoveXmmReg64(dst, valueReg)
+}
+
+func emitLoadFloat64Immediate(assembler *amd64.Assembler, dst amd64.XMMRegister, bits uint64, scratchReg amd64.Register) {
+	assembler.MoveRegImm64(scratchReg, bits)
+	assembler.MoveXmmReg64(dst, scratchReg)
+}
+
+func emitStoreResultRegisterFromCallArgXmm(assembler *amd64.Assembler, argOffset int32, resultReg amd64.XMMRegister, indexReg amd64.Register, addrReg amd64.Register) {
+	emitLoadBuiltinCallArg64(assembler, indexReg, argOffset)
+	assembler.ShiftLeftRegImm8(indexReg, 3)
+	assembler.MoveRegReg(addrReg, amd64.RegsBaseRegister)
+	assembler.AddRegReg(addrReg, indexReg)
+	assembler.MoveMemXmm64(addrReg, 0, resultReg)
+}
+
+func emitStoreResultRegisterFromCallArgReg(assembler *amd64.Assembler, argOffset int32, resultReg amd64.Register, indexReg amd64.Register, addrReg amd64.Register) {
+	emitLoadBuiltinCallArg64(assembler, indexReg, argOffset)
+	assembler.ShiftLeftRegImm8(indexReg, 3)
+	assembler.MoveRegReg(addrReg, amd64.RegsBaseRegister)
+	assembler.AddRegReg(addrReg, indexReg)
+	assembler.MoveMemReg64(addrReg, 0, resultReg)
+}
+
+func emitJumpIfValueFalsey(assembler *amd64.Assembler, valueReg amd64.Register, scratchReg amd64.Register, falseyLabel *amd64.Label) {
+	assembler.MoveRegImm64(scratchReg, uint64(value.NilValue().Bits()))
+	assembler.CmpRegReg(valueReg, scratchReg)
+	assembler.Jcc(amd64.CondEqual, falseyLabel)
+	assembler.MoveRegImm64(scratchReg, uint64(value.BoolValue(false).Bits()))
+	assembler.CmpRegReg(valueReg, scratchReg)
+	assembler.Jcc(amd64.CondEqual, falseyLabel)
+}
+
 func emitLoadThreadStateHeader(assembler *amd64.Assembler, dst amd64.Register) {
 	assembler.MoveRegMem64(dst, amd64.VMStateRegister, rtstate.VMStateActiveThreadStateOffset)
 }
@@ -1195,6 +1526,13 @@ func emitStoreThreadCurrentFrame(assembler *amd64.Assembler, threadReg amd64.Reg
 func emitRestoreCallerSiteID(assembler *amd64.Assembler) {
 	emitLoadBuiltinScratch64(assembler, amd64.RegRAX, builtinScratchTableRefOffset)
 	assembler.MoveMemReg32(amd64.RegR11, execCtxSiteIDOffset, amd64.RegRAX)
+}
+
+func emitRestoreCallerFrameFromScratch(assembler *amd64.Assembler) {
+	emitLoadBuiltinScratch64(assembler, amd64.RegR13, builtinScratchPayload3Offset)
+	emitLoadBuiltinScratch64(assembler, amd64.RegR12, builtinScratchPayload2Offset)
+	emitLoadThreadStateHeader(assembler, amd64.RegRAX)
+	emitStoreThreadCurrentFrame(assembler, amd64.RegRAX, amd64.RegR13)
 }
 
 func emitReturnNestedCallDispatch(assembler *amd64.Assembler, flags uint32, hasAux bool, auxReg amd64.Register) {
@@ -1209,9 +1547,7 @@ func emitReturnNestedCallDispatch(assembler *amd64.Assembler, flags uint32, hasA
 	assembler.MoveMemImm32(amd64.RegR11, execCtxReserved3Off, 0)
 	emitRestoreCallerSiteID(assembler)
 	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, flags)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultDispatchToRuntime))
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
-	assembler.Ret()
+	emitExitCurrentBuiltinToRuntime(assembler, false)
 }
 
 func emitZeroSlots(assembler *amd64.Assembler, baseReg amd64.Register, countReg amd64.Register) {

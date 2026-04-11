@@ -164,11 +164,15 @@ func (runtime *Runtime) callCompiled(thread *state.ThreadState, closureRef value
 	if nresults > resultSlots {
 		resultSlots = nresults
 	}
+	varargCount := 0
+	if compiled.Proto.IsVararg != 0 && len(args) > int(compiled.Proto.NumParams) {
+		varargCount = len(args) - int(compiled.Proto.NumParams)
+	}
 	registerBase, err := thread.NextRegisterBase()
 	if err != nil {
 		return nil, err
 	}
-	totalSlots := uint32(registerCount + resultSlots)
+	totalSlots := uint32(registerCount + resultSlots + varargCount)
 	if registerBase+totalSlots > thread.StackSlots() {
 		return nil, fmt.Errorf("thread stack exhausted: need %d slots, have %d", registerBase+totalSlots, thread.StackSlots())
 	}
@@ -180,16 +184,25 @@ func (runtime *Runtime) callCompiled(thread *state.ThreadState, closureRef value
 	if err != nil {
 		return nil, err
 	}
+	var varargBase uintptr
+	if varargCount > 0 {
+		varargBase, err = thread.SlotAddress(registerBase + uint32(registerCount+resultSlots))
+		if err != nil {
+			return nil, err
+		}
+	}
 	frame, err := thread.PushFrame(state.FrameSpec{
 		Closure:       value.LuaClosureRefValue(closureRef),
 		Proto:         closureObject.Proto,
 		RegisterBase:  registerBase,
 		ConstBase:     constBase,
+		VarargBase:    varargBase,
 		ResultBase:    resultBase,
 		SavedBCOff:    0,
 		NResults:      normalizeRequestedResults(nresults),
+		VarargCount:   uint32(varargCount),
 		RegisterCount: uint16(registerCount),
-		SpillCount:    uint16(resultSlots),
+		SpillCount:    uint16(resultSlots + varargCount),
 	})
 	if err != nil {
 		return nil, err
@@ -200,6 +213,15 @@ func (runtime *Runtime) callCompiled(thread *state.ThreadState, closureRef value
 			_, _ = thread.PopFrame()
 			clearThreadSlots(thread, registerBase, totalSlots)
 			return nil, err
+		}
+	}
+	if varargCount > 0 {
+		for index, slotValue := range args[int(compiled.Proto.NumParams):] {
+			if err := thread.SetValueAtAddress(varargBase+uintptr(index)*value.TValueSize, slotValue); err != nil {
+				_, _ = thread.PopFrame()
+				clearThreadSlots(thread, registerBase, totalSlots)
+				return nil, err
+			}
 		}
 	}
 	cleaned := false

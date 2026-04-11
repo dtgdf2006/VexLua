@@ -16,6 +16,36 @@ func (engine *Engine) recordSetFeedback(act *activation, pc int, kind feedback.S
 	engine.recordActivationTableFeedback(act, pc, kind, tableValue, key, slotValue, true)
 }
 
+func (engine *Engine) recordCallFeedback(act *activation, pc int, kind feedback.SlotKind, callee value.TValue) {
+	if act == nil {
+		return
+	}
+	closureRef, err := engine.activationClosureRef(act)
+	if err != nil {
+		return
+	}
+	proto, err := engine.activationProto(act)
+	if err != nil {
+		return
+	}
+	engine.UpdateCallFeedbackAtPC(closureRef, proto, pc, kind, callee)
+}
+
+func (engine *Engine) recordUpvalueFeedback(act *activation, pc int, kind feedback.SlotKind, upvalueRef value.HeapRef44, observed value.TValue) {
+	if act == nil {
+		return
+	}
+	closureRef, err := engine.activationClosureRef(act)
+	if err != nil {
+		return
+	}
+	proto, err := engine.activationProto(act)
+	if err != nil {
+		return
+	}
+	engine.UpdateUpvalueFeedbackAtPC(closureRef, proto, pc, kind, upvalueRef, observed)
+}
+
 func (engine *Engine) recordActivationTableFeedback(act *activation, pc int, kind feedback.SlotKind, tableValue value.TValue, key value.TValue, slotValue value.TValue, isStore bool) {
 	if act == nil {
 		return
@@ -32,30 +62,67 @@ func (engine *Engine) recordActivationTableFeedback(act *activation, pc int, kin
 }
 
 func (engine *Engine) UpdateTableFeedbackAtPC(closureRef value.HeapRef44, proto *bytecode.Proto, pc int, kind feedback.SlotKind, tableValue value.TValue, key value.TValue, slotValue value.TValue, isStore bool) {
+	engine.updateFeedbackAtPC(closureRef, proto, pc, kind, func(slotIndex uint32) {
+		engine.UpdateTableFeedbackAtSlot(closureRef, kind, slotIndex, tableValue, key, slotValue, isStore)
+	})
+}
+
+func (engine *Engine) UpdateTableFeedbackAtSlot(closureRef value.HeapRef44, kind feedback.SlotKind, slotIndex uint32, tableValue value.TValue, key value.TValue, slotValue value.TValue, isStore bool) {
+	access, eligible, err := engine.describeFeedbackAccess(tableValue, key, slotValue, isStore)
+	if err != nil {
+		return
+	}
+	engine.updateFeedbackAtSlot(closureRef, kind, slotIndex, func(current feedback.Cell) (feedback.Cell, bool) {
+		return feedback.NextTableCell(current, kind, access, eligible, key.Bits())
+	})
+}
+
+func (engine *Engine) UpdateCallFeedbackAtPC(closureRef value.HeapRef44, proto *bytecode.Proto, pc int, kind feedback.SlotKind, callee value.TValue) {
+	engine.updateFeedbackAtPC(closureRef, proto, pc, kind, func(slotIndex uint32) {
+		engine.UpdateCallFeedbackAtSlot(closureRef, kind, slotIndex, callee)
+	})
+}
+
+func (engine *Engine) UpdateCallFeedbackAtSlot(closureRef value.HeapRef44, kind feedback.SlotKind, slotIndex uint32, callee value.TValue) {
+	engine.updateFeedbackAtSlot(closureRef, kind, slotIndex, func(current feedback.Cell) (feedback.Cell, bool) {
+		return feedback.NextCallCell(current, kind, callee)
+	})
+}
+
+func (engine *Engine) UpdateUpvalueFeedbackAtPC(closureRef value.HeapRef44, proto *bytecode.Proto, pc int, kind feedback.SlotKind, upvalueRef value.HeapRef44, observed value.TValue) {
+	engine.updateFeedbackAtPC(closureRef, proto, pc, kind, func(slotIndex uint32) {
+		engine.UpdateUpvalueFeedbackAtSlot(closureRef, kind, slotIndex, upvalueRef, observed)
+	})
+}
+
+func (engine *Engine) UpdateUpvalueFeedbackAtSlot(closureRef value.HeapRef44, kind feedback.SlotKind, slotIndex uint32, upvalueRef value.HeapRef44, observed value.TValue) {
+	upvalueObject, err := engine.Upvalues.Object(upvalueRef)
+	if err != nil {
+		return
+	}
+	engine.updateFeedbackAtSlot(closureRef, kind, slotIndex, func(current feedback.Cell) (feedback.Cell, bool) {
+		return feedback.NextUpvalueCell(current, kind, upvalueRef, upvalueObject.State, observed.Bits())
+	})
+}
+
+func (engine *Engine) updateFeedbackAtPC(closureRef value.HeapRef44, proto *bytecode.Proto, pc int, kind feedback.SlotKind, apply func(slotIndex uint32)) {
 	slot, slotIndex, ok := feedback.SlotInfoForProtoPC(proto, pc)
 	if !ok || slot.Kind != kind {
 		return
 	}
-	engine.UpdateTableFeedbackAtSlot(closureRef, kind, slotIndex, tableValue, key, slotValue, isStore)
+	apply(slotIndex)
 }
 
-func (engine *Engine) UpdateTableFeedbackAtSlot(closureRef value.HeapRef44, kind feedback.SlotKind, slotIndex uint32, tableValue value.TValue, key value.TValue, slotValue value.TValue, isStore bool) {
+func (engine *Engine) updateFeedbackAtSlot(closureRef value.HeapRef44, kind feedback.SlotKind, slotIndex uint32, update func(current feedback.Cell) (feedback.Cell, bool)) {
 	closureObject, err := engine.Closures.Object(closureRef)
 	if err != nil || closureObject.FeedbackData == 0 || slotIndex >= closureObject.FeedbackSize {
 		return
 	}
 	current, err := engine.Closures.ReadFeedbackCell(closureRef, slotIndex)
-	if err != nil {
+	if err != nil || current.SlotKind != kind {
 		return
 	}
-	if current.SlotKind != kind {
-		return
-	}
-	access, eligible, err := engine.describeFeedbackAccess(tableValue, key, slotValue, isStore)
-	if err != nil {
-		return
-	}
-	next, changed := feedback.NextTableCell(current, kind, access, eligible, key.Bits())
+	next, changed := update(current)
 	if changed {
 		_ = engine.Closures.WriteFeedbackCell(closureRef, slotIndex, next)
 	}

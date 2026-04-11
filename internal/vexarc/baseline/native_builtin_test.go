@@ -37,7 +37,7 @@ func TestStubManagerInstallsAllCoveredNativeBuiltinBodies(t *testing.T) {
 			t.Fatalf("stub %d should install a native body block", id)
 		}
 		if manager.stubBlocks[id] == nil {
-			t.Fatalf("stub %d should install an entry thunk block", id)
+			t.Fatalf("stub %d should install an entry veneer block", id)
 		}
 	}
 }
@@ -54,7 +54,7 @@ func TestStubManagerInstallsNativeTableGlobalBodies(t *testing.T) {
 			t.Fatalf("stub %d should install a native body block", id)
 		}
 		if manager.stubBlocks[id] == nil {
-			t.Fatalf("stub %d should install an entry thunk block", id)
+			t.Fatalf("stub %d should install an entry veneer block", id)
 		}
 	}
 }
@@ -81,6 +81,7 @@ func TestNativeBuiltinCallReturnsToCompiledContinuation(t *testing.T) {
 	assembler.MoveMemImm32(amd64.RegRSP, int32(state.StubCallBlockFlagsOffset), 0xA5A5A5A5)
 	assembler.MoveRegImm64(amd64.RegR10, uint64(builtinEntry))
 	assembler.CallReg(amd64.RegR10)
+	assembler.AddRegImm32(amd64.RegRSP, int32(abi.StubCallBlockSize))
 	assembler.XorRegReg(amd64.RegRAX, amd64.RegRAX)
 	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
 	assembler.Ret()
@@ -117,7 +118,7 @@ func TestNativeBuiltinCallReturnsToCompiledContinuation(t *testing.T) {
 	}
 }
 
-func TestStubManagerUsesThunkBackedEntries(t *testing.T) {
+func TestStubManagerUsesVeneerBackedEntries(t *testing.T) {
 	source, err := os.ReadFile("stub_manager.go")
 	if err != nil {
 		t.Fatalf("read stub_manager.go: %v", err)
@@ -129,10 +130,10 @@ func TestStubManagerUsesThunkBackedEntries(t *testing.T) {
 			t.Fatalf("stub manager should no longer install legacy status exit blocks via %q", needle)
 		}
 	}
-	required := []string{"buildBuiltinEntryThunk(", "InstallNativeBuiltin("}
+	required := []string{"buildBuiltinEntryVeneer(", "InstallNativeBuiltin("}
 	for _, needle := range required {
 		if !strings.Contains(text, needle) {
-			t.Fatalf("stub manager should expose thunk-backed native builtin infrastructure %q", needle)
+			t.Fatalf("stub manager should expose veneer-backed native builtin infrastructure %q", needle)
 		}
 	}
 	for _, needle := range []string{"buildGetGlobalBuiltinBody()", "buildGetTableBuiltinBody()", "buildSetGlobalBuiltinBody()", "buildSetTableBuiltinBody()"} {
@@ -269,8 +270,6 @@ func buildTestContinueBuiltinBody(slot int, bits value.Raw, flags uint32) []byte
 	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, flags)
 	assembler.MoveRegImm64(amd64.RegRAX, uint64(bits))
 	assembler.MoveMemReg64(amd64.RegR12, slotDisp(slot), amd64.RegRAX)
-	assembler.MoveRegImm32(amd64.RegRAX, uint32(abi.BuiltinResultContinue))
-	assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
 	assembler.Ret()
 	return assembler.Buffer().Bytes()
 }

@@ -256,6 +256,14 @@ func (assembler *Assembler) MoveMemXmm64(base Register, disp int32, src XMMRegis
 	assembler.emitMemory(lowBitsXmm(src), base, disp)
 }
 
+func (assembler *Assembler) MoveXmmReg64(dst XMMRegister, src Register) {
+	assembler.buffer.emitByte(0x66)
+	assembler.emitRex(true, hiBitXmm(dst), 0, hiBit(src))
+	assembler.buffer.emitByte(0x0F)
+	assembler.buffer.emitByte(0x6E)
+	assembler.emitModRM(0b11, lowBitsXmm(dst), lowBits(src))
+}
+
 func (assembler *Assembler) AddsdXmmXmm(dst XMMRegister, src XMMRegister) {
 	assembler.buffer.emitByte(0xF2)
 	assembler.emitRex(false, hiBitXmm(dst), 0, hiBitXmm(src))
@@ -270,6 +278,38 @@ func (assembler *Assembler) SubsdXmmXmm(dst XMMRegister, src XMMRegister) {
 	assembler.buffer.emitByte(0x0F)
 	assembler.buffer.emitByte(0x5C)
 	assembler.emitModRM(0b11, lowBitsXmm(dst), lowBitsXmm(src))
+}
+
+func (assembler *Assembler) MulsdXmmXmm(dst XMMRegister, src XMMRegister) {
+	assembler.buffer.emitByte(0xF2)
+	assembler.emitRex(false, hiBitXmm(dst), 0, hiBitXmm(src))
+	assembler.buffer.emitByte(0x0F)
+	assembler.buffer.emitByte(0x59)
+	assembler.emitModRM(0b11, lowBitsXmm(dst), lowBitsXmm(src))
+}
+
+func (assembler *Assembler) DivsdXmmXmm(dst XMMRegister, src XMMRegister) {
+	assembler.buffer.emitByte(0xF2)
+	assembler.emitRex(false, hiBitXmm(dst), 0, hiBitXmm(src))
+	assembler.buffer.emitByte(0x0F)
+	assembler.buffer.emitByte(0x5E)
+	assembler.emitModRM(0b11, lowBitsXmm(dst), lowBitsXmm(src))
+}
+
+func (assembler *Assembler) Cvttsd2siReg64(dst Register, src XMMRegister) {
+	assembler.buffer.emitByte(0xF2)
+	assembler.emitRex(true, hiBit(dst), 0, hiBitXmm(src))
+	assembler.buffer.emitByte(0x0F)
+	assembler.buffer.emitByte(0x2C)
+	assembler.emitModRM(0b11, lowBits(dst), lowBitsXmm(src))
+}
+
+func (assembler *Assembler) Cvtsi2sdXmmReg64(dst XMMRegister, src Register) {
+	assembler.buffer.emitByte(0xF2)
+	assembler.emitRex(true, hiBitXmm(dst), 0, hiBit(src))
+	assembler.buffer.emitByte(0x0F)
+	assembler.buffer.emitByte(0x2A)
+	assembler.emitModRM(0b11, lowBitsXmm(dst), lowBits(src))
 }
 
 func (assembler *Assembler) UcomisdXmmXmm(left XMMRegister, right XMMRegister) {

@@ -750,7 +750,7 @@ func TestBaselineRuntimeNativeBuiltinCompositionStaysInCompiledIsland(t *testing
 	}
 }
 
-func TestBaselineRuntimeFallsBackToInterpreter(t *testing.T) {
+func TestBaselineRuntimeCompilesArithmeticFastPath(t *testing.T) {
 	engine := interp.New()
 	runtime := NewRuntime(engine)
 	defer func() { _ = runtime.Close() }()
@@ -784,14 +784,15 @@ func TestBaselineRuntimeFallsBackToInterpreter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compile proto: %v", err)
 	}
-	if compiled.Supported {
-		t.Fatalf("ADD should still fall back in Stage 6")
+	if !compiled.Supported {
+		t.Fatalf("ADD should compile in the current baseline pipeline, unsupported reason: %s", compiled.UnsupportedReason)
 	}
 	results, err := runtime.Call(thread, closure.Value, nil, -1)
 	if err != nil {
 		t.Fatalf("runtime call: %v", err)
 	}
 	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	assertNoNativeFallback(t, runtime)
 }
 
 func TestBaselineRuntimeCompiledCallerCanFallbackCallee(t *testing.T) {
@@ -1805,7 +1806,7 @@ func TestBaselineRuntimeVersionMissRewarmsMonomorphicCell(t *testing.T) {
 	}
 	assertCounterDeltaZero(t, runtime, before)
 	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
-	versionBefore := cell.TableVersion
+	versionBefore := cell.TableVersion()
 	if err := engine.Tables.Set(box.Ref, keyOther.Value, value.NumberValue(9)); err != nil {
 		t.Fatalf("mutate table to bump version: %v", err)
 	}
@@ -1820,7 +1821,7 @@ func TestBaselineRuntimeVersionMissRewarmsMonomorphicCell(t *testing.T) {
 		t.Fatalf("version mismatch should avoid deopt replay, got %d", runtime.DeoptCount())
 	}
 	cell = mustFeedbackCell(t, runtime, closure.Ref, 0)
-	if cell.State != feedback.StateMonomorphic || cell.TableVersion == versionBefore {
+	if cell.State != feedback.StateMonomorphic || cell.TableVersion() == versionBefore {
 		t.Fatalf("expected re-warmed monomorphic cell with new version, got %+v", cell)
 	}
 	before = captureRuntimeCounters(runtime)

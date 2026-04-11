@@ -14,6 +14,10 @@ const (
 	SlotGetTable
 	SlotSetGlobal
 	SlotSetTable
+	SlotGetUpvalue
+	SlotSetUpvalue
+	SlotCall
+	SlotTailCall
 )
 
 type Slot struct {
@@ -100,6 +104,14 @@ func slotKindForOpcode(opcode bytecode.Opcode) (SlotKind, bool) {
 		return SlotSetGlobal, true
 	case bytecode.OP_SETTABLE:
 		return SlotSetTable, true
+	case bytecode.OP_GETUPVAL:
+		return SlotGetUpvalue, true
+	case bytecode.OP_SETUPVAL:
+		return SlotSetUpvalue, true
+	case bytecode.OP_CALL:
+		return SlotCall, true
+	case bytecode.OP_TAILCALL:
+		return SlotTailCall, true
 	default:
 		return SlotInvalid, false
 	}

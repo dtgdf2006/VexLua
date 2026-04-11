@@ -54,6 +54,8 @@ func NewCompiler(engine *interp.Engine, cache *codecache.Cache, manager *stubMan
 		stubs.StubTailCall,
 		stubs.StubForPrep,
 		stubs.StubForLoop,
+		stubs.StubSelf,
+		stubs.StubLen,
 	} {
 		entry, err := manager.StubEntry(id)
 		if err != nil {
@@ -79,7 +81,12 @@ func (compiler *Compiler) Compile(proto *bytecode.Proto) (*CompiledCode, error) 
 		metadata:       compiled.Metadata,
 		labels:         make(map[int]*amd64.Label),
 	}
-	if err := state.preflight(); err != nil {
+	if err := state.validateStructure(); err != nil {
+		compiled.Supported = false
+		compiled.UnsupportedReason = err.Error()
+		return compiled, nil
+	}
+	if err := state.previsit(); err != nil {
 		compiled.Supported = false
 		compiled.UnsupportedReason = err.Error()
 		return compiled, nil
@@ -117,9 +124,62 @@ type compileState struct {
 	labels         map[int]*amd64.Label
 }
 
-func (state *compileState) preflight() error {
+type instructionDisposition uint8
+
+const (
+	instructionDispositionCompiled instructionDisposition = iota
+	instructionDispositionPayload
+	instructionDispositionDeopt
+)
+
+func (state *compileState) dispositionForInstruction(offset int, instruction bytecode.Instruction) instructionDisposition {
+	if state.isSetListExtraArgument(offset) {
+		return instructionDispositionPayload
+	}
+	switch instruction.Opcode() {
+	case bytecode.OP_MOVE,
+		bytecode.OP_LOADK,
+		bytecode.OP_LOADBOOL,
+		bytecode.OP_LOADNIL,
+		bytecode.OP_GETUPVAL,
+		bytecode.OP_SELF,
+		bytecode.OP_GETGLOBAL,
+		bytecode.OP_GETTABLE,
+		bytecode.OP_SETGLOBAL,
+		bytecode.OP_SETUPVAL,
+		bytecode.OP_ADD,
+		bytecode.OP_SUB,
+		bytecode.OP_MUL,
+		bytecode.OP_DIV,
+		bytecode.OP_MOD,
+		bytecode.OP_POW,
+		bytecode.OP_UNM,
+		bytecode.OP_NOT,
+		bytecode.OP_LEN,
+		bytecode.OP_SETTABLE,
+		bytecode.OP_JMP,
+		bytecode.OP_EQ,
+		bytecode.OP_LT,
+		bytecode.OP_LE,
+		bytecode.OP_TEST,
+		bytecode.OP_TESTSET,
+		bytecode.OP_CALL,
+		bytecode.OP_TAILCALL,
+		bytecode.OP_RETURN,
+		bytecode.OP_FORPREP,
+		bytecode.OP_FORLOOP:
+		return instructionDispositionCompiled
+	default:
+		return instructionDispositionDeopt
+	}
+}
+
+func (state *compileState) validateStructure() error {
 	if state.proto == nil {
 		return fmt.Errorf("proto cannot be nil")
+	}
+	if err := bytecode.ValidateProto(state.proto); err != nil {
+		return err
 	}
 	for index, constant := range state.proto.Constants {
 		switch constant.Kind {
@@ -128,147 +188,51 @@ func (state *compileState) preflight() error {
 			return fmt.Errorf("constant %d: unsupported constant kind %s", index, constant.Kind)
 		}
 	}
+	return nil
+}
+
+func (state *compileState) previsit() error {
 	for offset, instruction := range state.proto.Code {
-		switch instruction.Opcode() {
-		case bytecode.OP_MOVE, bytecode.OP_LOADK, bytecode.OP_LOADBOOL, bytecode.OP_LOADNIL, bytecode.OP_GETUPVAL, bytecode.OP_GETGLOBAL, bytecode.OP_GETTABLE, bytecode.OP_SETGLOBAL, bytecode.OP_SETUPVAL, bytecode.OP_SETTABLE, bytecode.OP_JMP, bytecode.OP_CALL, bytecode.OP_TAILCALL, bytecode.OP_RETURN, bytecode.OP_FORPREP, bytecode.OP_FORLOOP:
-		default:
-			return fmt.Errorf("opcode %s is not lowered in Stage 6", instruction.Opcode())
+		if err := state.previsitInstruction(offset, instruction); err != nil {
+			return err
 		}
-		switch instruction.Opcode() {
-		case bytecode.OP_MOVE:
-			if err := state.validateSlot(offset, instruction.Opcode(), instruction.A()); err != nil {
-				return err
-			}
-			if err := state.validateSlot(offset, instruction.Opcode(), instruction.B()); err != nil {
-				return err
-			}
-		case bytecode.OP_LOADK, bytecode.OP_LOADBOOL, bytecode.OP_GETGLOBAL, bytecode.OP_SETGLOBAL:
-			if err := state.validateSlot(offset, instruction.Opcode(), instruction.A()); err != nil {
-				return err
-			}
-		case bytecode.OP_LOADNIL:
-			if err := state.validateSlotRange(offset, instruction.Opcode(), instruction.A(), instruction.B()-instruction.A()+1); err != nil {
-				return err
-			}
-		case bytecode.OP_GETUPVAL:
-			if err := state.validateSlot(offset, instruction.Opcode(), instruction.A()); err != nil {
-				return err
-			}
-			if err := state.validateUpvalueIndex(offset, instruction.Opcode(), instruction.B()); err != nil {
-				return err
-			}
-		case bytecode.OP_SETUPVAL:
-			if err := state.validateSlot(offset, instruction.Opcode(), instruction.A()); err != nil {
-				return err
-			}
-			if err := state.validateUpvalueIndex(offset, instruction.Opcode(), instruction.B()); err != nil {
-				return err
-			}
-		case bytecode.OP_GETTABLE:
-			if err := state.validateSlot(offset, instruction.Opcode(), instruction.A()); err != nil {
-				return err
-			}
-			if err := state.validateSlot(offset, instruction.Opcode(), instruction.B()); err != nil {
-				return err
-			}
-			if !bytecode.IsConstantRK(instruction.C()) {
-				if err := state.validateSlot(offset, instruction.Opcode(), instruction.C()); err != nil {
-					return err
-				}
-			}
-		case bytecode.OP_SETTABLE:
-			if err := state.validateSlot(offset, instruction.Opcode(), instruction.A()); err != nil {
-				return err
-			}
-			if !bytecode.IsConstantRK(instruction.B()) {
-				if err := state.validateSlot(offset, instruction.Opcode(), instruction.B()); err != nil {
-					return err
-				}
-			}
-			if !bytecode.IsConstantRK(instruction.C()) {
-				if err := state.validateSlot(offset, instruction.Opcode(), instruction.C()); err != nil {
-					return err
-				}
-			}
-		case bytecode.OP_CALL:
-			if err := state.validateSlot(offset, instruction.Opcode(), instruction.A()); err != nil {
-				return err
-			}
-			if instruction.B() > 0 {
-				if err := state.validateSlotRange(offset, instruction.Opcode(), instruction.A(), instruction.B()); err != nil {
-					return err
-				}
-			}
-			if instruction.C() > 1 {
-				if err := state.validateSlotRange(offset, instruction.Opcode(), instruction.A(), instruction.C()-1); err != nil {
-					return err
-				}
-			}
-		case bytecode.OP_TAILCALL:
-			if err := state.validateSlot(offset, instruction.Opcode(), instruction.A()); err != nil {
-				return err
-			}
-			if instruction.B() > 0 {
-				if err := state.validateSlotRange(offset, instruction.Opcode(), instruction.A(), instruction.B()); err != nil {
-					return err
-				}
-			}
-		case bytecode.OP_RETURN:
-			if err := state.validateSlot(offset, instruction.Opcode(), instruction.A()); err != nil {
-				return err
-			}
-			if instruction.B() > 1 {
-				if err := state.validateSlotRange(offset, instruction.Opcode(), instruction.A(), instruction.B()-1); err != nil {
-					return err
-				}
-			}
-		case bytecode.OP_FORPREP, bytecode.OP_FORLOOP:
-			if err := state.validateSlotRange(offset, instruction.Opcode(), instruction.A(), 4); err != nil {
-				return err
-			}
+	}
+	return nil
+}
+
+func (state *compileState) previsitInstruction(offset int, instruction bytecode.Instruction) error {
+	disposition := state.dispositionForInstruction(offset, instruction)
+	if disposition == instructionDispositionDeopt || disposition == instructionDispositionPayload {
+		return nil
+	}
+	switch instruction.Opcode() {
+	case bytecode.OP_JMP:
+		target := offset + 1 + instruction.SBx()
+		if err := state.validateTarget(target, offset, instruction.Opcode()); err != nil {
+			return err
 		}
-		switch instruction.Opcode() {
-		case bytecode.OP_LOADK:
-			if instruction.Bx() < 0 || instruction.Bx() >= len(state.proto.Constants) {
-				return fmt.Errorf("LOADK constant index out of range at pc %d", offset)
-			}
-		case bytecode.OP_GETGLOBAL, bytecode.OP_SETGLOBAL:
-			if instruction.Bx() < 0 || instruction.Bx() >= len(state.proto.Constants) {
-				return fmt.Errorf("%s constant index out of range at pc %d", instruction.Opcode(), offset)
-			}
-		case bytecode.OP_JMP:
-			target := offset + 1 + instruction.SBx()
-			if err := state.validateTarget(target, offset, instruction.Opcode()); err != nil {
-				return err
-			}
-			state.labelFor(target)
-		case bytecode.OP_LOADBOOL:
-			if instruction.C() != 0 {
-				target := offset + 2
-				if err := state.validateTarget(target, offset, instruction.Opcode()); err != nil {
-					return err
-				}
-				state.labelFor(target)
-			}
-		case bytecode.OP_CALL:
-			if instruction.B() == 0 || instruction.C() == 0 {
-				return fmt.Errorf("open CALL forms are not lowered in Stage 6 at pc %d", offset)
-			}
-		case bytecode.OP_TAILCALL:
-			if instruction.B() == 0 || instruction.C() != 0 {
-				return fmt.Errorf("open TAILCALL forms are not lowered in Stage 6 at pc %d", offset)
-			}
-		case bytecode.OP_RETURN:
-			if instruction.B() == 0 {
-				return fmt.Errorf("open RETURN form is not lowered in Stage 6 at pc %d", offset)
-			}
-		case bytecode.OP_FORPREP, bytecode.OP_FORLOOP:
-			target := offset + 1 + instruction.SBx()
+		state.labelFor(target)
+	case bytecode.OP_LOADBOOL:
+		if instruction.C() != 0 {
+			target := offset + 2
 			if err := state.validateTarget(target, offset, instruction.Opcode()); err != nil {
 				return err
 			}
 			state.labelFor(target)
 		}
+	case bytecode.OP_FORPREP, bytecode.OP_FORLOOP:
+		target := offset + 1 + instruction.SBx()
+		if err := state.validateTarget(target, offset, instruction.Opcode()); err != nil {
+			return err
+		}
+		state.labelFor(target)
+	case bytecode.OP_EQ, bytecode.OP_LT, bytecode.OP_LE, bytecode.OP_TEST, bytecode.OP_TESTSET, bytecode.OP_TFORLOOP:
+		target, err := state.testJumpTarget(offset, instruction.Opcode())
+		if err != nil {
+			return err
+		}
+		state.labelFor(target)
+		state.labelFor(offset + 2)
 	}
 	return nil
 }
@@ -300,13 +264,6 @@ func (state *compileState) validateSlotRange(pc int, opcode bytecode.Opcode, sta
 	return state.validateSlot(pc, opcode, start+count-1)
 }
 
-func (state *compileState) validateUpvalueIndex(pc int, opcode bytecode.Opcode, index int) error {
-	if index < 0 || index >= int(state.proto.NumUpvalues) {
-		return fmt.Errorf("%s upvalue %d is out of range at pc %d", opcode, index, pc)
-	}
-	return nil
-}
-
 func (state *compileState) beginInstruction(offset int) error {
 	if label, ok := state.labels[offset]; ok {
 		if err := state.assembler.Bind(label); err != nil {
@@ -325,6 +282,14 @@ func (state *compileState) beginInstruction(offset int) error {
 }
 
 func (state *compileState) emitInstruction(offset int, instruction bytecode.Instruction) error {
+	disposition := state.dispositionForInstruction(offset, instruction)
+	if disposition == instructionDispositionPayload {
+		return nil
+	}
+	if disposition == instructionDispositionDeopt {
+		state.emitUncoveredInstructionDeopt(offset)
+		return nil
+	}
 	switch instruction.Opcode() {
 	case bytecode.OP_MOVE:
 		state.assembler.MoveRegMem64(amd64.RegRAX, amd64.RegR12, slotDisp(instruction.B()))
@@ -332,16 +297,17 @@ func (state *compileState) emitInstruction(offset int, instruction bytecode.Inst
 	case bytecode.OP_LOADK:
 		state.emitLoadConstant(instruction.A(), instruction.Bx())
 	case bytecode.OP_LOADBOOL:
-		state.emitStoreRawTValue(instruction.A(), uint64(value.BoolValue(instruction.B() != 0).Bits()))
-		if instruction.C() != 0 {
-			state.assembler.Jmp(state.labelFor(offset + 2))
-		}
+		return state.emitLoadBoolInstruction(offset, instruction)
 	case bytecode.OP_LOADNIL:
-		for index := instruction.A(); index <= instruction.B(); index++ {
-			state.emitStoreRawTValue(index, uint64(value.NilValue().Bits()))
-		}
+		return state.emitLoadNilInstruction(instruction)
 	case bytecode.OP_GETUPVAL:
-		state.emitGetUpvalue(offset, instruction.A(), instruction.B())
+		slotIndex, err := state.feedbackSlotIndex(offset, feedback.SlotGetUpvalue)
+		if err != nil {
+			return err
+		}
+		state.emitGetUpvalue(offset, instruction.A(), instruction.B(), slotIndex)
+	case bytecode.OP_SELF:
+		return state.emitSelfInstruction(offset, instruction)
 	case bytecode.OP_GETGLOBAL:
 		slotIndex, err := state.feedbackSlotIndex(offset, feedback.SlotGetGlobal)
 		if err != nil {
@@ -361,7 +327,17 @@ func (state *compileState) emitInstruction(offset int, instruction bytecode.Inst
 		}
 		state.emitSetGlobal(offset, instruction.A(), instruction.Bx(), slotIndex)
 	case bytecode.OP_SETUPVAL:
-		state.emitSetUpvalue(offset, instruction.A(), instruction.B())
+		slotIndex, err := state.feedbackSlotIndex(offset, feedback.SlotSetUpvalue)
+		if err != nil {
+			return err
+		}
+		state.emitSetUpvalue(offset, instruction.A(), instruction.B(), slotIndex)
+	case bytecode.OP_ADD, bytecode.OP_SUB, bytecode.OP_MUL, bytecode.OP_DIV, bytecode.OP_MOD, bytecode.OP_POW, bytecode.OP_UNM:
+		return state.emitArithmeticInstruction(offset, instruction)
+	case bytecode.OP_NOT:
+		return state.emitNotInstruction(offset, instruction)
+	case bytecode.OP_LEN:
+		return state.emitLengthInstruction(offset, instruction)
 	case bytecode.OP_SETTABLE:
 		slotIndex, err := state.feedbackSlotIndex(offset, feedback.SlotSetTable)
 		if err != nil {
@@ -369,27 +345,139 @@ func (state *compileState) emitInstruction(offset int, instruction bytecode.Inst
 		}
 		state.emitSetTable(offset, instruction.A(), instruction.B(), instruction.C(), slotIndex)
 	case bytecode.OP_JMP:
-		state.assembler.Jmp(state.labelFor(offset + 1 + instruction.SBx()))
+		return state.emitJumpInstruction(offset, instruction)
+	case bytecode.OP_EQ, bytecode.OP_LT, bytecode.OP_LE:
+		return state.emitCompareInstruction(offset, instruction)
+	case bytecode.OP_TEST, bytecode.OP_TESTSET:
+		return state.emitTestInstruction(offset, instruction)
 	case bytecode.OP_CALL:
-		state.emitCall(offset, instruction.A(), instruction.B(), instruction.C(), uint32(offset+1))
+		return state.emitCallInstruction(offset, instruction)
 	case bytecode.OP_TAILCALL:
-		state.emitTailCall(offset, instruction.A(), instruction.B())
+		return state.emitTailCallInstruction(offset, instruction)
 	case bytecode.OP_RETURN:
-		count := instruction.B() - 1
-		state.assembler.MoveRegMem64(amd64.RegR10, amd64.RegR13, state.CallFrameResultBaseOffset())
-		for index := 0; index < count; index++ {
-			state.assembler.MoveRegMem64(amd64.RegRAX, amd64.RegR12, slotDisp(instruction.A()+index))
-			state.assembler.MoveMemReg64(amd64.RegR10, slotDisp(index), amd64.RegRAX)
-		}
-		state.emitStatus(compiledStatusOK, uint32(count))
+		return state.emitReturnInstruction(offset, instruction)
 	case bytecode.OP_FORPREP:
-		state.emitForPrep(offset, instruction.A(), offset+1+instruction.SBx())
+		return state.emitForPrepInstruction(offset, instruction)
 	case bytecode.OP_FORLOOP:
-		state.emitForLoop(offset, instruction.A(), offset+1, offset+1+instruction.SBx())
+		return state.emitForLoopInstruction(offset, instruction)
 	default:
-		return fmt.Errorf("unexpected opcode %s", instruction.Opcode())
+		return fmt.Errorf("compiled instruction %s has no emitter", instruction.Opcode())
 	}
 	return nil
+}
+
+func (state *compileState) emitLoadBoolInstruction(offset int, instruction bytecode.Instruction) error {
+	state.emitStoreRawTValue(instruction.A(), uint64(value.BoolValue(instruction.B() != 0).Bits()))
+	if instruction.C() != 0 {
+		state.assembler.Jmp(state.labelFor(offset + 2))
+	}
+	return nil
+}
+
+func (state *compileState) emitLoadNilInstruction(instruction bytecode.Instruction) error {
+	for index := instruction.A(); index <= instruction.B(); index++ {
+		state.emitStoreRawTValue(index, uint64(value.NilValue().Bits()))
+	}
+	return nil
+}
+
+func (state *compileState) emitSelfInstruction(offset int, instruction bytecode.Instruction) error {
+	state.emitSelf(offset, instruction.A(), instruction.B(), instruction.C())
+	return nil
+}
+
+func (state *compileState) emitArithmeticInstruction(offset int, instruction bytecode.Instruction) error {
+	state.emitArithmetic(offset, instruction.Opcode(), instruction.A(), instruction.B(), instruction.C())
+	return nil
+}
+
+func (state *compileState) emitNotInstruction(offset int, instruction bytecode.Instruction) error {
+	state.emitNot(offset, instruction.A(), instruction.B())
+	return nil
+}
+
+func (state *compileState) emitLengthInstruction(offset int, instruction bytecode.Instruction) error {
+	state.emitLength(offset, instruction.A(), instruction.B())
+	return nil
+}
+
+func (state *compileState) emitJumpInstruction(offset int, instruction bytecode.Instruction) error {
+	state.assembler.Jmp(state.labelFor(offset + 1 + instruction.SBx()))
+	return nil
+}
+
+func (state *compileState) emitCompareInstruction(offset int, instruction bytecode.Instruction) error {
+	target, err := state.testJumpTarget(offset, instruction.Opcode())
+	if err != nil {
+		return err
+	}
+	state.emitCompare(offset, instruction.Opcode(), instruction.A(), instruction.B(), instruction.C(), target)
+	return nil
+}
+
+func (state *compileState) emitTestInstruction(offset int, instruction bytecode.Instruction) error {
+	target, err := state.testJumpTarget(offset, instruction.Opcode())
+	if err != nil {
+		return err
+	}
+	state.emitTest(offset, instruction.Opcode(), instruction.A(), instruction.B(), instruction.C(), target)
+	return nil
+}
+
+func (state *compileState) emitCallInstruction(offset int, instruction bytecode.Instruction) error {
+	if instruction.B() == 0 || instruction.C() == 0 {
+		state.emitUncoveredInstructionDeopt(offset)
+		return nil
+	}
+	slotIndex, err := state.feedbackSlotIndex(offset, feedback.SlotCall)
+	if err != nil {
+		return err
+	}
+	state.emitCall(offset, instruction.A(), instruction.B(), instruction.C(), uint32(offset+1), slotIndex)
+	return nil
+}
+
+func (state *compileState) emitTailCallInstruction(offset int, instruction bytecode.Instruction) error {
+	if instruction.B() == 0 || instruction.C() != 0 {
+		state.emitUncoveredInstructionDeopt(offset)
+		return nil
+	}
+	slotIndex, err := state.feedbackSlotIndex(offset, feedback.SlotTailCall)
+	if err != nil {
+		return err
+	}
+	state.emitTailCall(offset, instruction.A(), instruction.B(), slotIndex)
+	return nil
+}
+
+func (state *compileState) emitReturnInstruction(offset int, instruction bytecode.Instruction) error {
+	if instruction.B() == 0 {
+		state.emitUncoveredInstructionDeopt(offset)
+		return nil
+	}
+	count := instruction.B() - 1
+	state.assembler.MoveRegMem64(amd64.RegR10, amd64.RegR13, state.CallFrameResultBaseOffset())
+	for index := 0; index < count; index++ {
+		state.assembler.MoveRegMem64(amd64.RegRAX, amd64.RegR12, slotDisp(instruction.A()+index))
+		state.assembler.MoveMemReg64(amd64.RegR10, slotDisp(index), amd64.RegRAX)
+	}
+	state.emitStatus(compiledStatusOK, uint32(count))
+	return nil
+}
+
+func (state *compileState) emitForPrepInstruction(offset int, instruction bytecode.Instruction) error {
+	state.emitForPrep(offset, instruction.A(), offset+1+instruction.SBx())
+	return nil
+}
+
+func (state *compileState) emitForLoopInstruction(offset int, instruction bytecode.Instruction) error {
+	state.emitForLoop(offset, instruction.A(), offset+1, offset+1+instruction.SBx())
+	return nil
+}
+
+func (state *compileState) emitUncoveredInstructionDeopt(bytecodePC int) {
+	siteID := state.recordContinuationSite(metadata.ContinuationDeopt, stubs.StubInvalid, bytecodePC, bytecodePC, -1, -1, 0, 0, 0, 0, metadata.ContinuationFlagDeoptOnUncovered)
+	state.emitDeoptExit(siteID)
 }
 
 func (state *compileState) recordContinuationSite(kind metadata.ContinuationKind, stubID stubs.ID, bytecodePC int, deoptPC int, resumePC int, altResumePC int, operand0 uint32, operand1 uint32, operand2 uint32, operand3 uint32, flags uint32) uint32 {
@@ -413,10 +501,6 @@ func (state *compileState) emitDeoptExit(siteID uint32) {
 	state.emitExit(state.compiler.deoptEntry, siteID)
 }
 
-func (state *compileState) emitStubExit(stubID stubs.ID, siteID uint32) {
-	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubID], siteID, stubID, 0, 0, 0, 0, 0)
-}
-
 func (state *compileState) emitExit(entry uintptr, siteID uint32) {
 	state.assembler.MoveMemImm32(amd64.RegR11, execCtxSiteIDOffset, siteID)
 	state.assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, 0)
@@ -437,11 +521,48 @@ func (state *compileState) emitBuiltinCallWithStubArgs(entry uintptr, siteID uin
 	state.assembler.MoveMemImm32(amd64.RegRSP, state.StubCallBlockFlagsOffset(), blockFlags)
 	state.assembler.MoveRegImm64(amd64.RegR10, uint64(entry))
 	state.assembler.CallReg(amd64.RegR10)
+	state.assembler.AddRegImm32(amd64.RegRSP, int32(abi.StubCallBlockSize))
 }
 
 func (state *compileState) emitMoveStackImm64(base amd64.Register, disp int32, value uint64) {
 	state.assembler.MoveRegImm64(amd64.RegRAX, value)
 	state.assembler.MoveMemReg64(base, disp, amd64.RegRAX)
+}
+
+func (state *compileState) isSetListExtraArgument(offset int) bool {
+	if state == nil || state.proto == nil || offset <= 0 || offset >= len(state.proto.Code) {
+		return false
+	}
+	previous := state.proto.Code[offset-1]
+	return previous.Opcode() == bytecode.OP_SETLIST && previous.C() == 0
+}
+
+func (state *compileState) testJumpTarget(offset int, opcode bytecode.Opcode) (int, error) {
+	if offset+1 >= len(state.proto.Code) {
+		return 0, fmt.Errorf("%s is missing trailing JMP at pc %d", opcode, offset)
+	}
+	jump := state.proto.Code[offset+1]
+	if jump.Opcode() != bytecode.OP_JMP {
+		return 0, fmt.Errorf("%s expects trailing JMP at pc %d, got %s", opcode, offset, jump.Opcode())
+	}
+	target := offset + 2 + jump.SBx()
+	if err := state.validateTarget(target, offset, opcode); err != nil {
+		return 0, err
+	}
+	return target, nil
+}
+
+func (state *compileState) closureResumePC(offset int, instruction bytecode.Instruction) (int, error) {
+	childIndex := instruction.Bx()
+	if childIndex < 0 || childIndex >= len(state.proto.Protos) {
+		return 0, fmt.Errorf("CLOSURE child proto %d is out of range at pc %d", childIndex, offset)
+	}
+	childProto := state.proto.Protos[childIndex]
+	resumePC := offset + 1 + int(childProto.NumUpvalues)
+	if resumePC > len(state.proto.Code) {
+		return 0, fmt.Errorf("CLOSURE capture payload overruns proto at pc %d", offset)
+	}
+	return resumePC, nil
 }
 
 func (state *compileState) sitePC(pc int) uint32 {
@@ -479,24 +600,24 @@ func (state *compileState) emitLoadConstant(slot int, index int) {
 	state.assembler.MoveMemReg64(amd64.RegR12, slotDisp(slot), amd64.RegRAX)
 }
 
-func (state *compileState) emitCall(bytecodePC int, a int, b int, c int, resumePC uint32) {
+func (state *compileState) emitCall(bytecodePC int, a int, b int, c int, resumePC uint32, slotIndex uint32) {
 	siteID := state.recordContinuationSite(metadata.ContinuationCall, stubs.StubLuaCall, bytecodePC, bytecodePC, int(resumePC), -1, uint32(a), uint32(b), uint32(c), 0, metadata.ContinuationFlagNativeBuiltinABI)
-	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubLuaCall], siteID, stubs.StubLuaCall, uint64(a), uint64(b), uint64(c), 0, 0)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubLuaCall], siteID, stubs.StubLuaCall, uint64(a), uint64(b), uint64(c), uint64(slotIndex), 0)
 }
 
-func (state *compileState) emitGetUpvalue(bytecodePC int, dst int, upvalueIndex int) {
+func (state *compileState) emitGetUpvalue(bytecodePC int, dst int, upvalueIndex int, slotIndex uint32) {
 	siteID := state.recordContinuationSite(metadata.ContinuationGetUpvalue, stubs.StubGetUpvalue, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(dst), uint32(upvalueIndex), 0, 0, metadata.ContinuationFlagNativeBuiltinABI)
-	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubGetUpvalue], siteID, stubs.StubGetUpvalue, uint64(dst), uint64(upvalueIndex), 0, 0, 0)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubGetUpvalue], siteID, stubs.StubGetUpvalue, uint64(dst), uint64(upvalueIndex), uint64(slotIndex), 0, 0)
 }
 
-func (state *compileState) emitSetUpvalue(bytecodePC int, src int, upvalueIndex int) {
+func (state *compileState) emitSetUpvalue(bytecodePC int, src int, upvalueIndex int, slotIndex uint32) {
 	siteID := state.recordContinuationSite(metadata.ContinuationSetUpvalue, stubs.StubSetUpvalue, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(src), uint32(upvalueIndex), 0, 0, metadata.ContinuationFlagNativeBuiltinABI)
-	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubSetUpvalue], siteID, stubs.StubSetUpvalue, uint64(src), uint64(upvalueIndex), 0, 0, 0)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubSetUpvalue], siteID, stubs.StubSetUpvalue, uint64(src), uint64(upvalueIndex), uint64(slotIndex), 0, 0)
 }
 
-func (state *compileState) emitTailCall(bytecodePC int, a int, b int) {
+func (state *compileState) emitTailCall(bytecodePC int, a int, b int, slotIndex uint32) {
 	siteID := state.recordContinuationSite(metadata.ContinuationTailCall, stubs.StubTailCall, bytecodePC, bytecodePC, -1, -1, uint32(a), uint32(b), 0, 0, metadata.ContinuationFlagFinalExit|metadata.ContinuationFlagNativeBuiltinABI)
-	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubTailCall], siteID, stubs.StubTailCall, uint64(a), uint64(b), 0, 0, 0)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubTailCall], siteID, stubs.StubTailCall, uint64(a), uint64(b), 0, uint64(slotIndex), 0)
 }
 
 func (state *compileState) emitForPrep(bytecodePC int, a int, target int) {

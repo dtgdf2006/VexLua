@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"strconv"
 
 	"vexlua/internal/bytecode"
 	"vexlua/internal/runtime/feedback"
@@ -31,35 +32,43 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 
 	ctx := engine.threadState(thread)
 	registerCount := uint32(proto.MaxStackSize)
-	reservedSlots := registerCount
-	if reservedSlots == 0 {
-		reservedSlots = 1
-	}
 	registerBase, err := thread.NextRegisterBase()
 	if err != nil {
 		return nil, err
-	}
-	if registerBase+reservedSlots > thread.StackSlots() {
-		return nil, fmt.Errorf("thread stack exhausted: need %d slots, have %d", registerBase+reservedSlots, thread.StackSlots())
 	}
 	constBase, err := engine.Protos.ConstantBase(proto, engine.Strings)
 	if err != nil {
 		return nil, err
 	}
 	varargCount := 0
-	if int(proto.NumParams) < len(args) {
+	if proto.IsVararg != 0 && int(proto.NumParams) < len(args) {
 		varargCount = len(args) - int(proto.NumParams)
+	}
+	reservedSlots := registerCount + uint32(varargCount)
+	if reservedSlots == 0 {
+		reservedSlots = 1
+	}
+	if registerBase+reservedSlots > thread.StackSlots() {
+		return nil, fmt.Errorf("thread stack exhausted: need %d slots, have %d", registerBase+reservedSlots, thread.StackSlots())
+	}
+	var varargBase uintptr
+	if varargCount > 0 {
+		varargBase, err = thread.SlotAddress(registerBase + registerCount)
+		if err != nil {
+			return nil, err
+		}
 	}
 	frame, err := thread.PushFrame(state.FrameSpec{
 		Closure:       value.LuaClosureRefValue(closureRef),
 		Proto:         closureObject.Proto,
 		RegisterBase:  registerBase,
 		ConstBase:     constBase,
+		VarargBase:    varargBase,
 		SavedBCOff:    0,
 		NResults:      normalizeNResults(nresults),
 		VarargCount:   uint32(varargCount),
 		RegisterCount: uint16(registerCount),
-		SpillCount:    0,
+		SpillCount:    uint16(varargCount),
 	})
 	if err != nil {
 		return nil, err
@@ -82,6 +91,11 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 	var varargs []value.TValue
 	if proto.IsVararg != 0 && len(args) > int(proto.NumParams) {
 		varargs = append(varargs, args[int(proto.NumParams):]...)
+		for index, slotValue := range varargs {
+			if err := thread.SetValueAtAddress(varargBase+uintptr(index)*value.TValueSize, slotValue); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if int(proto.NumParams) > len(args) {
 		activation.top = uint32(minInt(int(proto.NumParams), int(registerCount)))
@@ -193,6 +207,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
+			engine.recordUpvalueFeedback(act, pc, feedback.SlotGetUpvalue, upvalueRef, upvalueValue)
 			if err := engine.setRegister(act, instruction.A(), upvalueValue); err != nil {
 				return nil, err
 			}
@@ -259,6 +274,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err := engine.Upvalues.Set(upvalueRef, registerValue); err != nil {
 				return nil, err
 			}
+			engine.recordUpvalueFeedback(act, pc, feedback.SlotSetUpvalue, upvalueRef, registerValue)
 		case bytecode.OP_SETTABLE:
 			tableValue, err := engine.registerValue(act, instruction.A())
 			if err != nil {
@@ -282,6 +298,25 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 				return nil, err
 			}
 			if err := engine.setRegister(act, instruction.A(), handle.Value); err != nil {
+				return nil, err
+			}
+		case bytecode.OP_SELF:
+			tableValue, err := engine.registerValue(act, instruction.B())
+			if err != nil {
+				return nil, err
+			}
+			if err := engine.setRegister(act, instruction.A()+1, tableValue); err != nil {
+				return nil, err
+			}
+			key, err := engine.rkValue(act, instruction.C())
+			if err != nil {
+				return nil, err
+			}
+			result, _, err := engine.getTable(tableValue, key)
+			if err != nil {
+				return nil, err
+			}
+			if err := engine.setRegister(act, instruction.A(), result); err != nil {
 				return nil, err
 			}
 		case bytecode.OP_ADD, bytecode.OP_SUB, bytecode.OP_MUL, bytecode.OP_DIV, bytecode.OP_MOD, bytecode.OP_POW:
@@ -317,6 +352,34 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 				return nil, err
 			}
 			if err := engine.setRegister(act, instruction.A(), value.NumberValue(-number)); err != nil {
+				return nil, err
+			}
+		case bytecode.OP_NOT:
+			registerValue, err := engine.registerValue(act, instruction.B())
+			if err != nil {
+				return nil, err
+			}
+			if err := engine.setRegister(act, instruction.A(), value.BoolValue(isFalse(registerValue))); err != nil {
+				return nil, err
+			}
+		case bytecode.OP_LEN:
+			registerValue, err := engine.registerValue(act, instruction.B())
+			if err != nil {
+				return nil, err
+			}
+			lengthValue, err := engine.lengthValue(registerValue)
+			if err != nil {
+				return nil, runtimeError(proto, pc, opcode, err.Error())
+			}
+			if err := engine.setRegister(act, instruction.A(), lengthValue); err != nil {
+				return nil, err
+			}
+		case bytecode.OP_CONCAT:
+			result, err := engine.concatRegisters(act, instruction.B(), instruction.C())
+			if err != nil {
+				return nil, runtimeError(proto, pc, opcode, err.Error())
+			}
+			if err := engine.setRegister(act, instruction.A(), result); err != nil {
 				return nil, err
 			}
 		case bytecode.OP_JMP:
@@ -417,6 +480,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if instruction.C() > 0 {
 				wantedResults = instruction.C() - 1
 			}
+			engine.recordCallFeedback(act, pc, feedback.SlotCall, callee)
 			results, err := engine.callValue(act.thread, callee, callArgs, wantedResults)
 			if err != nil {
 				return nil, err
@@ -430,9 +494,94 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
+			engine.recordCallFeedback(act, pc, feedback.SlotTailCall, callee)
 			return engine.callValue(act.thread, callee, callArgs, -1)
 		case bytecode.OP_RETURN:
 			return engine.collectReturnValues(act, instruction.A(), instruction.B())
+		case bytecode.OP_FORLOOP:
+			step, err := engine.loopNumberValue(act, instruction.A()+2, pc, opcode, "step")
+			if err != nil {
+				return nil, err
+			}
+			index, err := engine.loopNumberValue(act, instruction.A(), pc, opcode, "index")
+			if err != nil {
+				return nil, err
+			}
+			limit, err := engine.loopNumberValue(act, instruction.A()+1, pc, opcode, "limit")
+			if err != nil {
+				return nil, err
+			}
+			index += step
+			continueLoop := (step > 0 && index <= limit) || (step <= 0 && limit <= index)
+			if continueLoop {
+				indexValue := value.NumberValue(index)
+				if err := engine.setRegister(act, instruction.A(), indexValue); err != nil {
+					return nil, err
+				}
+				if err := engine.setRegister(act, instruction.A()+3, indexValue); err != nil {
+					return nil, err
+				}
+				act.pc += instruction.SBx()
+			}
+		case bytecode.OP_FORPREP:
+			init, err := engine.loopNumberValue(act, instruction.A(), pc, opcode, "initial value")
+			if err != nil {
+				return nil, err
+			}
+			limit, err := engine.loopNumberValue(act, instruction.A()+1, pc, opcode, "limit")
+			if err != nil {
+				return nil, err
+			}
+			step, err := engine.loopNumberValue(act, instruction.A()+2, pc, opcode, "step")
+			if err != nil {
+				return nil, err
+			}
+			if err := engine.setRegister(act, instruction.A()+1, value.NumberValue(limit)); err != nil {
+				return nil, err
+			}
+			if err := engine.setRegister(act, instruction.A()+2, value.NumberValue(step)); err != nil {
+				return nil, err
+			}
+			if err := engine.setRegister(act, instruction.A(), value.NumberValue(init-step)); err != nil {
+				return nil, err
+			}
+			act.pc += instruction.SBx()
+		case bytecode.OP_TFORLOOP:
+			callee, callArgs, err := engine.collectCallArguments(act, instruction.A(), 3)
+			if err != nil {
+				return nil, err
+			}
+			results, err := engine.callValue(act.thread, callee, callArgs, instruction.C())
+			if err != nil {
+				return nil, err
+			}
+			for index := 0; index < instruction.C(); index++ {
+				slotValue := value.NilValue()
+				if index < len(results) {
+					slotValue = results[index]
+				}
+				if err := engine.setRegister(act, instruction.A()+3+index, slotValue); err != nil {
+					return nil, err
+				}
+			}
+			firstResult, err := engine.registerValue(act, instruction.A()+3)
+			if err != nil {
+				return nil, err
+			}
+			if !firstResult.IsBoxedTag(value.TagNil) {
+				if err := engine.setRegister(act, instruction.A()+2, firstResult); err != nil {
+					return nil, err
+				}
+				if err := engine.takeTestJump(act, pc, opcode); err != nil {
+					return nil, err
+				}
+			} else {
+				act.pc++
+			}
+		case bytecode.OP_SETLIST:
+			if err := engine.executeSetList(act, proto, instruction); err != nil {
+				return nil, runtimeError(proto, pc, opcode, err.Error())
+			}
 		case bytecode.OP_CLOSE:
 			registerBase, err := engine.activationRegisterBase(act)
 			if err != nil {
@@ -571,6 +720,111 @@ func (engine *Engine) constantValue(act *activation, index int) (value.TValue, e
 		return value.NilValue(), err
 	}
 	return value.FromRaw(value.Raw(binary.LittleEndian.Uint64(bytes))), nil
+}
+
+func (engine *Engine) lengthValue(slotValue value.TValue) (value.TValue, error) {
+	if slotValue.IsBoxedTag(value.TagStringRef) {
+		ref, _ := slotValue.HeapRef()
+		header, err := engine.Strings.Header(ref)
+		if err != nil {
+			return value.NilValue(), err
+		}
+		return value.NumberValue(float64(header.Length)), nil
+	}
+	if slotValue.IsBoxedTag(value.TagTableRef) {
+		ref, _ := slotValue.HeapRef()
+		object, err := engine.Tables.Object(ref)
+		if err != nil {
+			return value.NilValue(), err
+		}
+		return value.NumberValue(float64(object.ArrayLenHint)), nil
+	}
+	return value.NilValue(), fmt.Errorf("length requires table or string, got %s", slotValue)
+}
+
+func (engine *Engine) concatRegisters(act *activation, start int, end int) (value.TValue, error) {
+	if start > end {
+		return value.NilValue(), fmt.Errorf("concat range %d..%d is invalid", start, end)
+	}
+	text := ""
+	for index := start; index <= end; index++ {
+		slotValue, err := engine.registerValue(act, index)
+		if err != nil {
+			return value.NilValue(), err
+		}
+		part, err := engine.concatOperandText(slotValue)
+		if err != nil {
+			return value.NilValue(), err
+		}
+		text += part
+	}
+	handle, err := engine.Strings.Intern(text)
+	if err != nil {
+		return value.NilValue(), err
+	}
+	return handle.Value, nil
+}
+
+func (engine *Engine) concatOperandText(slotValue value.TValue) (string, error) {
+	if slotValue.IsBoxedTag(value.TagStringRef) {
+		ref, _ := slotValue.HeapRef()
+		return engine.Strings.Text(ref)
+	}
+	if number, ok := slotValue.Float64(); ok {
+		return strconv.FormatFloat(number, 'g', -1, 64), nil
+	}
+	return "", fmt.Errorf("concat requires strings or numbers, got %s", slotValue)
+}
+
+func (engine *Engine) loopNumberValue(act *activation, index int, pc int, opcode bytecode.Opcode, role string) (float64, error) {
+	slotValue, err := engine.registerValue(act, index)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := slotValue.Float64()
+	if !ok {
+		return 0, engine.activationRuntimeError(act, pc, opcode, fmt.Sprintf("for %s must be a number", role))
+	}
+	if err := engine.setRegister(act, index, value.NumberValue(number)); err != nil {
+		return 0, err
+	}
+	return number, nil
+}
+
+func (engine *Engine) executeSetList(act *activation, proto *bytecode.Proto, instruction bytecode.Instruction) error {
+	tableValue, err := engine.registerValue(act, instruction.A())
+	if err != nil {
+		return err
+	}
+	n := instruction.B()
+	if n == 0 {
+		if act.top <= uint32(instruction.A()+1) {
+			n = 0
+		} else {
+			n = int(act.top) - instruction.A() - 1
+		}
+	}
+	block := instruction.C()
+	if block == 0 {
+		if act.pc >= len(proto.Code) {
+			return fmt.Errorf("SETLIST expects trailing extra argument instruction")
+		}
+		block = int(proto.Code[act.pc])
+		act.pc++
+	}
+	const fieldsPerFlush = 50
+	baseIndex := (block - 1) * fieldsPerFlush
+	for index := 1; index <= n; index++ {
+		slotValue, err := engine.registerValue(act, instruction.A()+index)
+		if err != nil {
+			return err
+		}
+		key := value.NumberValue(float64(baseIndex + index))
+		if err := engine.setTable(tableValue, key, slotValue); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (engine *Engine) rkValue(act *activation, operand int) (value.TValue, error) {

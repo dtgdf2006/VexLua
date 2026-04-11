@@ -93,6 +93,137 @@ func TestInterpreterClosureAndUpvalueCapture(t *testing.T) {
 	assertProtoExecAndChunkDiff(t, outer, value.NilValue(), nil, -1, []value.TValue{value.NumberValue(42)})
 }
 
+func TestInterpreterSelfAndSetListChunkDiff(t *testing.T) {
+	child := &bytecode.Proto{
+		Source:       "@method.lua",
+		MaxStackSize: 1,
+		Constants: []bytecode.Constant{
+			bytecode.NumberConstant(99),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	proto := &bytecode.Proto{
+		Source:       "@self-setlist.lua",
+		MaxStackSize: 4,
+		Constants: []bytecode.Constant{
+			bytecode.NumberConstant(11),
+			bytecode.NumberConstant(22),
+			bytecode.NumberConstant(33),
+			bytecode.NumberConstant(2),
+			bytecode.StringConstant("id"),
+		},
+		Protos: []*bytecode.Proto{child},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_NEWTABLE, 0, 0, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 2, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 3, 2),
+			bytecode.CreateABC(bytecode.OP_SETLIST, 0, 3, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 3),
+			bytecode.CreateABC(bytecode.OP_GETTABLE, 1, 0, 1),
+			bytecode.CreateABx(bytecode.OP_CLOSURE, 2, 0),
+			bytecode.CreateABC(bytecode.OP_SETTABLE, 0, bytecode.RKAsk(4), 2),
+			bytecode.CreateABC(bytecode.OP_SELF, 2, 0, bytecode.RKAsk(4)),
+			bytecode.CreateABC(bytecode.OP_CALL, 2, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 1, 3, 0),
+		},
+	}
+	assertProtoExecAndChunkDiff(t, proto, value.NilValue(), nil, -1, []value.TValue{value.NumberValue(22), value.NumberValue(99)})
+}
+
+func TestInterpreterNotLenConcatAndNumericForChunkDiff(t *testing.T) {
+	proto := &bytecode.Proto{
+		Source:       "@extended-opcodes.lua",
+		MaxStackSize: 10,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("hello"),
+			bytecode.NumberConstant(42),
+			bytecode.StringConstant("he"),
+			bytecode.StringConstant("llo"),
+			bytecode.NumberConstant(1),
+			bytecode.NumberConstant(3),
+			bytecode.NumberConstant(0),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_NEWTABLE, 0, 0, 1),
+			bytecode.CreateABC(bytecode.OP_SETTABLE, 0, bytecode.RKAsk(0), bytecode.RKAsk(1)),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 2),
+			bytecode.CreateABx(bytecode.OP_LOADK, 2, 3),
+			bytecode.CreateABC(bytecode.OP_CONCAT, 1, 1, 2),
+			bytecode.CreateABC(bytecode.OP_LEN, 2, 1, 0),
+			bytecode.CreateABC(bytecode.OP_GETTABLE, 3, 0, 1),
+			bytecode.CreateABC(bytecode.OP_LOADBOOL, 4, 0, 0),
+			bytecode.CreateABC(bytecode.OP_NOT, 4, 4, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 5, 4),
+			bytecode.CreateABx(bytecode.OP_LOADK, 6, 5),
+			bytecode.CreateABx(bytecode.OP_LOADK, 7, 4),
+			bytecode.CreateABx(bytecode.OP_LOADK, 9, 6),
+			bytecode.CreateAsBx(bytecode.OP_FORPREP, 5, 1),
+			bytecode.CreateABC(bytecode.OP_ADD, 9, 9, 8),
+			bytecode.CreateAsBx(bytecode.OP_FORLOOP, 5, -2),
+			bytecode.CreateABC(bytecode.OP_MOVE, 5, 9, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 2, 5, 0),
+		},
+	}
+	assertProtoExecAndChunkDiff(t, proto, value.NilValue(), nil, -1, []value.TValue{value.NumberValue(5), value.NumberValue(42), value.BoolValue(true), value.NumberValue(6)})
+}
+
+func TestInterpreterTForLoopWithHostIterator(t *testing.T) {
+	engine := New()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("create env: %v", err)
+	}
+	iterator, err := engine.RegisterHostFunction("iter", func(state float64, control float64) (any, any) {
+		if control >= 2 {
+			return nil, nil
+		}
+		next := control + 1
+		return next, next + 10
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register iterator: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "iter", iterator.Value); err != nil {
+		t.Fatalf("set global iter: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@tforloop.lua",
+		MaxStackSize: 6,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("iter"),
+			bytecode.NumberConstant(0),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 2, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 5, 1),
+			bytecode.CreateABC(bytecode.OP_TFORLOOP, 0, 0, 2),
+			bytecode.CreateAsBx(bytecode.OP_JMP, 0, 1),
+			bytecode.CreateABC(bytecode.OP_RETURN, 5, 2, 0),
+			bytecode.CreateABC(bytecode.OP_ADD, 5, 5, 4),
+			bytecode.CreateAsBx(bytecode.OP_JMP, 0, -5),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("create closure: %v", err)
+	}
+	results, err := engine.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("execute tforloop closure: %v", err)
+	}
+	assertResultsEqual(t, results, []value.TValue{value.NumberValue(23)})
+}
+
 func TestInterpreterVarargTailcallAndProtectedCall(t *testing.T) {
 	engine := New()
 	thread, err := engine.NewThread(0, 0)

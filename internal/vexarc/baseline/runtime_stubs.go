@@ -314,7 +314,6 @@ func (runtime *Runtime) compiledFrameState(frame *state.CallFrameHeader) (value.
 	}
 	return closureRef, compiled, nil
 }
-
 func (runtime *Runtime) collectFrameCallArguments(thread *state.ThreadState, frame *state.CallFrameHeader, a int, b int) (value.TValue, []value.TValue, error) {
 	callee, err := thread.Register(frame, uint16(a))
 	if err != nil {

@@ -14,6 +14,11 @@ const (
 	StubTailCall
 	StubForPrep
 	StubForLoop
+	StubSelf
+	StubArithmetic
+	StubUnaryTest
+	StubLen
+	StubCompare
 )
 
 type Descriptor struct {
@@ -32,6 +37,11 @@ var Catalog = map[ID]Descriptor{
 	StubTailCall:   {ID: StubTailCall, Name: "tail-call"},
 	StubForPrep:    {ID: StubForPrep, Name: "for-prep"},
 	StubForLoop:    {ID: StubForLoop, Name: "for-loop"},
+	StubSelf:       {ID: StubSelf, Name: "self"},
+	StubArithmetic: {ID: StubArithmetic, Name: "arithmetic"},
+	StubUnaryTest:  {ID: StubUnaryTest, Name: "unary-test"},
+	StubLen:        {ID: StubLen, Name: "len"},
+	StubCompare:    {ID: StubCompare, Name: "compare"},
 }
 
 func Lookup(id ID) (Descriptor, bool) {

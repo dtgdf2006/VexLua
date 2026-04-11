@@ -22,6 +22,11 @@ const (
 	ContinuationTailCall
 	ContinuationForPrep
 	ContinuationForLoop
+	ContinuationSelf
+	ContinuationArithmetic
+	ContinuationUnaryTest
+	ContinuationLength
+	ContinuationCompare
 	ContinuationDeopt
 )
 

@@ -12,22 +12,22 @@ type State uint8
 type AccessKind uint8
 
 const (
-	HeaderSize             = 0x20
-	HeaderSlotCountOffset  = 0x00
-	HeaderBudgetOffset     = 0x04
-	HeaderHotnessOffset    = 0x08
-	HeaderOSRStateOffset   = 0x0C
-	HeaderFlagsOffset      = 0x10
-	CellSize               = 0x20
-	CellStateOffset        = 0x00
-	CellAccessKindOffset   = 0x01
-	CellSlotKindOffset     = 0x02
-	CellFlagsOffset        = 0x03
-	CellTableVersionOffset = 0x04
-	CellCachedIndexOffset  = 0x08
-	CellReservedOffset     = 0x0C
-	CellTableRefOffset     = 0x10
-	CellKeyBitsOffset      = 0x18
+	HeaderSize            = 0x20
+	HeaderSlotCountOffset = 0x00
+	HeaderBudgetOffset    = 0x04
+	HeaderHotnessOffset   = 0x08
+	HeaderOSRStateOffset  = 0x0C
+	HeaderFlagsOffset     = 0x10
+	CellSize              = 0x20
+	CellStateOffset       = 0x00
+	CellAccessKindOffset  = 0x01
+	CellSlotKindOffset    = 0x02
+	CellFlagsOffset       = 0x03
+	CellPayload32AOffset  = 0x04
+	CellPayload32BOffset  = 0x08
+	CellPayload32COffset  = 0x0C
+	CellHeapRefOffset     = 0x10
+	CellValueBitsOffset   = 0x18
 )
 
 const (
@@ -40,6 +40,10 @@ const (
 	AccessInvalid AccessKind = iota
 	AccessArray
 	AccessHash
+	AccessCallLuaClosure
+	AccessCallHostFunction
+	AccessUpvalueOpen
+	AccessUpvalueClosed
 )
 
 type Header struct {
@@ -51,14 +55,15 @@ type Header struct {
 }
 
 type Cell struct {
-	State        State
-	AccessKind   AccessKind
-	SlotKind     SlotKind
-	Flags        uint8
-	TableVersion uint32
-	CachedIndex  uint32
-	TableRef     value.HeapRef44
-	KeyBits      value.Raw
+	State      State
+	AccessKind AccessKind
+	SlotKind   SlotKind
+	Flags      uint8
+	Payload32A uint32
+	Payload32B uint32
+	Payload32C uint32
+	HeapRef    value.HeapRef44
+	ValueBits  value.Raw
 }
 
 func NewHeader(slotCount uint32) Header {
@@ -73,16 +78,53 @@ func NewMegamorphicCell(kind SlotKind) Cell {
 	return Cell{State: StateMegamorphic, SlotKind: kind}
 }
 
-func NewMonomorphicCell(kind SlotKind, accessKind AccessKind, tableRef value.HeapRef44, tableVersion uint32, cachedIndex uint32, keyBits value.Raw) Cell {
+func NewMonomorphicCell(kind SlotKind, accessKind AccessKind, payload32A uint32, payload32B uint32, payload32C uint32, heapRef value.HeapRef44, valueBits value.Raw) Cell {
 	return Cell{
-		State:        StateMonomorphic,
-		AccessKind:   accessKind,
-		SlotKind:     kind,
-		TableVersion: tableVersion,
-		CachedIndex:  cachedIndex,
-		TableRef:     tableRef,
-		KeyBits:      keyBits,
+		State:      StateMonomorphic,
+		AccessKind: accessKind,
+		SlotKind:   kind,
+		Payload32A: payload32A,
+		Payload32B: payload32B,
+		Payload32C: payload32C,
+		HeapRef:    heapRef,
+		ValueBits:  valueBits,
 	}
+}
+
+func NewTableMonomorphicCell(kind SlotKind, accessKind AccessKind, tableRef value.HeapRef44, tableVersion uint32, cachedIndex uint32, keyBits value.Raw) Cell {
+	return NewMonomorphicCell(kind, accessKind, tableVersion, cachedIndex, 0, tableRef, keyBits)
+}
+
+func NewCallMonomorphicCell(kind SlotKind, accessKind AccessKind, targetRef value.HeapRef44, calleeBits value.Raw) Cell {
+	return NewMonomorphicCell(kind, accessKind, 0, 0, 0, targetRef, calleeBits)
+}
+
+func NewUpvalueMonomorphicCell(kind SlotKind, accessKind AccessKind, upvalueRef value.HeapRef44, observedBits value.Raw) Cell {
+	return NewMonomorphicCell(kind, accessKind, 0, 0, 0, upvalueRef, observedBits)
+}
+
+func (cell Cell) TableVersion() uint32 {
+	return cell.Payload32A
+}
+
+func (cell Cell) CachedIndex() uint32 {
+	return cell.Payload32B
+}
+
+func (cell Cell) TableRef() value.HeapRef44 {
+	return cell.HeapRef
+}
+
+func (cell Cell) KeyBits() value.Raw {
+	return cell.ValueBits
+}
+
+func (cell Cell) TargetRef() value.HeapRef44 {
+	return cell.HeapRef
+}
+
+func (cell Cell) ObservedValueBits() value.Raw {
+	return cell.ValueBits
 }
 
 func VectorSize(slotCount uint32) uint64 {
@@ -133,14 +175,15 @@ func ReadCell(buffer []byte) (Cell, error) {
 		return Cell{}, fmt.Errorf("buffer too small for feedback cell: %d", len(buffer))
 	}
 	return Cell{
-		State:        State(buffer[CellStateOffset]),
-		AccessKind:   AccessKind(buffer[CellAccessKindOffset]),
-		SlotKind:     SlotKind(buffer[CellSlotKindOffset]),
-		Flags:        buffer[CellFlagsOffset],
-		TableVersion: binary.LittleEndian.Uint32(buffer[CellTableVersionOffset : CellTableVersionOffset+4]),
-		CachedIndex:  binary.LittleEndian.Uint32(buffer[CellCachedIndexOffset : CellCachedIndexOffset+4]),
-		TableRef:     value.HeapRef44(binary.LittleEndian.Uint64(buffer[CellTableRefOffset : CellTableRefOffset+8])),
-		KeyBits:      value.Raw(binary.LittleEndian.Uint64(buffer[CellKeyBitsOffset : CellKeyBitsOffset+8])),
+		State:      State(buffer[CellStateOffset]),
+		AccessKind: AccessKind(buffer[CellAccessKindOffset]),
+		SlotKind:   SlotKind(buffer[CellSlotKindOffset]),
+		Flags:      buffer[CellFlagsOffset],
+		Payload32A: binary.LittleEndian.Uint32(buffer[CellPayload32AOffset : CellPayload32AOffset+4]),
+		Payload32B: binary.LittleEndian.Uint32(buffer[CellPayload32BOffset : CellPayload32BOffset+4]),
+		Payload32C: binary.LittleEndian.Uint32(buffer[CellPayload32COffset : CellPayload32COffset+4]),
+		HeapRef:    value.HeapRef44(binary.LittleEndian.Uint64(buffer[CellHeapRefOffset : CellHeapRefOffset+8])),
+		ValueBits:  value.Raw(binary.LittleEndian.Uint64(buffer[CellValueBitsOffset : CellValueBitsOffset+8])),
 	}, nil
 }
 
@@ -152,10 +195,10 @@ func WriteCell(buffer []byte, cell Cell) error {
 	buffer[CellAccessKindOffset] = byte(cell.AccessKind)
 	buffer[CellSlotKindOffset] = byte(cell.SlotKind)
 	buffer[CellFlagsOffset] = cell.Flags
-	binary.LittleEndian.PutUint32(buffer[CellTableVersionOffset:CellTableVersionOffset+4], cell.TableVersion)
-	binary.LittleEndian.PutUint32(buffer[CellCachedIndexOffset:CellCachedIndexOffset+4], cell.CachedIndex)
-	binary.LittleEndian.PutUint32(buffer[CellReservedOffset:CellReservedOffset+4], 0)
-	binary.LittleEndian.PutUint64(buffer[CellTableRefOffset:CellTableRefOffset+8], uint64(cell.TableRef))
-	binary.LittleEndian.PutUint64(buffer[CellKeyBitsOffset:CellKeyBitsOffset+8], uint64(cell.KeyBits))
+	binary.LittleEndian.PutUint32(buffer[CellPayload32AOffset:CellPayload32AOffset+4], cell.Payload32A)
+	binary.LittleEndian.PutUint32(buffer[CellPayload32BOffset:CellPayload32BOffset+4], cell.Payload32B)
+	binary.LittleEndian.PutUint32(buffer[CellPayload32COffset:CellPayload32COffset+4], cell.Payload32C)
+	binary.LittleEndian.PutUint64(buffer[CellHeapRefOffset:CellHeapRefOffset+8], uint64(cell.HeapRef))
+	binary.LittleEndian.PutUint64(buffer[CellValueBitsOffset:CellValueBitsOffset+8], uint64(cell.ValueBits))
 	return nil
 }
