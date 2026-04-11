@@ -4,43 +4,32 @@ import (
 	"fmt"
 
 	"vexlua/internal/bytecode"
+	"vexlua/internal/runtime/feedback"
 	"vexlua/internal/runtime/value"
 	"vexlua/internal/vexarc/codecache"
 	"vexlua/internal/vexarc/metadata"
 )
 
 const (
-	compiledStatusOK      = 0
-	compiledStatusYield   = 1
-	compiledStatusError   = 2
-	compiledStatusDeopt   = 3
-	compiledStatusSuspend = 4
-)
-
-type SuspendKind uint32
-
-const (
-	SuspendNone SuspendKind = iota
-	SuspendCall
-	SuspendForPrep
-	SuspendForLoop
+	compiledStatusOK    = 0
+	compiledStatusYield = 1
+	compiledStatusError = 2
+	compiledStatusDeopt = 3
+	compiledStatusStub  = 4
 )
 
 const (
-	execCtxResumePCOffset    = 0x00
-	execCtxSuspendKindOffset = 0x04
-	execCtxArg0Offset        = 0x08
-	execCtxArg1Offset        = 0x0C
-	execCtxArg2Offset        = 0x10
+	execCtxSiteIDOffset = 0x00
+	execCtxFlagsOffset  = 0x04
 )
 
 type executionContext struct {
-	ResumePC    uint32
-	SuspendKind uint32
-	Arg0        uint32
-	Arg1        uint32
-	Arg2        uint32
-	Reserved    uint32
+	SiteID    uint32
+	Flags     uint32
+	Reserved0 uint32
+	Reserved1 uint32
+	Reserved2 uint32
+	Reserved3 uint32
 }
 
 type CompiledCode struct {
@@ -48,6 +37,7 @@ type CompiledCode struct {
 	ProtoRef          value.HeapRef44
 	Block             *codecache.Block
 	Metadata          metadata.CodeMetadata
+	FeedbackLayout    *feedback.Layout
 	Entry             uintptr
 	Supported         bool
 	UnsupportedReason string
@@ -60,6 +50,31 @@ func (code *CompiledCode) EntryAtBytecode(bytecodeOffset int) (uintptr, error) {
 	offset, ok := code.Metadata.CodeOffset(bytecodeOffset)
 	if !ok {
 		return 0, fmt.Errorf("no code offset for bytecode %d", bytecodeOffset)
+	}
+	return code.Entry + uintptr(offset), nil
+}
+
+func (code *CompiledCode) ContinuationSite(siteID uint32) (metadata.ContinuationSite, error) {
+	if code == nil {
+		return metadata.ContinuationSite{}, fmt.Errorf("compiled code is nil")
+	}
+	site, ok := code.Metadata.ContinuationSite(siteID)
+	if !ok {
+		return metadata.ContinuationSite{}, fmt.Errorf("unknown continuation site %d", siteID)
+	}
+	return site, nil
+}
+
+func (code *CompiledCode) EntryAtSite(site metadata.ContinuationSite, alternate bool) (uintptr, error) {
+	if code == nil || !code.Supported || code.Block == nil {
+		return 0, fmt.Errorf("compiled code is not executable")
+	}
+	offset := site.ResumeCodeOffset
+	if alternate {
+		offset = site.AltResumeCodeOff
+	}
+	if offset == metadata.UnmappedOffset {
+		return 0, fmt.Errorf("continuation site %d has no compiled resume target", site.BytecodePC)
 	}
 	return code.Entry + uintptr(offset), nil
 }

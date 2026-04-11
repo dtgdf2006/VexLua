@@ -26,7 +26,7 @@ type allocationSpan struct {
 
 type page struct {
 	start uint64
-	data  []byte
+	size  uint64
 	used  uint64
 }
 
@@ -100,12 +100,19 @@ func (heap *Heap) Alloc(size uint64) (Allocation, error) {
 		page = heap.newPage(alignedSize)
 	}
 	off := page.start + page.used
+	if err := heap.native.EnsureCommitted(off + alignedSize); err != nil {
+		return Allocation{}, err
+	}
+	bytes, err := heap.native.Bytes(off, alignedSize)
+	if err != nil {
+		return Allocation{}, err
+	}
 	page.used += alignedSize
 	allocation := Allocation{
 		Offset:  value.HeapOff64(off),
 		Address: heap.base + uintptr(off),
 		Size:    alignedSize,
-		Bytes:   page.data[page.used-alignedSize : page.used],
+		Bytes:   bytes,
 	}
 	heap.allocations[allocation.Offset] = allocationSpan{start: off, size: alignedSize}
 	return allocation, nil
@@ -130,11 +137,15 @@ func (heap *Heap) Resolve(offset value.HeapOff64, size uint64) ([]byte, error) {
 	if offset == 0 {
 		return nil, fmt.Errorf("offset zero is reserved")
 	}
-	page, localOffset := heap.findPage(uint64(offset), size)
-	if page == nil {
+	if page, _ := heap.findPage(uint64(offset), size); page == nil {
 		return nil, fmt.Errorf("heap offset %#x is out of range", uint64(offset))
 	}
-	return page.data[localOffset : localOffset+size], nil
+	if size > 0 {
+		if err := heap.native.EnsureCommitted(uint64(offset) + size); err != nil {
+			return nil, err
+		}
+	}
+	return heap.native.Bytes(uint64(offset), size)
 }
 
 func (heap *Heap) AddressForOffset(offset value.HeapOff64) (uintptr, error) {
@@ -154,23 +165,7 @@ func (heap *Heap) NativeAddressForOffset(offset value.HeapOff64) (uintptr, error
 	if _, err := heap.Resolve(offset, 1); err != nil {
 		return 0, err
 	}
-	if err := heap.native.EnsureCommitted(uint64(offset) + 1); err != nil {
-		return 0, err
-	}
 	return heap.NativeBase() + uintptr(offset), nil
-}
-
-func (heap *Heap) ResolveNative(offset value.HeapOff64, size uint64) ([]byte, error) {
-	if offset == 0 {
-		return nil, fmt.Errorf("offset zero is reserved")
-	}
-	if _, err := heap.Resolve(offset, size); err != nil {
-		return nil, err
-	}
-	if err := heap.native.EnsureCommitted(uint64(offset) + size); err != nil {
-		return nil, err
-	}
-	return heap.native.Bytes(uint64(offset), size)
 }
 
 func (heap *Heap) OffsetForAddress(address uintptr) (value.HeapOff64, error) {
@@ -180,6 +175,20 @@ func (heap *Heap) OffsetForAddress(address uintptr) (value.HeapOff64, error) {
 	}
 	if offset == 0 {
 		return 0, fmt.Errorf("address %#x does not reference allocated heap memory", address)
+	}
+	if _, err := heap.Resolve(offset, 1); err != nil {
+		return 0, err
+	}
+	return offset, nil
+}
+
+func (heap *Heap) OffsetForNativeAddress(address uintptr) (value.HeapOff64, error) {
+	offset, err := value.EncodeHeapOff64(heap.NativeBase(), address)
+	if err != nil {
+		return 0, err
+	}
+	if offset == 0 {
+		return 0, fmt.Errorf("native address %#x does not reference allocated heap memory", address)
 	}
 	if _, err := heap.Resolve(offset, 1); err != nil {
 		return 0, err
@@ -247,27 +256,6 @@ func (heap *Heap) DecodeHeapRef(ref value.HeapRef44) (uintptr, error) {
 	return address, nil
 }
 
-func (heap *Heap) SyncNative(offset value.HeapOff64, bytes []byte) error {
-	if offset == 0 {
-		return fmt.Errorf("offset zero is reserved")
-	}
-	if len(bytes) == 0 {
-		return nil
-	}
-	if _, err := heap.Resolve(offset, uint64(len(bytes))); err != nil {
-		return err
-	}
-	if err := heap.native.EnsureCommitted(uint64(offset) + uint64(len(bytes))); err != nil {
-		return err
-	}
-	nativeBytes, err := heap.native.Bytes(uint64(offset), uint64(len(bytes)))
-	if err != nil {
-		return err
-	}
-	copy(nativeBytes, bytes)
-	return nil
-}
-
 func (heap *Heap) currentPage(size uint64) *page {
 	if len(heap.pages) == 0 {
 		return nil
@@ -287,10 +275,10 @@ func (heap *Heap) newPage(minSize uint64) *page {
 	start := alignUp(heap.nextPage, value.ObjectAlignment)
 	page := &page{
 		start: start,
-		data:  make([]byte, pageSize),
+		size:  pageSize,
 	}
 	heap.pages = append(heap.pages, page)
-	heap.nextPage = start + uint64(len(page.data))
+	heap.nextPage = start + page.size
 	return page
 }
 
@@ -312,7 +300,7 @@ func (heap *Heap) findPage(offset uint64, size uint64) (*page, uint64) {
 }
 
 func (page *page) remaining() uint64 {
-	return uint64(len(page.data)) - page.used
+	return page.size - page.used
 }
 
 func alignUp(valueToAlign uint64, alignment uint64) uint64 {

@@ -3,12 +3,79 @@ package table
 import (
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"testing"
+	"unsafe"
 
 	"vexlua/internal/runtime/heap"
 	rtstring "vexlua/internal/runtime/string"
 	"vexlua/internal/runtime/value"
 )
+
+func TestTableObjectLayoutContract(t *testing.T) {
+	object := NewObject(0xCAFEBABE)
+	object.Flags = FlagHasMetatable | FlagHasArrayPart | FlagHasHashPart
+	object.ShapeID = 9
+	object.TableVersion = 17
+	object.Metatable = value.BoolValue(true)
+	object.ArrayData = value.HeapOff64(0x1110)
+	object.ArrayLenHint = 3
+	object.ArrayCap = 4
+	object.CtrlData = value.HeapOff64(0x2220)
+	object.EntriesData = value.HeapOff64(0x3330)
+	object.HashCount = 2
+	object.HashCapacity = 16
+	object.GrowthLeft = 11
+	buffer := make([]byte, ObjectSize)
+	if err := WriteObject(buffer, object); err != nil {
+		t.Fatalf("write table object: %v", err)
+	}
+	if got := Flags(binary.LittleEndian.Uint32(buffer[FlagsOffset : FlagsOffset+4])); got != object.Flags {
+		t.Fatalf("flags = %#x, want %#x", uint32(got), uint32(object.Flags))
+	}
+	if got := binary.LittleEndian.Uint32(buffer[ShapeIDOffset : ShapeIDOffset+4]); got != object.ShapeID {
+		t.Fatalf("shape id = %d, want %d", got, object.ShapeID)
+	}
+	if got := binary.LittleEndian.Uint32(buffer[TableVersionOffset : TableVersionOffset+4]); got != object.TableVersion {
+		t.Fatalf("table version = %d, want %d", got, object.TableVersion)
+	}
+	if got := binary.LittleEndian.Uint32(buffer[Reserved0Offset : Reserved0Offset+4]); got != 0 {
+		t.Fatalf("reserved0 = %#x, want 0", got)
+	}
+	if got := value.Raw(binary.LittleEndian.Uint64(buffer[MetatableOffset : MetatableOffset+8])); got != object.Metatable.Bits() {
+		t.Fatalf("metatable bits = %#x, want %#x", uint64(got), uint64(object.Metatable.Bits()))
+	}
+	if got := value.HeapOff64(binary.LittleEndian.Uint64(buffer[ArrayDataOffset : ArrayDataOffset+8])); got != object.ArrayData {
+		t.Fatalf("array data = %#x, want %#x", uint64(got), uint64(object.ArrayData))
+	}
+	if got := binary.LittleEndian.Uint32(buffer[ArrayLenHintOffset : ArrayLenHintOffset+4]); got != object.ArrayLenHint {
+		t.Fatalf("array len hint = %d, want %d", got, object.ArrayLenHint)
+	}
+	if got := binary.LittleEndian.Uint32(buffer[ArrayCapOffset : ArrayCapOffset+4]); got != object.ArrayCap {
+		t.Fatalf("array cap = %d, want %d", got, object.ArrayCap)
+	}
+	if got := value.HeapOff64(binary.LittleEndian.Uint64(buffer[CtrlDataOffset : CtrlDataOffset+8])); got != object.CtrlData {
+		t.Fatalf("ctrl data = %#x, want %#x", uint64(got), uint64(object.CtrlData))
+	}
+	if got := value.HeapOff64(binary.LittleEndian.Uint64(buffer[EntriesDataOffset : EntriesDataOffset+8])); got != object.EntriesData {
+		t.Fatalf("entries data = %#x, want %#x", uint64(got), uint64(object.EntriesData))
+	}
+	if got := binary.LittleEndian.Uint32(buffer[HashCountOffset : HashCountOffset+4]); got != object.HashCount {
+		t.Fatalf("hash count = %d, want %d", got, object.HashCount)
+	}
+	if got := binary.LittleEndian.Uint32(buffer[HashCapacityOffset : HashCapacityOffset+4]); got != object.HashCapacity {
+		t.Fatalf("hash capacity = %d, want %d", got, object.HashCapacity)
+	}
+	if got := binary.LittleEndian.Uint32(buffer[GrowthLeftOffset : GrowthLeftOffset+4]); got != object.GrowthLeft {
+		t.Fatalf("growth left = %d, want %d", got, object.GrowthLeft)
+	}
+	if got := binary.LittleEndian.Uint32(buffer[HashSeedOffset : HashSeedOffset+4]); got != object.HashSeed {
+		t.Fatalf("hash seed = %#x, want %#x", got, object.HashSeed)
+	}
+	if got := binary.LittleEndian.Uint64(buffer[Reserved1Offset : Reserved1Offset+8]); got != 0 {
+		t.Fatalf("reserved1 = %#x, want 0", got)
+	}
+}
 
 func TestArrayPartReadWriteAndLenHint(t *testing.T) {
 	runtimeHeap := heap.MustNew(0, 0)
@@ -269,4 +336,255 @@ func TestTableObjectExposesNativeArrayAndHashRegions(t *testing.T) {
 func nativeTValueAt(buffer []byte, index int) value.TValue {
 	offset := index * value.TValueSize
 	return value.FromRaw(value.Raw(binary.LittleEndian.Uint64(buffer[offset : offset+value.TValueSize])))
+}
+
+func TestDescribeFastAccessForArrayAndHash(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	strings := rtstring.NewInternTable(runtimeHeap, 0x12345678)
+	tables := NewStore(runtimeHeap)
+	handle, err := tables.New(0, 0)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	keyHandle, err := strings.Intern("answer")
+	if err != nil {
+		t.Fatalf("intern key: %v", err)
+	}
+	if err := tables.Set(handle.Ref, value.NumberValue(1), value.NumberValue(10)); err != nil {
+		t.Fatalf("set array key: %v", err)
+	}
+	if err := tables.Set(handle.Ref, keyHandle.Value, value.NumberValue(42)); err != nil {
+		t.Fatalf("set hash key: %v", err)
+	}
+	arrayAccess, ok, err := tables.DescribeFastGet(handle.Ref, value.NumberValue(1))
+	if err != nil {
+		t.Fatalf("describe array get: %v", err)
+	}
+	if !ok || arrayAccess.Kind != FastAccessArray || arrayAccess.SlotIndex != 0 {
+		t.Fatalf("unexpected array fast access: %+v ok=%t", arrayAccess, ok)
+	}
+	hashAccess, ok, err := tables.DescribeFastGet(handle.Ref, keyHandle.Value)
+	if err != nil {
+		t.Fatalf("describe hash get: %v", err)
+	}
+	if !ok || hashAccess.Kind != FastAccessHash {
+		t.Fatalf("unexpected hash fast access: %+v ok=%t", hashAccess, ok)
+	}
+	storeAccess, ok, err := tables.DescribeFastSet(handle.Ref, keyHandle.Value, value.NumberValue(84))
+	if err != nil {
+		t.Fatalf("describe hash set: %v", err)
+	}
+	if !ok || storeAccess.Kind != FastAccessHash || storeAccess.SlotIndex != hashAccess.SlotIndex {
+		t.Fatalf("unexpected hash set fast access: %+v ok=%t", storeAccess, ok)
+	}
+	blockedHandle, err := strings.Intern("meta")
+	if err != nil {
+		t.Fatalf("intern metatable key: %v", err)
+	}
+	if err := tables.SetMetatable(handle.Ref, blockedHandle.Value); err != nil {
+		t.Fatalf("set metatable: %v", err)
+	}
+	if _, ok, err := tables.DescribeFastGet(handle.Ref, keyHandle.Value); err != nil {
+		t.Fatalf("describe blocked hash get: %v", err)
+	} else if ok {
+		t.Fatalf("blocked table should not expose fast get access")
+	}
+}
+
+func TestTableUsesSingleCanonicalBytes(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	strings := rtstring.NewInternTable(runtimeHeap, 0x87654321)
+	tables := NewStore(runtimeHeap)
+	handle, err := tables.New(0, 0)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	keyHandle, err := strings.Intern("answer")
+	if err != nil {
+		t.Fatalf("intern key: %v", err)
+	}
+	if err := tables.Set(handle.Ref, value.NumberValue(1), value.NumberValue(10)); err != nil {
+		t.Fatalf("set array value: %v", err)
+	}
+	if err := tables.Set(handle.Ref, keyHandle.Value, value.NumberValue(42)); err != nil {
+		t.Fatalf("set hash value: %v", err)
+	}
+	object, err := tables.Object(handle.Ref)
+	if err != nil {
+		t.Fatalf("read table object: %v", err)
+	}
+	logicalObject, err := runtimeHeap.Resolve(mustOffsetForRef(t, runtimeHeap, handle.Ref), ObjectSize)
+	if err != nil {
+		t.Fatalf("resolve canonical object: %v", err)
+	}
+	nativeObjectAddress, err := runtimeHeap.NativeAddressForOffset(mustOffsetForRef(t, runtimeHeap, handle.Ref))
+	if err != nil {
+		t.Fatalf("resolve native object address: %v", err)
+	}
+	if uintptr(unsafe.Pointer(&logicalObject[0])) != nativeObjectAddress {
+		t.Fatalf("table object bytes base %#x, want %#x", uintptr(unsafe.Pointer(&logicalObject[0])), nativeObjectAddress)
+	}
+	decodedObject, err := ReadObject(logicalObject)
+	if err != nil {
+		t.Fatalf("read canonical object: %v", err)
+	}
+	if decodedObject.ArrayData != object.ArrayData || decodedObject.EntriesData != object.EntriesData {
+		t.Fatalf("native object layout mismatch: native=%+v logical=%+v", decodedObject, object)
+	}
+	arrayBytes, err := runtimeHeap.Resolve(object.ArrayData, uint64(object.ArrayCap)*value.TValueSize)
+	if err != nil {
+		t.Fatalf("resolve array region: %v", err)
+	}
+	arrayAddress, err := runtimeHeap.NativeAddressForOffset(object.ArrayData)
+	if err != nil {
+		t.Fatalf("resolve array native address: %v", err)
+	}
+	if uintptr(unsafe.Pointer(&arrayBytes[0])) != arrayAddress {
+		t.Fatalf("table array bytes base %#x, want %#x", uintptr(unsafe.Pointer(&arrayBytes[0])), arrayAddress)
+	}
+	if got := nativeTValueAt(arrayBytes, 0); got.Bits() != value.NumberValue(10).Bits() {
+		t.Fatalf("native array slot = %s, want %s", got, value.NumberValue(10))
+	}
+	entriesBytes, err := runtimeHeap.Resolve(object.EntriesData, uint64(object.HashCapacity)*EntrySize)
+	if err != nil {
+		t.Fatalf("resolve entries region: %v", err)
+	}
+	entriesAddress, err := runtimeHeap.NativeAddressForOffset(object.EntriesData)
+	if err != nil {
+		t.Fatalf("resolve entries native address: %v", err)
+	}
+	if uintptr(unsafe.Pointer(&entriesBytes[0])) != entriesAddress {
+		t.Fatalf("table entries bytes base %#x, want %#x", uintptr(unsafe.Pointer(&entriesBytes[0])), entriesAddress)
+	}
+	ctrlBytes, err := runtimeHeap.Resolve(object.CtrlData, uint64(object.HashCapacity)+1)
+	if err != nil {
+		t.Fatalf("resolve ctrl region: %v", err)
+	}
+	ctrlAddress, err := runtimeHeap.NativeAddressForOffset(object.CtrlData)
+	if err != nil {
+		t.Fatalf("resolve ctrl native address: %v", err)
+	}
+	if uintptr(unsafe.Pointer(&ctrlBytes[0])) != ctrlAddress {
+		t.Fatalf("table ctrl bytes base %#x, want %#x", uintptr(unsafe.Pointer(&ctrlBytes[0])), ctrlAddress)
+	}
+	if !nativeHashContains(t, entriesBytes, ctrlBytes, object.HashCapacity, keyHandle.Value, value.NumberValue(42)) {
+		t.Fatalf("native hash region missing expected entry")
+	}
+	if err := tables.Set(handle.Ref, keyHandle.Value, value.NumberValue(84)); err != nil {
+		t.Fatalf("overwrite hash value: %v", err)
+	}
+	entriesBytes, err = runtimeHeap.Resolve(object.EntriesData, uint64(object.HashCapacity)*EntrySize)
+	if err != nil {
+		t.Fatalf("resolve entries after overwrite: %v", err)
+	}
+	if !nativeHashContains(t, entriesBytes, ctrlBytes, object.HashCapacity, keyHandle.Value, value.NumberValue(84)) {
+		t.Fatalf("native hash region did not reflect overwritten value")
+	}
+}
+
+func TestTableNativeAddressesStayStableAcrossHeapGrowthAndGC(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	strings := rtstring.NewInternTable(runtimeHeap, 0xABCDEF01)
+	tables := NewStore(runtimeHeap)
+	handle, err := tables.New(0, 0)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	keyHandle, err := strings.Intern("answer")
+	if err != nil {
+		t.Fatalf("intern key: %v", err)
+	}
+	if err := tables.Set(handle.Ref, value.NumberValue(1), value.NumberValue(10)); err != nil {
+		t.Fatalf("set array value: %v", err)
+	}
+	if err := tables.Set(handle.Ref, keyHandle.Value, value.NumberValue(42)); err != nil {
+		t.Fatalf("set hash value: %v", err)
+	}
+	object, err := tables.Object(handle.Ref)
+	if err != nil {
+		t.Fatalf("read table object: %v", err)
+	}
+	arrayAddrBefore, err := runtimeHeap.NativeAddressForOffset(object.ArrayData)
+	if err != nil {
+		t.Fatalf("native array address: %v", err)
+	}
+	ctrlAddrBefore, err := runtimeHeap.NativeAddressForOffset(object.CtrlData)
+	if err != nil {
+		t.Fatalf("native ctrl address: %v", err)
+	}
+	entriesAddrBefore, err := runtimeHeap.NativeAddressForOffset(object.EntriesData)
+	if err != nil {
+		t.Fatalf("native entries address: %v", err)
+	}
+	for index := 0; index < 512; index++ {
+		grown, err := tables.New(0, 0)
+		if err != nil {
+			t.Fatalf("grow table %d: %v", index, err)
+		}
+		key, err := strings.Intern(fmt.Sprintf("grow-%03d", index))
+		if err != nil {
+			t.Fatalf("intern grow key %d: %v", index, err)
+		}
+		if err := tables.Set(grown.Ref, value.NumberValue(1), value.NumberValue(float64(index))); err != nil {
+			t.Fatalf("set grow array %d: %v", index, err)
+		}
+		if err := tables.Set(grown.Ref, key.Value, value.NumberValue(float64(index))); err != nil {
+			t.Fatalf("set grow hash %d: %v", index, err)
+		}
+	}
+	runtime.GC()
+	arrayAddrAfter, err := runtimeHeap.NativeAddressForOffset(object.ArrayData)
+	if err != nil {
+		t.Fatalf("native array address after growth: %v", err)
+	}
+	ctrlAddrAfter, err := runtimeHeap.NativeAddressForOffset(object.CtrlData)
+	if err != nil {
+		t.Fatalf("native ctrl address after growth: %v", err)
+	}
+	entriesAddrAfter, err := runtimeHeap.NativeAddressForOffset(object.EntriesData)
+	if err != nil {
+		t.Fatalf("native entries address after growth: %v", err)
+	}
+	if arrayAddrBefore != arrayAddrAfter || ctrlAddrBefore != ctrlAddrAfter || entriesAddrBefore != entriesAddrAfter {
+		t.Fatalf("native addresses changed across heap growth/GC: array %#x->%#x ctrl %#x->%#x entries %#x->%#x", arrayAddrBefore, arrayAddrAfter, ctrlAddrBefore, ctrlAddrAfter, entriesAddrBefore, entriesAddrAfter)
+	}
+	arrayBytes, err := runtimeHeap.Resolve(object.ArrayData, uint64(object.ArrayCap)*value.TValueSize)
+	if err != nil {
+		t.Fatalf("resolve array after growth: %v", err)
+	}
+	if got := nativeTValueAt(arrayBytes, 0); got.Bits() != value.NumberValue(10).Bits() {
+		t.Fatalf("native array slot after growth = %s, want %s", got, value.NumberValue(10))
+	}
+}
+
+func mustOffsetForRef(t *testing.T, runtimeHeap *heap.Heap, ref value.HeapRef44) value.HeapOff64 {
+	t.Helper()
+	address, err := runtimeHeap.DecodeHeapRef(ref)
+	if err != nil {
+		t.Fatalf("decode heap ref %#x: %v", uint64(ref), err)
+	}
+	offset, err := runtimeHeap.OffsetForAddress(address)
+	if err != nil {
+		t.Fatalf("offset for heap ref %#x: %v", uint64(ref), err)
+	}
+	return offset
+}
+
+func nativeHashContains(t *testing.T, entries []byte, ctrl []byte, capacity uint32, key value.TValue, want value.TValue) bool {
+	t.Helper()
+	for slot := uint32(0); slot < capacity; slot++ {
+		switch ctrl[slot] {
+		case CtrlEmpty, CtrlDeleted, CtrlSentinel:
+			continue
+		}
+		start := int(slot) * EntrySize
+		entry, err := ReadEntry(entries[start : start+EntrySize])
+		if err != nil {
+			t.Fatalf("read native entry %d: %v", slot, err)
+		}
+		if entry.Key.Bits() == key.Bits() && entry.Value.Bits() == want.Bits() {
+			return true
+		}
+	}
+	return false
 }

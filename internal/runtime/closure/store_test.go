@@ -3,14 +3,54 @@ package closure
 import (
 	"encoding/binary"
 	"testing"
+	"unsafe"
 
 	"vexlua/internal/bytecode"
+	"vexlua/internal/runtime/feedback"
 	"vexlua/internal/runtime/heap"
 	rproto "vexlua/internal/runtime/proto"
 	"vexlua/internal/runtime/state"
 	"vexlua/internal/runtime/upvalue"
 	"vexlua/internal/runtime/value"
 )
+
+func TestClosureObjectLayoutContract(t *testing.T) {
+	object := NewObject(value.BoolValue(true), value.NumberValue(3), 2, value.HeapOff64(0x1122334455667788))
+	object.Flags = 0x55AA
+	object.FeedbackData = value.HeapOff64(0x8877665544332211)
+	object.FeedbackSize = 7
+	buffer := make([]byte, ObjectSize)
+	if err := WriteObject(buffer, object); err != nil {
+		t.Fatalf("write closure object: %v", err)
+	}
+	if got := value.Raw(binary.LittleEndian.Uint64(buffer[ProtoOffset : ProtoOffset+8])); got != object.Proto.Bits() {
+		t.Fatalf("proto bits = %#x, want %#x", uint64(got), uint64(object.Proto.Bits()))
+	}
+	if got := value.Raw(binary.LittleEndian.Uint64(buffer[EnvOffset : EnvOffset+8])); got != object.Env.Bits() {
+		t.Fatalf("env bits = %#x, want %#x", uint64(got), uint64(object.Env.Bits()))
+	}
+	if got := binary.LittleEndian.Uint16(buffer[UpvalueCountOffset : UpvalueCountOffset+2]); got != object.UpvalueCount {
+		t.Fatalf("upvalue count = %d, want %d", got, object.UpvalueCount)
+	}
+	if got := binary.LittleEndian.Uint16(buffer[FlagsOffset : FlagsOffset+2]); got != object.Flags {
+		t.Fatalf("flags = %#x, want %#x", got, object.Flags)
+	}
+	if got := binary.LittleEndian.Uint32(buffer[Reserved0Offset : Reserved0Offset+4]); got != 0 {
+		t.Fatalf("reserved0 = %#x, want 0", got)
+	}
+	if got := value.HeapOff64(binary.LittleEndian.Uint64(buffer[UpvaluesDataOffset : UpvaluesDataOffset+8])); got != object.UpvaluesData {
+		t.Fatalf("upvalues data = %#x, want %#x", uint64(got), uint64(object.UpvaluesData))
+	}
+	if got := value.HeapOff64(binary.LittleEndian.Uint64(buffer[FeedbackVectorOff : FeedbackVectorOff+8])); got != object.FeedbackData {
+		t.Fatalf("feedback data = %#x, want %#x", uint64(got), uint64(object.FeedbackData))
+	}
+	if got := binary.LittleEndian.Uint32(buffer[FeedbackSlotsOff : FeedbackSlotsOff+4]); got != object.FeedbackSize {
+		t.Fatalf("feedback slots = %d, want %d", got, object.FeedbackSize)
+	}
+	if got := binary.LittleEndian.Uint32(buffer[Reserved2Offset : Reserved2Offset+4]); got != 0 {
+		t.Fatalf("reserved2 = %#x, want 0", got)
+	}
+}
 
 func TestClosureProtoBridgeAndUpvalueLifecycle(t *testing.T) {
 	runtimeHeap := heap.MustNew(0, 0)
@@ -21,7 +61,7 @@ func TestClosureProtoBridgeAndUpvalueLifecycle(t *testing.T) {
 	}
 	protos := rproto.NewStore(runtimeHeap)
 	closures := NewStore(runtimeHeap, protos)
-	upvalues := upvalue.NewManager(runtimeHeap)
+	upvalues := upvalue.NewManager(runtimeHeap, vm)
 
 	slot, err := thread.SlotAddress(4)
 	if err != nil {
@@ -129,7 +169,7 @@ func TestClosureExposesNativeEnvProtoAndUpvalueVector(t *testing.T) {
 	}
 	protos := rproto.NewStore(runtimeHeap)
 	closures := NewStore(runtimeHeap, protos)
-	upvalues := upvalue.NewManager(runtimeHeap)
+	upvalues := upvalue.NewManager(runtimeHeap, vm)
 	firstSlot, err := thread.SlotAddress(2)
 	if err != nil {
 		t.Fatalf("first slot address: %v", err)
@@ -213,6 +253,13 @@ func TestClosureExposesNativeEnvProtoAndUpvalueVector(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve closure bytes: %v", err)
 	}
+	nativeAddress, err := runtimeHeap.NativeAddressForOffset(offset)
+	if err != nil {
+		t.Fatalf("resolve closure native address: %v", err)
+	}
+	if uintptr(unsafe.Pointer(&bytes[0])) != nativeAddress {
+		t.Fatalf("closure object bytes base %#x, want %#x", uintptr(unsafe.Pointer(&bytes[0])), nativeAddress)
+	}
 	if got := value.Raw(binary.LittleEndian.Uint64(bytes[ProtoOffset : ProtoOffset+8])); got != protoHandle.Value.Bits() {
 		t.Fatalf("closure proto bits = %#x, want %#x", uint64(got), uint64(protoHandle.Value.Bits()))
 	}
@@ -221,5 +268,95 @@ func TestClosureExposesNativeEnvProtoAndUpvalueVector(t *testing.T) {
 	}
 	if got := value.HeapOff64(binary.LittleEndian.Uint64(bytes[UpvaluesDataOffset : UpvaluesDataOffset+8])); got != object.UpvaluesData {
 		t.Fatalf("closure upvalue data = %#x, want %#x", uint64(got), uint64(object.UpvaluesData))
+	}
+	upvalueBytes, err := runtimeHeap.Resolve(object.UpvaluesData, uint64(object.UpvalueCount)*8)
+	if err != nil {
+		t.Fatalf("resolve canonical upvalue vector: %v", err)
+	}
+	nativeUpvalueAddress, err := runtimeHeap.NativeAddressForOffset(object.UpvaluesData)
+	if err != nil {
+		t.Fatalf("resolve upvalue vector native address: %v", err)
+	}
+	if uintptr(unsafe.Pointer(&upvalueBytes[0])) != nativeUpvalueAddress {
+		t.Fatalf("closure upvalue vector bytes base %#x, want %#x", uintptr(unsafe.Pointer(&upvalueBytes[0])), nativeUpvalueAddress)
+	}
+}
+
+func TestClosureFeedbackVectorUsesNativeHeapLayout(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	protos := rproto.NewStore(runtimeHeap)
+	closures := NewStore(runtimeHeap, protos)
+	proto := &bytecode.Proto{
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	env := value.NilValue()
+	closureHandle, err := closures.NewLuaClosure(proto, env, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	layout := feedback.LayoutForProto(proto)
+	base, err := closures.EnsureFeedbackVector(closureHandle.Ref, layout)
+	if err != nil {
+		t.Fatalf("ensure feedback vector: %v", err)
+	}
+	if base == 0 {
+		t.Fatalf("feedback vector base should not be zero")
+	}
+	object, err := closures.Object(closureHandle.Ref)
+	if err != nil {
+		t.Fatalf("read closure object: %v", err)
+	}
+	if object.FeedbackData == 0 || object.FeedbackSize != layout.SlotCount() {
+		t.Fatalf("unexpected closure feedback metadata: offset=%#x slots=%d", uint64(object.FeedbackData), object.FeedbackSize)
+	}
+	expectedBase, err := runtimeHeap.NativeAddressForOffset(object.FeedbackData)
+	if err != nil {
+		t.Fatalf("resolve feedback base: %v", err)
+	}
+	if base != expectedBase {
+		t.Fatalf("feedback base %#x, want %#x", base, expectedBase)
+	}
+	header, err := closures.ReadFeedbackHeader(closureHandle.Ref)
+	if err != nil {
+		t.Fatalf("read feedback header: %v", err)
+	}
+	if header.SlotCount != layout.SlotCount() {
+		t.Fatalf("feedback slot count = %d, want %d", header.SlotCount, layout.SlotCount())
+	}
+	cell, err := closures.ReadFeedbackCell(closureHandle.Ref, 0)
+	if err != nil {
+		t.Fatalf("read feedback cell: %v", err)
+	}
+	if cell.State != feedback.StateGeneric || cell.SlotKind != feedback.SlotGetGlobal {
+		t.Fatalf("unexpected initial feedback cell: %+v", cell)
+	}
+	feedbackBytes, err := runtimeHeap.Resolve(object.FeedbackData, feedback.VectorSize(layout.SlotCount()))
+	if err != nil {
+		t.Fatalf("resolve canonical feedback vector: %v", err)
+	}
+	nativeFeedbackAddress, err := runtimeHeap.NativeAddressForOffset(object.FeedbackData)
+	if err != nil {
+		t.Fatalf("resolve feedback native address: %v", err)
+	}
+	if uintptr(unsafe.Pointer(&feedbackBytes[0])) != nativeFeedbackAddress {
+		t.Fatalf("feedback vector bytes base %#x, want %#x", uintptr(unsafe.Pointer(&feedbackBytes[0])), nativeFeedbackAddress)
+	}
+	updated := feedback.NewMegamorphicCell(feedback.SlotGetGlobal)
+	if err := closures.WriteFeedbackCell(closureHandle.Ref, 0, updated); err != nil {
+		t.Fatalf("write feedback cell: %v", err)
+	}
+	cellBytes, err := runtimeHeap.Resolve(object.FeedbackData+value.HeapOff64(feedback.CellOffset(0)), feedback.CellSize)
+	if err != nil {
+		t.Fatalf("resolve feedback cell: %v", err)
+	}
+	decodedCell, err := feedback.ReadCell(cellBytes)
+	if err != nil {
+		t.Fatalf("decode feedback cell: %v", err)
+	}
+	if decodedCell != updated {
+		t.Fatalf("feedback cell = %+v, want %+v", decodedCell, updated)
 	}
 }

@@ -89,6 +89,25 @@ func TestHeapAddressAndReferenceRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHeapNativeAddressRoundTrip(t *testing.T) {
+	h := heap.MustNew(heap.DefaultHeapBase, 64)
+	alloc, err := h.AllocObject(value.CommonHeader{Kind: value.KindProto, SizeBytes: value.CommonHeaderSize})
+	if err != nil {
+		t.Fatalf("unexpected allocation error: %v", err)
+	}
+	nativeAddress, err := h.NativeAddressForOffset(alloc.Offset)
+	if err != nil {
+		t.Fatalf("unexpected native address error: %v", err)
+	}
+	offset, err := h.OffsetForNativeAddress(nativeAddress)
+	if err != nil {
+		t.Fatalf("unexpected native offset error: %v", err)
+	}
+	if offset != alloc.Offset {
+		t.Fatalf("unexpected native offset round-trip: %#x != %#x", uint64(offset), uint64(alloc.Offset))
+	}
+}
+
 func TestHeapAllocCrossesPagesWhenNeeded(t *testing.T) {
 	h := heap.MustNew(heap.DefaultHeapBase, 32)
 	first, err := h.AllocObject(value.CommonHeader{Kind: value.KindString, SizeBytes: 0x20})
@@ -107,15 +126,16 @@ func TestHeapAllocCrossesPagesWhenNeeded(t *testing.T) {
 	}
 }
 
-func TestHeapSyncsNativeMirrorAtLogicalOffset(t *testing.T) {
+func TestHeapResolveReturnsCanonicalNativeBytes(t *testing.T) {
 	h := heap.MustNew(heap.DefaultHeapBase, 64)
 	alloc, err := h.AllocObject(value.CommonHeader{Kind: value.KindProto, SizeBytes: 0x20})
 	if err != nil {
 		t.Fatalf("unexpected allocation error: %v", err)
 	}
 	copy(alloc.Bytes[:8], []byte{1, 2, 3, 4, 5, 6, 7, 8})
-	if err := h.SyncNative(alloc.Offset, alloc.Bytes); err != nil {
-		t.Fatalf("sync native mirror: %v", err)
+	resolvedBytes, err := h.Resolve(alloc.Offset, 8)
+	if err != nil {
+		t.Fatalf("resolve bytes: %v", err)
 	}
 	nativeAddress, err := h.NativeAddressForOffset(alloc.Offset)
 	if err != nil {
@@ -124,14 +144,24 @@ func TestHeapSyncsNativeMirrorAtLogicalOffset(t *testing.T) {
 	if nativeAddress%value.ObjectAlignment != 0 {
 		t.Fatalf("native address is not aligned: %#x", nativeAddress)
 	}
-	nativeBytes, err := h.ResolveNative(alloc.Offset, 8)
+	if uintptr(unsafe.Pointer(&alloc.Bytes[0])) != nativeAddress {
+		t.Fatalf("allocation bytes base mismatch: got %#x want %#x", uintptr(unsafe.Pointer(&alloc.Bytes[0])), nativeAddress)
+	}
+	if uintptr(unsafe.Pointer(&resolvedBytes[0])) != nativeAddress {
+		t.Fatalf("resolved bytes base mismatch: got %#x want %#x", uintptr(unsafe.Pointer(&resolvedBytes[0])), nativeAddress)
+	}
+	resolvedBytes[0] = 9
+	nativeBytes, err := h.Resolve(alloc.Offset, 8)
 	if err != nil {
-		t.Fatalf("resolve native bytes: %v", err)
+		t.Fatalf("resolve canonical bytes after write: %v", err)
+	}
+	if alloc.Bytes[0] != 9 || nativeBytes[0] != 9 {
+		t.Fatalf("canonical bytes diverged after resolve write: alloc=%d native=%d", alloc.Bytes[0], nativeBytes[0])
 	}
 	var got [8]byte
 	copy(got[:], nativeBytes)
-	if got != [8]byte{1, 2, 3, 4, 5, 6, 7, 8} {
-		t.Fatalf("native mirror bytes = %v, want [1 2 3 4 5 6 7 8]", got)
+	if got != [8]byte{9, 2, 3, 4, 5, 6, 7, 8} {
+		t.Fatalf("canonical native bytes = %v, want [9 2 3 4 5 6 7 8]", got)
 	}
 	if nativeAddress-uintptr(alloc.Offset) != h.NativeBase() {
 		t.Fatalf("native base mismatch: address=%#x offset=%#x base=%#x", nativeAddress, uint64(alloc.Offset), h.NativeBase())
@@ -145,18 +175,12 @@ func TestHeapNativeBaseRemainsStableAcrossCommitGrowth(t *testing.T) {
 		t.Fatalf("first allocation: %v", err)
 	}
 	copy(first.Bytes[:8], []byte{1, 3, 5, 7, 9, 11, 13, 15})
-	if err := h.SyncNative(first.Offset, first.Bytes); err != nil {
-		t.Fatalf("sync first allocation: %v", err)
-	}
 	base := h.NativeBase()
 	large, err := h.Alloc(256 * 1024)
 	if err != nil {
 		t.Fatalf("large allocation: %v", err)
 	}
 	copy(large.Bytes[:8], []byte{2, 4, 6, 8, 10, 12, 14, 16})
-	if err := h.SyncNative(large.Offset, large.Bytes); err != nil {
-		t.Fatalf("sync large allocation: %v", err)
-	}
 	if h.NativeBase() != base {
 		t.Fatalf("native base changed across commit growth: got %#x want %#x", h.NativeBase(), base)
 	}
@@ -169,30 +193,22 @@ func TestHeapNativeAddressRemainsValidAfterCommitGrowth(t *testing.T) {
 		t.Fatalf("first allocation: %v", err)
 	}
 	copy(first.Bytes[:8], []byte{42, 41, 40, 39, 38, 37, 36, 35})
-	if err := h.SyncNative(first.Offset, first.Bytes); err != nil {
-		t.Fatalf("sync first allocation: %v", err)
-	}
-	nativeBytes, err := h.ResolveNative(first.Offset, 8)
-	if err != nil {
-		t.Fatalf("resolve native bytes: %v", err)
-	}
 	nativeAddress, err := h.NativeAddressForOffset(first.Offset)
 	if err != nil {
 		t.Fatalf("native address: %v", err)
 	}
-	nativePtr := unsafe.Pointer(&nativeBytes[0])
-	if uintptr(nativePtr) != nativeAddress {
-		t.Fatalf("native pointer mismatch: ptr=%#x address=%#x", uintptr(nativePtr), nativeAddress)
+	bytesAtAddress, err := h.Resolve(first.Offset, 8)
+	if err != nil {
+		t.Fatalf("resolve original bytes: %v", err)
+	}
+	if uintptr(unsafe.Pointer(&bytesAtAddress[0])) != nativeAddress {
+		t.Fatalf("native pointer mismatch: ptr=%#x address=%#x", uintptr(unsafe.Pointer(&bytesAtAddress[0])), nativeAddress)
 	}
 	large, err := h.Alloc(256 * 1024)
 	if err != nil {
 		t.Fatalf("large allocation: %v", err)
 	}
 	copy(large.Bytes[:8], []byte{1, 1, 2, 3, 5, 8, 13, 21})
-	if err := h.SyncNative(large.Offset, large.Bytes); err != nil {
-		t.Fatalf("sync large allocation: %v", err)
-	}
-	bytesAtAddress := unsafe.Slice((*byte)(nativePtr), 8)
 	var got [8]byte
 	copy(got[:], bytesAtAddress)
 	if got != [8]byte{42, 41, 40, 39, 38, 37, 36, 35} {
@@ -207,24 +223,19 @@ func TestHeapPublishedNativeAddressesSurviveGC(t *testing.T) {
 		t.Fatalf("allocation: %v", err)
 	}
 	copy(alloc.Bytes[:8], []byte{9, 8, 7, 6, 5, 4, 3, 2})
-	if err := h.SyncNative(alloc.Offset, alloc.Bytes); err != nil {
-		t.Fatalf("sync allocation: %v", err)
-	}
-	nativeBytes, err := h.ResolveNative(alloc.Offset, 8)
-	if err != nil {
-		t.Fatalf("resolve native bytes: %v", err)
-	}
 	base := h.NativeBase()
 	nativeAddress, err := h.NativeAddressForOffset(alloc.Offset)
 	if err != nil {
 		t.Fatalf("native address: %v", err)
 	}
-	nativePtr := unsafe.Pointer(&nativeBytes[0])
 	runtime.GC()
 	if h.NativeBase() != base {
 		t.Fatalf("native base changed after GC: got %#x want %#x", h.NativeBase(), base)
 	}
-	bytesAtAddress := unsafe.Slice((*byte)(nativePtr), 8)
+	bytesAtAddress, err := h.Resolve(alloc.Offset, 8)
+	if err != nil {
+		t.Fatalf("resolve allocation bytes after GC: %v", err)
+	}
 	var got [8]byte
 	copy(got[:], bytesAtAddress)
 	if got != [8]byte{9, 8, 7, 6, 5, 4, 3, 2} {

@@ -34,6 +34,7 @@ type VMState struct {
 	HeapBase     uintptr
 	nextThreadID uint64
 	threads      []*ThreadState
+	threadByID   map[uint64]*ThreadState
 	nativeArena  []byte
 	nativeHeader *VMStateHeader
 	pinner       runtime.Pinner
@@ -42,6 +43,8 @@ type VMState struct {
 type ThreadState struct {
 	VM           *VMState
 	ID           uint64
+	nativeArena  []byte
+	nativeHeader *ThreadStateHeader
 	stackBase    uintptr
 	frameBase    uintptr
 	stackArena   []byte
@@ -63,6 +66,7 @@ func NewVMState(runtimeHeap *heap.Heap) *VMState {
 		Heap:         runtimeHeap,
 		HeapBase:     runtimeHeap.Base(),
 		nextThreadID: 1,
+		threadByID:   make(map[uint64]*ThreadState),
 		nativeArena:  nativeArena,
 		nativeHeader: header,
 	}
@@ -79,11 +83,14 @@ func (vm *VMState) NewThread(stackSlots uint32, frameCapacity uint32) (*ThreadSt
 	}
 	stackArena, stackPtr := allocAlignedArena(int(stackSlots)*value.TValueSize, value.TValueSize)
 	frameArena, framePtr := allocAlignedArena(int(frameCapacity)*CallFrameHeaderSize, value.ObjectAlignment)
+	threadArena, threadPtr := allocAlignedArena(ThreadStateHeaderSize, value.ObjectAlignment)
 	stack := unsafe.Slice((*value.TValue)(stackPtr), int(stackSlots))
 	frames := unsafe.Slice((*CallFrameHeader)(framePtr), int(frameCapacity))
 	thread := &ThreadState{
 		VM:           vm,
 		ID:           vm.nextThreadID,
+		nativeArena:  threadArena,
+		nativeHeader: (*ThreadStateHeader)(threadPtr),
 		stackBase:    uintptr(stackPtr),
 		frameBase:    uintptr(framePtr),
 		stackArena:   stackArena,
@@ -92,10 +99,12 @@ func (vm *VMState) NewThread(stackSlots uint32, frameCapacity uint32) (*ThreadSt
 		frames:       frames,
 		currentFrame: -1,
 	}
+	thread.pinner.Pin(&thread.nativeArena[0])
 	thread.pinner.Pin(&thread.stackArena[0])
 	thread.pinner.Pin(&thread.frameArena[0])
 	vm.nextThreadID++
 	vm.threads = append(vm.threads, thread)
+	vm.threadByID[thread.ID] = thread
 	vm.syncHeader(nil)
 	for index := range thread.stack {
 		thread.stack[index] = value.NilValue()
@@ -103,7 +112,15 @@ func (vm *VMState) NewThread(stackSlots uint32, frameCapacity uint32) (*ThreadSt
 	for index := range thread.frames {
 		thread.frames[index] = CallFrameHeader{}
 	}
+	thread.syncNativeHeader()
 	return thread, nil
+}
+
+func (vm *VMState) ThreadByID(id uint64) *ThreadState {
+	if vm == nil {
+		return nil
+	}
+	return vm.threadByID[id]
 }
 
 func (thread *ThreadState) StackSlots() uint32 {
@@ -112,6 +129,27 @@ func (thread *ThreadState) StackSlots() uint32 {
 
 func (thread *ThreadState) FrameCapacity() uint32 {
 	return uint32(len(thread.frames))
+}
+
+func (thread *ThreadState) NativePointer() unsafe.Pointer {
+	if thread == nil {
+		return nil
+	}
+	return unsafe.Pointer(thread.nativeHeader)
+}
+
+func (thread *ThreadState) OpenUpvalueHead() value.HeapRef44 {
+	if thread == nil || thread.nativeHeader == nil {
+		return 0
+	}
+	return value.HeapRef44(thread.nativeHeader.OpenUpvalueHead)
+}
+
+func (thread *ThreadState) SetOpenUpvalueHead(ref value.HeapRef44) {
+	if thread == nil || thread.nativeHeader == nil {
+		return
+	}
+	thread.nativeHeader.OpenUpvalueHead = uint64(ref)
 }
 
 func (thread *ThreadState) NextRegisterBase() (uint32, error) {
@@ -139,6 +177,14 @@ func (thread *ThreadState) ValueAtAddress(address uintptr) (value.TValue, error)
 		return value.NilValue(), err
 	}
 	return thread.stack[index], nil
+}
+
+func (thread *ThreadState) SlotIndexForAddress(address uintptr) (uint32, error) {
+	index, err := thread.slotIndex(address)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(index), nil
 }
 
 func (thread *ThreadState) SetValueAtAddress(address uintptr, slotValue value.TValue) error {
@@ -287,6 +333,16 @@ func (thread *ThreadState) slotIndex(address uintptr) (int, error) {
 		return 0, fmt.Errorf("address %#x is outside thread stack capacity", address)
 	}
 	return index, nil
+}
+
+func (thread *ThreadState) syncNativeHeader() {
+	if thread == nil || thread.nativeHeader == nil {
+		return
+	}
+	thread.nativeHeader.StackBase = uint64(thread.stackBase)
+	thread.nativeHeader.StackEnd = uint64(thread.stackBase + uintptr(len(thread.stack))*value.TValueSize)
+	thread.nativeHeader.FrameBase = uint64(thread.frameBase)
+	thread.nativeHeader.FrameEnd = uint64(thread.frameBase + uintptr(len(thread.frames))*CallFrameHeaderSize)
 }
 
 func allocAlignedArena(size int, alignment uintptr) ([]byte, unsafe.Pointer) {

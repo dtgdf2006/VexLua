@@ -1,0 +1,336 @@
+package baseline
+
+import (
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"vexlua/internal/bytecode"
+	"vexlua/internal/interp"
+	"vexlua/internal/runtime/value"
+)
+
+func TestExecutionModelFinalAcceptanceMatrix(t *testing.T) {
+	t.Run("compiled-island-call-chain", TestBaselineRuntimeCallStubChainsAcrossCompiledFrames)
+	t.Run("compiled-proto-cache", TestBaselineRuntimeCachesCompiledProtoByRef)
+	t.Run("shared-stub-feedback", TestBaselineRuntimeFeedbackTransitionsMatchInterpreter)
+	t.Run("real-deopt-continuation", TestBaselineRuntimeDeoptResumesWithoutReplayingEarlierSideEffects)
+	t.Run("host-bridge-continuation", TestBaselineRuntimeHostBridgeStubsResumeCompiledContinuation)
+	t.Run("host-descriptor-refresh", TestBaselineRuntimeHostDescriptorRefreshKeepsCompiledContinuation)
+	t.Run("tailcall-continuation", TestBaselineRuntimeCompiledTailCall)
+	t.Run("loop-backedge-continuation", TestBaselineRuntimeLoopSlowStubResumesContinuation)
+	t.Run("activation-convergence", testExecutionModelActivationConvergence)
+	t.Run("table-layering-audit", TestTableLoweringStaysOnFastPathDispatchLayer)
+	t.Run("runtime-stub-host-boundary-audit", TestRuntimeStubsUseSharedHostBoundary)
+}
+
+func TestExecutionModelSourceAudit(t *testing.T) {
+	root := repoRoot(t)
+	t.Run("legacy-helper-names-absent", func(t *testing.T) {
+		forbidden := []string{
+			"compiledRunsWithoutSuspend",
+			"recordTableFeedback",
+			"func (engine *Engine) hostObjectGet",
+			"func (engine *Engine) hostObjectSet",
+			"func (engine *Engine) callHostFunction",
+		}
+		var hits []string
+		err := filepath.WalkDir(filepath.Join(root, "internal"), func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			content, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			text := string(content)
+			for _, needle := range forbidden {
+				if strings.Contains(text, needle) {
+					hits = append(hits, filepath.ToSlash(path)+": "+needle)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk internal sources: %v", err)
+		}
+		if len(hits) != 0 {
+			t.Fatalf("found residual execution-model helpers or heuristics: %v", hits)
+		}
+	})
+
+	t.Run("transition-cleanup-residue-absent", func(t *testing.T) {
+		forbidden := []string{
+			"constByProto",
+			"resolveCount",
+			"ResolveCount(",
+			"CallSuspendCount(",
+			"ForPrepSuspendCount(",
+			"ForLoopSuspendCount(",
+			"syncCompiledStoreWriteback",
+			"ResolveNative",
+			"SyncNative",
+		}
+		var hits []string
+		err := filepath.WalkDir(filepath.Join(root, "internal"), func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			content, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			text := string(content)
+			for _, needle := range forbidden {
+				if strings.Contains(text, needle) {
+					hits = append(hits, filepath.ToSlash(path)+": "+needle)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk internal sources: %v", err)
+		}
+		if len(hits) != 0 {
+			t.Fatalf("found residual transition cleanup symbols: %v", hits)
+		}
+	})
+
+	t.Run("runtime-pinner-stays-execution-state-only", func(t *testing.T) {
+		allowed := map[string]struct{}{
+			"internal/runtime/state/thread.go": {},
+		}
+		var hits []string
+		err := filepath.WalkDir(filepath.Join(root, "internal"), func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			content, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			if !strings.Contains(string(content), "runtime.Pinner") {
+				return nil
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			rel = filepath.ToSlash(rel)
+			if _, ok := allowed[rel]; !ok {
+				hits = append(hits, rel)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk internal sources: %v", err)
+		}
+		if len(hits) != 0 {
+			t.Fatalf("runtime.Pinner should remain execution-state only, found: %v", hits)
+		}
+	})
+
+	t.Run("activation-struct-stays-thin", func(t *testing.T) {
+		text := readRepoFile(t, "internal", "interp", "engine.go")
+		block := sourceBlock(t, text, "type activation struct {", "type threadSnapshot struct {")
+		forbidden := []string{"proto", "env", "closureObject", "upvalueRefs", "registerBase", "baseAddress", "reservedSlots"}
+		for _, needle := range forbidden {
+			if strings.Contains(block, needle) {
+				t.Fatalf("activation struct should not cache derived state %q: %s", needle, block)
+			}
+		}
+	})
+
+	t.Run("feedback-path-stays-shared", func(t *testing.T) {
+		text := readRepoFile(t, "internal", "interp", "feedback.go")
+		forbidden := []string{"recordTableFeedback", "LayoutForProto("}
+		for _, needle := range forbidden {
+			if strings.Contains(text, needle) {
+				t.Fatalf("feedback path should not depend on %q", needle)
+			}
+		}
+		required := []string{"UpdateTableFeedbackAtPC", "UpdateTableFeedbackAtSlot"}
+		for _, needle := range required {
+			if !strings.Contains(text, needle) {
+				t.Fatalf("feedback path should expose shared helper %q", needle)
+			}
+		}
+	})
+
+	t.Run("covered-lowering-uses-shared-stubs", func(t *testing.T) {
+		text := readRepoFile(t, "internal", "vexarc", "baseline", "table_lowering.go")
+		forbidden := []string{"emitDeoptExit(", "compiledStatusDeopt", "Engine.Call("}
+		for _, needle := range forbidden {
+			if strings.Contains(text, needle) {
+				t.Fatalf("table lowering should not fall back through %q", needle)
+			}
+		}
+		required := []string{"emitStubExit(stubs.StubGetGlobal", "emitStubExit(stubs.StubGetTable", "emitStubExit(stubs.StubSetGlobal", "emitStubExit(stubs.StubSetTable"}
+		for _, needle := range required {
+			if !strings.Contains(text, needle) {
+				t.Fatalf("table lowering should dispatch through %q", needle)
+			}
+		}
+	})
+
+	t.Run("docs-have-no-execution-model-tail", func(t *testing.T) {
+		forbidden := []string{"Stage 8 再补 metadata", "后面再把 host bridge shared stub 化", "先保留解释器 feedback 状态机", "暂时先靠 Go 调度", "后续再对齐"}
+		docs := []string{
+			readRepoFile(t, "DEV.md"),
+			readRepoFile(t, "docs", "design", "table-binary-contract.md"),
+			readRepoFile(t, "docs", "design", "callframe-abi-contract.md"),
+		}
+		for _, text := range docs {
+			for _, needle := range forbidden {
+				if strings.Contains(text, needle) {
+					t.Fatalf("docs should not retain execution-model tail item %q", needle)
+				}
+			}
+		}
+	})
+}
+
+func testExecutionModelActivationConvergence(t *testing.T) {
+	engine := interp.New()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("create env: %v", err)
+	}
+	childOne := &bytecode.Proto{
+		Source:       "@accept-child-one.lua",
+		MaxStackSize: 1,
+		Constants: []bytecode.Constant{
+			bytecode.NumberConstant(10),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	childTwo := &bytecode.Proto{
+		Source:       "@accept-child-two.lua",
+		MaxStackSize: 1,
+		Constants: []bytecode.Constant{
+			bytecode.NumberConstant(20),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	outerA := &bytecode.Proto{
+		Source:       "@accept-outer-a.lua",
+		MaxStackSize: 1,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("swapProto"),
+		},
+		Protos: []*bytecode.Proto{childOne},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 1, 1),
+			bytecode.CreateABx(bytecode.OP_CLOSURE, 0, 0),
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 1, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	outerB := &bytecode.Proto{
+		Source:       "@accept-outer-b.lua",
+		MaxStackSize: 1,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("swapProto"),
+		},
+		Protos: []*bytecode.Proto{childTwo},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 1, 1),
+			bytecode.CreateABx(bytecode.OP_CLOSURE, 0, 0),
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 1, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	outerBHandle, err := engine.Protos.Intern(outerB)
+	if err != nil {
+		t.Fatalf("intern alternate proto: %v", err)
+	}
+	swapProto, err := engine.RegisterHostFunction("swapProto", func() {
+		frame := thread.CurrentFrame()
+		if frame == nil {
+			t.Fatalf("expected active Lua frame during host callback")
+		}
+		frame.Proto = outerBHandle.Value
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register swapProto: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "swapProto", swapProto.Value); err != nil {
+		t.Fatalf("set global swapProto: %v", err)
+	}
+	closureHandle, err := engine.NewClosure(outerA, env.Value, nil)
+	if err != nil {
+		t.Fatalf("create outer closure: %v", err)
+	}
+	results, err := engine.Call(thread, closureHandle.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("execute outer closure: %v", err)
+	}
+	if len(results) != 1 || results[0].Bits() != value.NumberValue(20).Bits() {
+		t.Fatalf("activation should pick child proto from current frame, got %v", results)
+	}
+}
+
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	root := filepath.Join("..", "..", "..")
+	if _, err := os.Stat(filepath.Join(root, "TODO.md")); err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	return root
+}
+
+func readRepoFile(t *testing.T, parts ...string) string {
+	t.Helper()
+	allParts := append([]string{repoRoot(t)}, parts...)
+	path := filepath.Join(allParts...)
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", filepath.ToSlash(path), err)
+	}
+	return string(bytes)
+}
+
+func sourceBlock(t *testing.T, text string, startMarker string, endMarker string) string {
+	t.Helper()
+	start := strings.Index(text, startMarker)
+	if start < 0 {
+		t.Fatalf("missing source block start %q", startMarker)
+	}
+	end := strings.Index(text[start:], endMarker)
+	if end < 0 {
+		t.Fatalf("missing source block end %q", endMarker)
+	}
+	return text[start : start+end]
+}

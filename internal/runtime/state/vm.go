@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	VMStateHeaderSize              = 0x30
+	VMStateHeaderSize              = 0x38
 	VMStateHeapBaseOffset          = 0x00
 	VMStateActiveThreadStackOffset = 0x08
 	VMStateActiveThreadFrameOffset = 0x10
@@ -16,6 +16,7 @@ const (
 	VMStateActiveThreadFrameEndOff = 0x20
 	VMStateThreadCountOffset       = 0x28
 	VMStateFlagsOffset             = 0x2C
+	VMStateActiveThreadStateOffset = 0x30
 )
 
 type VMStateHeader struct {
@@ -26,6 +27,7 @@ type VMStateHeader struct {
 	ActiveThreadFrameEnd  uint64
 	ThreadCount           uint32
 	Flags                 uint32
+	ActiveThreadStateBase uint64
 }
 
 func (vm *VMState) NativePointer() unsafe.Pointer {
@@ -53,12 +55,14 @@ func (vm *VMState) syncHeader(thread *ThreadState) {
 		vm.nativeHeader.ActiveThreadFrameBase = 0
 		vm.nativeHeader.ActiveThreadStackEnd = 0
 		vm.nativeHeader.ActiveThreadFrameEnd = 0
+		vm.nativeHeader.ActiveThreadStateBase = 0
 		return
 	}
 	vm.nativeHeader.ActiveThreadStackBase = uint64(thread.stackBase)
 	vm.nativeHeader.ActiveThreadFrameBase = uint64(thread.frameBase)
 	vm.nativeHeader.ActiveThreadStackEnd = uint64(thread.stackBase + uintptr(len(thread.stack))*value.TValueSize)
 	vm.nativeHeader.ActiveThreadFrameEnd = uint64(thread.frameBase + uintptr(len(thread.frames))*CallFrameHeaderSize)
+	vm.nativeHeader.ActiveThreadStateBase = uint64(uintptr(thread.NativePointer()))
 }
 
 func ValidateVMStateLayout() error {
@@ -85,6 +89,12 @@ func ValidateVMStateLayout() error {
 	}
 	if unsafe.Offsetof(VMStateHeader{}.Flags) != VMStateFlagsOffset {
 		return fmt.Errorf("VMStateHeader.Flags offset mismatch: got %#x want %#x", unsafe.Offsetof(VMStateHeader{}.Flags), VMStateFlagsOffset)
+	}
+	if unsafe.Offsetof(VMStateHeader{}.ActiveThreadStateBase) != VMStateActiveThreadStateOffset {
+		return fmt.Errorf("VMStateHeader.ActiveThreadStateBase offset mismatch: got %#x want %#x", unsafe.Offsetof(VMStateHeader{}.ActiveThreadStateBase), VMStateActiveThreadStateOffset)
+	}
+	if err := ValidateThreadStateLayout(); err != nil {
+		return err
 	}
 	return nil
 }

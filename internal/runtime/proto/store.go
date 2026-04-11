@@ -3,8 +3,6 @@ package proto
 import (
 	"encoding/binary"
 	"fmt"
-	"runtime"
-	"unsafe"
 
 	"vexlua/internal/bytecode"
 	"vexlua/internal/runtime/heap"
@@ -89,17 +87,9 @@ type ClosureSite struct {
 }
 
 type Store struct {
-	heap         *heap.Heap
-	byProto      map[*bytecode.Proto]value.HeapRef44
-	byRef        map[value.HeapRef44]*bytecode.Proto
-	constByProto map[*bytecode.Proto]*constantBlock
-	resolveCount uint64
-}
-
-type constantBlock struct {
-	values []value.TValue
-	base   uintptr
-	pinner runtime.Pinner
+	heap    *heap.Heap
+	byProto map[*bytecode.Proto]value.HeapRef44
+	byRef   map[value.HeapRef44]*bytecode.Proto
 }
 
 func NewStore(runtimeHeap *heap.Heap) *Store {
@@ -107,10 +97,9 @@ func NewStore(runtimeHeap *heap.Heap) *Store {
 		panic("proto store requires a heap")
 	}
 	return &Store{
-		heap:         runtimeHeap,
-		byProto:      make(map[*bytecode.Proto]value.HeapRef44),
-		byRef:        make(map[value.HeapRef44]*bytecode.Proto),
-		constByProto: make(map[*bytecode.Proto]*constantBlock),
+		heap:    runtimeHeap,
+		byProto: make(map[*bytecode.Proto]value.HeapRef44),
+		byRef:   make(map[value.HeapRef44]*bytecode.Proto),
 	}
 }
 
@@ -132,9 +121,6 @@ func (store *Store) Intern(proto *bytecode.Proto) (Handle, error) {
 	if err := WriteObject(allocation.Bytes, object); err != nil {
 		return Handle{}, err
 	}
-	if err := store.heap.SyncNative(allocation.Offset, allocation.Bytes); err != nil {
-		return Handle{}, err
-	}
 	ref, err := store.heap.EncodeHeapRef(allocation.Address)
 	if err != nil {
 		return Handle{}, err
@@ -145,16 +131,11 @@ func (store *Store) Intern(proto *bytecode.Proto) (Handle, error) {
 }
 
 func (store *Store) Resolve(ref value.HeapRef44) (*bytecode.Proto, error) {
-	store.resolveCount++
 	proto, ok := store.byRef[ref]
 	if !ok {
 		return nil, fmt.Errorf("unknown proto ref %#x", uint64(ref))
 	}
 	return proto, nil
-}
-
-func (store *Store) ResolveCount() uint64 {
-	return store.resolveCount
 }
 
 func (store *Store) SetCompiledEntry(ref value.HeapRef44, entry uintptr) error {
@@ -168,10 +149,7 @@ func (store *Store) SyncCompiledMetadata(ref value.HeapRef44, entry uintptr, fla
 	}
 	object.CompiledEntry = uint64(entry)
 	object.CompiledFlags = flags
-	if err := WriteObject(bytes, object); err != nil {
-		return err
-	}
-	return store.syncNativeObject(ref, bytes)
+	return WriteObject(bytes, object)
 }
 
 func (store *Store) CompiledEntry(ref value.HeapRef44) (uintptr, error) {
@@ -199,31 +177,26 @@ func (store *Store) NativeConstBase(ref value.HeapRef44) (uintptr, error) {
 }
 
 func (store *Store) ConstantBase(proto *bytecode.Proto, strings *rtstring.InternTable) (uintptr, error) {
-	block, err := store.constantBlockFor(proto, strings)
+	object, _, err := store.ensureConstantData(proto, strings)
 	if err != nil {
 		return 0, err
 	}
-	if block == nil {
-		if err := store.syncConstBasePointer(proto, 0); err != nil {
-			return 0, err
-		}
-		return 0, nil
-	}
-	if err := store.syncConstBasePointer(proto, uint64(block.base)); err != nil {
-		return 0, err
-	}
-	return block.base, nil
+	return uintptr(object.ConstBasePtr), nil
 }
 
 func (store *Store) ConstantValue(proto *bytecode.Proto, index int, strings *rtstring.InternTable) (value.TValue, error) {
-	block, err := store.constantBlockFor(proto, strings)
+	object, offset, err := store.ensureConstantData(proto, strings)
 	if err != nil {
 		return value.NilValue(), err
 	}
-	if block == nil || index < 0 || index >= len(block.values) {
+	if offset == 0 || index < 0 || index >= int(object.ConstantCount) {
 		return value.NilValue(), fmt.Errorf("constant %d is out of range", index)
 	}
-	return block.values[index], nil
+	bytes, err := store.heap.Resolve(offset+value.HeapOff64(index*value.TValueSize), value.TValueSize)
+	if err != nil {
+		return value.NilValue(), err
+	}
+	return value.FromRaw(value.Raw(binary.LittleEndian.Uint64(bytes))), nil
 }
 
 func (store *Store) Object(ref value.HeapRef44) (Object, error) {
@@ -439,9 +412,6 @@ func (store *Store) buildObject(proto *bytecode.Proto) (Object, error) {
 	object.ChildProtoData = childData
 	object.ClosureSiteData = closureSiteData
 	object.LineInfoData = lineInfoData
-	if block, ok := store.constByProto[proto]; ok && block != nil {
-		object.ConstBasePtr = uint64(block.base)
-	}
 	return object, nil
 }
 
@@ -465,38 +435,56 @@ func (store *Store) objectBytes(ref value.HeapRef44) (Object, []byte, error) {
 	return object, bytes, nil
 }
 
-func (store *Store) syncConstBasePointer(proto *bytecode.Proto, base uint64) error {
+func (store *Store) ensureConstantData(proto *bytecode.Proto, strings *rtstring.InternTable) (Object, value.HeapOff64, error) {
 	if proto == nil {
-		return nil
+		return Object{}, 0, fmt.Errorf("proto cannot be nil")
 	}
-	ref, ok := store.byProto[proto]
-	if !ok {
-		return nil
-	}
-	object, bytes, err := store.objectBytes(ref)
+	handle, err := store.Intern(proto)
 	if err != nil {
-		return err
+		return Object{}, 0, err
 	}
-	if object.ConstBasePtr == base {
-		return nil
+	object, bytes, err := store.objectBytes(handle.Ref)
+	if err != nil {
+		return Object{}, 0, err
 	}
-	object.ConstBasePtr = base
+	if object.ConstantCount == 0 {
+		return object, 0, nil
+	}
+	if object.ConstBasePtr != 0 {
+		offset, err := store.constantDataOffset(object.ConstBasePtr)
+		if err != nil {
+			return Object{}, 0, err
+		}
+		return object, offset, nil
+	}
+	offset, err := store.allocConstantData(proto.Constants, strings)
+	if err != nil {
+		return Object{}, 0, err
+	}
+	base, err := store.heap.NativeAddressForOffset(offset)
+	if err != nil {
+		return Object{}, 0, err
+	}
+	object.ConstBasePtr = uint64(base)
 	if err := WriteObject(bytes, object); err != nil {
-		return err
+		return Object{}, 0, err
 	}
-	return store.syncNativeObject(ref, bytes)
+	return object, offset, nil
 }
 
-func (store *Store) syncNativeObject(ref value.HeapRef44, bytes []byte) error {
-	address, err := store.heap.DecodeHeapRef(ref)
-	if err != nil {
-		return err
+func (store *Store) constantDataOffset(base uint64) (value.HeapOff64, error) {
+	if base == 0 {
+		return 0, nil
 	}
-	offset, err := store.heap.OffsetForAddress(address)
-	if err != nil {
-		return err
+	nativeBase := store.heap.NativeBase()
+	if uintptr(base) < nativeBase {
+		return 0, fmt.Errorf("constant base %#x precedes heap native base %#x", base, nativeBase)
 	}
-	return store.heap.SyncNative(offset, bytes)
+	offset := value.HeapOff64(uint64(uintptr(base) - nativeBase))
+	if _, err := store.heap.Resolve(offset, value.TValueSize); err != nil {
+		return 0, err
+	}
+	return offset, nil
 }
 
 func (store *Store) allocInstructionData(code []bytecode.Instruction) (value.HeapOff64, error) {
@@ -509,9 +497,6 @@ func (store *Store) allocInstructionData(code []bytecode.Instruction) (value.Hea
 	}
 	for index, instruction := range code {
 		binary.LittleEndian.PutUint32(allocation.Bytes[index*4:(index+1)*4], uint32(instruction))
-	}
-	if err := store.heap.SyncNative(allocation.Offset, allocation.Bytes); err != nil {
-		return 0, err
 	}
 	return allocation.Offset, nil
 }
@@ -531,9 +516,6 @@ func (store *Store) allocChildProtoData(children []*bytecode.Proto) (value.HeapO
 		}
 		binary.LittleEndian.PutUint64(allocation.Bytes[index*8:(index+1)*8], uint64(handle.Ref))
 	}
-	if err := store.heap.SyncNative(allocation.Offset, allocation.Bytes); err != nil {
-		return 0, err
-	}
 	return allocation.Offset, nil
 }
 
@@ -547,9 +529,6 @@ func (store *Store) allocLineInfoData(lines []int) (value.HeapOff64, error) {
 	}
 	for index, line := range lines {
 		binary.LittleEndian.PutUint32(allocation.Bytes[index*4:(index+1)*4], uint32(int32(line)))
-	}
-	if err := store.heap.SyncNative(allocation.Offset, allocation.Bytes); err != nil {
-		return 0, err
 	}
 	return allocation.Offset, nil
 }
@@ -578,9 +557,6 @@ func (store *Store) allocClosureSiteData(sites []closureSiteRecord) (value.HeapO
 			return 0, err
 		}
 	}
-	if err := store.heap.SyncNative(allocation.Offset, allocation.Bytes); err != nil {
-		return 0, err
-	}
 	return allocation.Offset, nil
 }
 
@@ -595,9 +571,6 @@ func (store *Store) allocCaptureDescriptors(captures []CaptureDescriptor) (value
 	for index, capture := range captures {
 		start := int(index) * CaptureDescriptorSize
 		writeCaptureDescriptor(allocation.Bytes[start:start+CaptureDescriptorSize], capture)
-	}
-	if err := store.heap.SyncNative(allocation.Offset, allocation.Bytes); err != nil {
-		return 0, err
 	}
 	return allocation.Offset, nil
 }
@@ -699,32 +672,23 @@ func writeCaptureDescriptor(buffer []byte, capture CaptureDescriptor) {
 	binary.LittleEndian.PutUint16(buffer[2:4], capture.Index)
 }
 
-func (store *Store) constantBlockFor(proto *bytecode.Proto, strings *rtstring.InternTable) (*constantBlock, error) {
-	if proto == nil {
-		return nil, fmt.Errorf("proto cannot be nil")
+func (store *Store) allocConstantData(constants []bytecode.Constant, strings *rtstring.InternTable) (value.HeapOff64, error) {
+	if len(constants) == 0 {
+		return 0, nil
 	}
-	if block, ok := store.constByProto[proto]; ok {
-		return block, nil
+	allocation, err := store.heap.Alloc(uint64(len(constants)) * value.TValueSize)
+	if err != nil {
+		return 0, err
 	}
-	if len(proto.Constants) == 0 {
-		store.constByProto[proto] = nil
-		return nil, nil
-	}
-	values := make([]value.TValue, len(proto.Constants))
-	for index, constant := range proto.Constants {
+	for index, constant := range constants {
 		converted, err := constantToTValue(constant, strings)
 		if err != nil {
-			return nil, fmt.Errorf("constant %d: %w", index, err)
+			return 0, fmt.Errorf("constant %d: %w", index, err)
 		}
-		values[index] = converted
+		start := index * value.TValueSize
+		binary.LittleEndian.PutUint64(allocation.Bytes[start:start+value.TValueSize], uint64(converted.Bits()))
 	}
-	block := &constantBlock{
-		values: values,
-		base:   uintptr(unsafe.Pointer(&values[0])),
-	}
-	block.pinner.Pin(&block.values[0])
-	store.constByProto[proto] = block
-	return block, nil
+	return allocation.Offset, nil
 }
 
 func constantToTValue(constant bytecode.Constant, strings *rtstring.InternTable) (value.TValue, error) {

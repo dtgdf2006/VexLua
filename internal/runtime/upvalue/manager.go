@@ -9,20 +9,18 @@ import (
 )
 
 type Manager struct {
-	heap      *heap.Heap
-	openHeads map[uint64]value.HeapRef44
-	owners    map[value.HeapRef44]*state.ThreadState
+	heap *heap.Heap
+	vm   *state.VMState
 }
 
-func NewManager(runtimeHeap *heap.Heap) *Manager {
+func NewManager(runtimeHeap *heap.Heap, vm *state.VMState) *Manager {
 	if runtimeHeap == nil {
 		panic("upvalue manager requires a heap")
 	}
-	return &Manager{
-		heap:      runtimeHeap,
-		openHeads: make(map[uint64]value.HeapRef44),
-		owners:    make(map[value.HeapRef44]*state.ThreadState),
+	if vm == nil {
+		panic("upvalue manager requires vm state")
 	}
+	return &Manager{heap: runtimeHeap, vm: vm}
 }
 
 func (manager *Manager) FindOrCreateOpen(thread *state.ThreadState, slotAddress uintptr) (Handle, error) {
@@ -32,7 +30,7 @@ func (manager *Manager) FindOrCreateOpen(thread *state.ThreadState, slotAddress 
 	if _, err := thread.ValueAtAddress(slotAddress); err != nil {
 		return Handle{}, err
 	}
-	head := manager.openHeads[thread.ID]
+	head := thread.OpenUpvalueHead()
 	var previous value.HeapRef44
 	current := head
 	for current != 0 {
@@ -59,9 +57,8 @@ func (manager *Manager) FindOrCreateOpen(thread *state.ThreadState, slotAddress 
 	if err != nil {
 		return Handle{}, err
 	}
-	manager.owners[handle.Ref] = thread
 	if previous == 0 {
-		manager.openHeads[thread.ID] = handle.Ref
+		thread.SetOpenUpvalueHead(handle.Ref)
 	} else {
 		previousObject, err := manager.Object(previous)
 		if err != nil {
@@ -89,14 +86,14 @@ func (manager *Manager) OpenHead(thread *state.ThreadState) value.HeapRef44 {
 	if thread == nil {
 		return 0
 	}
-	return manager.openHeads[thread.ID]
+	return thread.OpenUpvalueHead()
 }
 
 func (manager *Manager) CloseAtOrAbove(thread *state.ThreadState, level uintptr) ([]Handle, error) {
 	if thread == nil {
 		return nil, fmt.Errorf("thread cannot be nil")
 	}
-	head := manager.openHeads[thread.ID]
+	head := thread.OpenUpvalueHead()
 	if head == 0 {
 		return nil, nil
 	}
@@ -125,11 +122,10 @@ func (manager *Manager) CloseAtOrAbove(thread *state.ThreadState, level uintptr)
 		if err := manager.writeObject(current, object); err != nil {
 			return nil, err
 		}
-		delete(manager.owners, current)
 		closed = append(closed, Handle{Ref: current, Value: value.UpValueRefValue(current)})
 		current = next
 	}
-	manager.openHeads[thread.ID] = current
+	thread.SetOpenUpvalueHead(current)
 	if current != 0 {
 		object, err := manager.Object(current)
 		if err != nil {
@@ -151,7 +147,7 @@ func (manager *Manager) Get(ref value.HeapRef44) (value.TValue, error) {
 	if object.State == StateClosed {
 		return object.ClosedValue, nil
 	}
-	thread := manager.owners[ref]
+	thread := manager.vm.ThreadByID(object.ThreadID)
 	if thread == nil {
 		return value.NilValue(), fmt.Errorf("open upvalue %#x is missing owner thread", uint64(ref))
 	}
@@ -167,7 +163,7 @@ func (manager *Manager) Set(ref value.HeapRef44, slotValue value.TValue) error {
 		object.ClosedValue = slotValue
 		return manager.writeObject(ref, object)
 	}
-	thread := manager.owners[ref]
+	thread := manager.vm.ThreadByID(object.ThreadID)
 	if thread == nil {
 		return fmt.Errorf("open upvalue %#x is missing owner thread", uint64(ref))
 	}

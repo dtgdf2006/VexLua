@@ -13,9 +13,9 @@ const (
 	hostDescriptorSize = 0x40
 
 	hostHandleOffset        = 0x10
-	descriptorIDOffset      = 0x18
+	reservedDescriptorOff   = 0x18
 	descriptorVersionOffset = 0x1C
-	cacheSlotOffset         = 0x20
+	reservedCacheSlotOff    = 0x20
 	flagsOffset             = 0x24
 	envOffset               = 0x28
 	nativeMetaOffset        = 0x30
@@ -51,12 +51,27 @@ const (
 	DescriptorFlagVariadic
 )
 
+func WrapperFlagsForDescriptor(kind DescriptorKind, flags DescriptorFlags) WrapperFlags {
+	var wrapper WrapperFlags
+	if flags&DescriptorFlagCallable != 0 {
+		wrapper |= WrapperFlagCallable
+	}
+	if flags&DescriptorFlagIndexable != 0 {
+		wrapper |= WrapperFlagIndexable
+	}
+	if flags&DescriptorFlagWritable != 0 {
+		wrapper |= WrapperFlagWritable
+	}
+	if kind == DescriptorKindFunction {
+		wrapper &^= WrapperFlagIndexable | WrapperFlagWritable
+	}
+	return wrapper
+}
+
 type WrapperHeader struct {
 	Common            value.CommonHeader
 	HostHandle        uint64
-	DescriptorID      uint32
 	DescriptorVersion uint32
-	CacheSlot         uint32
 	Flags             WrapperFlags
 	Env               value.TValue
 	NativeMeta        value.HeapOff64
@@ -73,7 +88,7 @@ type NativeDescriptor struct {
 	Kind              DescriptorKind
 }
 
-func newWrapperHeader(kind value.ObjectKind, size uint32, handle uint64, descriptorID uint32, descriptorVersion uint32, cacheSlot uint32, flags WrapperFlags, env value.TValue, nativeMeta value.HeapOff64) WrapperHeader {
+func newWrapperHeader(kind value.ObjectKind, size uint32, handle uint64, descriptorVersion uint32, flags WrapperFlags, env value.TValue, nativeMeta value.HeapOff64) WrapperHeader {
 	return WrapperHeader{
 		Common: value.CommonHeader{
 			Kind:      kind,
@@ -82,21 +97,19 @@ func newWrapperHeader(kind value.ObjectKind, size uint32, handle uint64, descrip
 			Flags:     value.HeaderFlagHostManaged,
 		},
 		HostHandle:        handle,
-		DescriptorID:      descriptorID,
 		DescriptorVersion: descriptorVersion,
-		CacheSlot:         cacheSlot,
 		Env:               env,
 		Flags:             flags,
 		NativeMeta:        nativeMeta,
 	}
 }
 
-func newHostObjectHeader(handle uint64, descriptorID uint32, descriptorVersion uint32, cacheSlot uint32, env value.TValue, nativeMeta value.HeapOff64) WrapperHeader {
-	return newWrapperHeader(value.KindHostObject, hostObjectSize, handle, descriptorID, descriptorVersion, cacheSlot, WrapperFlagIndexable|WrapperFlagWritable, env, nativeMeta)
+func newHostObjectHeader(handle uint64, descriptorVersion uint32, env value.TValue, nativeMeta value.HeapOff64) WrapperHeader {
+	return newWrapperHeader(value.KindHostObject, hostObjectSize, handle, descriptorVersion, WrapperFlagIndexable|WrapperFlagWritable, env, nativeMeta)
 }
 
-func newHostFunctionHeader(handle uint64, descriptorID uint32, descriptorVersion uint32, cacheSlot uint32, env value.TValue, nativeMeta value.HeapOff64) WrapperHeader {
-	return newWrapperHeader(value.KindHostFunction, hostFunctionSize, handle, descriptorID, descriptorVersion, cacheSlot, WrapperFlagCallable, env, nativeMeta)
+func newHostFunctionHeader(handle uint64, descriptorVersion uint32, env value.TValue, nativeMeta value.HeapOff64) WrapperHeader {
+	return newWrapperHeader(value.KindHostFunction, hostFunctionSize, handle, descriptorVersion, WrapperFlagCallable, env, nativeMeta)
 }
 
 func newNativeDescriptor(descriptorID uint32, descriptorVersion uint32, shapeID uint32, cacheSlot uint32, arity uint16, flags DescriptorFlags, kind DescriptorKind) NativeDescriptor {
@@ -131,9 +144,7 @@ func readWrapperHeader(buffer []byte, expectedKind value.ObjectKind, expectedSiz
 	return WrapperHeader{
 		Common:            common,
 		HostHandle:        binary.LittleEndian.Uint64(buffer[hostHandleOffset : hostHandleOffset+8]),
-		DescriptorID:      binary.LittleEndian.Uint32(buffer[descriptorIDOffset : descriptorIDOffset+4]),
 		DescriptorVersion: binary.LittleEndian.Uint32(buffer[descriptorVersionOffset : descriptorVersionOffset+4]),
-		CacheSlot:         binary.LittleEndian.Uint32(buffer[cacheSlotOffset : cacheSlotOffset+4]),
 		Flags:             WrapperFlags(binary.LittleEndian.Uint32(buffer[flagsOffset : flagsOffset+4])),
 		Env:               value.FromRaw(value.Raw(binary.LittleEndian.Uint64(buffer[envOffset : envOffset+8]))),
 		NativeMeta:        value.HeapOff64(binary.LittleEndian.Uint64(buffer[nativeMetaOffset : nativeMetaOffset+8])),
@@ -148,9 +159,9 @@ func writeWrapperHeader(buffer []byte, header WrapperHeader) error {
 		return err
 	}
 	binary.LittleEndian.PutUint64(buffer[hostHandleOffset:hostHandleOffset+8], header.HostHandle)
-	binary.LittleEndian.PutUint32(buffer[descriptorIDOffset:descriptorIDOffset+4], header.DescriptorID)
+	binary.LittleEndian.PutUint32(buffer[reservedDescriptorOff:reservedDescriptorOff+4], 0)
 	binary.LittleEndian.PutUint32(buffer[descriptorVersionOffset:descriptorVersionOffset+4], header.DescriptorVersion)
-	binary.LittleEndian.PutUint32(buffer[cacheSlotOffset:cacheSlotOffset+4], header.CacheSlot)
+	binary.LittleEndian.PutUint32(buffer[reservedCacheSlotOff:reservedCacheSlotOff+4], 0)
 	binary.LittleEndian.PutUint32(buffer[flagsOffset:flagsOffset+4], uint32(header.Flags))
 	binary.LittleEndian.PutUint64(buffer[envOffset:envOffset+8], uint64(header.Env.Bits()))
 	binary.LittleEndian.PutUint64(buffer[nativeMetaOffset:nativeMetaOffset+8], uint64(header.NativeMeta))

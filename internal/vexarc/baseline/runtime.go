@@ -6,21 +6,20 @@ import (
 
 	"vexlua/internal/bytecode"
 	"vexlua/internal/interp"
-	rtproto "vexlua/internal/runtime/proto"
 	"vexlua/internal/runtime/state"
 	"vexlua/internal/runtime/value"
 	"vexlua/internal/vexarc/abi"
 	"vexlua/internal/vexarc/codecache"
+	"vexlua/internal/vexarc/stubs"
 )
 
 type Runtime struct {
-	Engine              *interp.Engine
-	Cache               *codecache.Cache
-	compiled            map[value.HeapRef44]*CompiledCode
-	callSuspendCount    uint64
-	forPrepSuspendCount uint64
-	forLoopSuspendCount uint64
-	deoptCount          uint64
+	Engine      *interp.Engine
+	Cache       *codecache.Cache
+	compiled    map[value.HeapRef44]*CompiledCode
+	sharedStubs *stubManager
+	stubCounts  map[stubs.ID]uint64
+	deoptCount  uint64
 }
 
 func NewRuntime(engine *interp.Engine) *Runtime {
@@ -28,9 +27,10 @@ func NewRuntime(engine *interp.Engine) *Runtime {
 		panic("baseline runtime requires an interpreter engine")
 	}
 	return &Runtime{
-		Engine:   engine,
-		Cache:    codecache.New(),
-		compiled: make(map[value.HeapRef44]*CompiledCode),
+		Engine:     engine,
+		Cache:      codecache.New(),
+		compiled:   make(map[value.HeapRef44]*CompiledCode),
+		stubCounts: make(map[stubs.ID]uint64),
 	}
 }
 
@@ -38,6 +38,11 @@ func (runtime *Runtime) Close() error {
 	var firstErr error
 	for _, compiled := range runtime.compiled {
 		if err := compiled.Release(runtime.Cache); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if runtime.sharedStubs != nil {
+		if err := runtime.sharedStubs.Release(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -74,7 +79,10 @@ func (runtime *Runtime) CompileRef(protoRef value.HeapRef44) (*CompiledCode, err
 	if err != nil {
 		return nil, err
 	}
-	compiled, err := NewCompiler(runtime.Engine, runtime.Cache).Compile(proto)
+	if err := runtime.ensureStubManager(); err != nil {
+		return nil, err
+	}
+	compiled, err := NewCompiler(runtime.Engine, runtime.Cache, runtime.sharedStubs).Compile(proto)
 	if err != nil {
 		return nil, err
 	}
@@ -91,32 +99,30 @@ func (runtime *Runtime) CompileRef(protoRef value.HeapRef44) (*CompiledCode, err
 	return compiled, nil
 }
 
-func (runtime *Runtime) CallSuspendCount() uint64 {
-	if runtime == nil {
-		return 0
-	}
-	return runtime.callSuspendCount
-}
-
-func (runtime *Runtime) ForPrepSuspendCount() uint64 {
-	if runtime == nil {
-		return 0
-	}
-	return runtime.forPrepSuspendCount
-}
-
-func (runtime *Runtime) ForLoopSuspendCount() uint64 {
-	if runtime == nil {
-		return 0
-	}
-	return runtime.forLoopSuspendCount
-}
-
 func (runtime *Runtime) DeoptCount() uint64 {
 	if runtime == nil {
 		return 0
 	}
 	return runtime.deoptCount
+}
+
+func (runtime *Runtime) SlowStubCount(id stubs.ID) uint64 {
+	if runtime == nil {
+		return 0
+	}
+	return runtime.stubCounts[id]
+}
+
+func (runtime *Runtime) ensureStubManager() error {
+	if runtime.sharedStubs != nil {
+		return nil
+	}
+	manager, err := newStubManager(runtime.Cache)
+	if err != nil {
+		return err
+	}
+	runtime.sharedStubs = manager
+	return nil
 }
 
 func (runtime *Runtime) Call(thread *state.ThreadState, callee value.TValue, args []value.TValue, nresults int) ([]value.TValue, error) {
@@ -141,6 +147,9 @@ func (runtime *Runtime) Call(thread *state.ThreadState, callee value.TValue, arg
 	}
 	if !compiled.Supported {
 		return runtime.Engine.Call(thread, callee, args, nresults)
+	}
+	if _, err := runtime.Engine.Closures.EnsureFeedbackVector(closureRef, compiled.FeedbackLayout); err != nil {
+		return nil, err
 	}
 	return runtime.callCompiled(thread, closureRef, args, nresults, compiled)
 }
@@ -205,12 +214,8 @@ func (runtime *Runtime) callCompiled(thread *state.ThreadState, closureRef value
 	defer cleanup()
 	regsBase := uintptr(frame.RegsBase)
 	ctx := executionContext{}
-	currentPC := 0
+	entry := compiled.Entry
 	for {
-		entry, err := compiled.EntryAtBytecode(currentPC)
-		if err != nil {
-			return nil, err
-		}
 		runtime.Engine.State.SyncActiveThread(thread)
 		status, aux := abi.EnterCompiled(entry, runtime.Engine.Heap.NativeBase(), runtime.Engine.State.NativePointer(), unsafe.Pointer(frame), regsBase, unsafe.Pointer(&ctx))
 		switch status {
@@ -220,112 +225,28 @@ func (runtime *Runtime) callCompiled(thread *state.ThreadState, closureRef value
 				return nil, err
 			}
 			return normalizeResults(results, nresults), nil
-		case compiledStatusSuspend:
-			nextPC, finished, finalResults, err := runtime.handleSuspend(thread, frame, value.LuaClosureRefValue(closureRef), compiled, &ctx, nresults)
+		case compiledStatusStub:
+			nextEntry, finished, finalResults, err := runtime.handleStub(thread, frame, closureRef, compiled, &ctx, stubs.ID(aux), nresults)
 			if err != nil {
 				return nil, err
 			}
 			if finished {
 				return finalResults, nil
 			}
-			currentPC = nextPC
+			entry = nextEntry
 		case compiledStatusDeopt:
 			runtime.deoptCount++
-			cleanup()
-			return runtime.Engine.Call(thread, value.LuaClosureRefValue(closureRef), args, nresults)
+			results, err := runtime.deoptFromContext(thread, frame, compiled, &ctx)
+			if err != nil {
+				return nil, err
+			}
+			return normalizeResults(results, nresults), nil
 		case compiledStatusError:
 			return nil, fmt.Errorf("compiled code returned error status")
 		default:
 			return nil, fmt.Errorf("unexpected compiled status %d", status)
 		}
 	}
-}
-
-func (runtime *Runtime) handleSuspend(thread *state.ThreadState, frame *state.CallFrameHeader, closure value.TValue, compiled *CompiledCode, ctx *executionContext, nresults int) (nextPC int, finished bool, finalResults []value.TValue, err error) {
-	switch SuspendKind(ctx.SuspendKind) {
-	case SuspendCall:
-		return runtime.handleCallSuspend(thread, frame, ctx)
-	case SuspendForPrep:
-		nextPC, err = runtime.handleForPrep(thread, frame, ctx)
-		return nextPC, false, nil, err
-	case SuspendForLoop:
-		nextPC, err = runtime.handleForLoop(thread, frame, ctx)
-		return nextPC, false, nil, err
-	default:
-		return 0, false, nil, fmt.Errorf("unknown suspend kind %d", ctx.SuspendKind)
-	}
-}
-
-func (runtime *Runtime) handleCallSuspend(thread *state.ThreadState, frame *state.CallFrameHeader, ctx *executionContext) (nextPC int, finished bool, finalResults []value.TValue, err error) {
-	runtime.callSuspendCount++
-	a := int(ctx.Arg0)
-	b := int(ctx.Arg1)
-	c := int(ctx.Arg2)
-	callee, err := thread.Register(frame, uint16(a))
-	if err != nil {
-		return 0, false, nil, err
-	}
-	args := make([]value.TValue, 0, b-1)
-	for index := 0; index < b-1; index++ {
-		argument, err := thread.Register(frame, uint16(a+1+index))
-		if err != nil {
-			return 0, false, nil, err
-		}
-		args = append(args, argument)
-	}
-	results, err := runtime.Call(thread, callee, args, c-1)
-	if err != nil {
-		return 0, false, nil, err
-	}
-	if err := storeFrameCallResults(thread, frame, a, c, results); err != nil {
-		return 0, false, nil, err
-	}
-	return int(ctx.ResumePC), false, nil, nil
-}
-
-func (runtime *Runtime) handleForPrep(thread *state.ThreadState, frame *state.CallFrameHeader, ctx *executionContext) (int, error) {
-	runtime.forPrepSuspendCount++
-	a := int(ctx.Arg0)
-	index, err := registerNumber(thread, frame, a)
-	if err != nil {
-		return 0, err
-	}
-	step, err := registerNumber(thread, frame, a+2)
-	if err != nil {
-		return 0, err
-	}
-	if err := thread.SetRegister(frame, uint16(a), value.NumberValue(index-step)); err != nil {
-		return 0, err
-	}
-	return int(ctx.Arg1), nil
-}
-
-func (runtime *Runtime) handleForLoop(thread *state.ThreadState, frame *state.CallFrameHeader, ctx *executionContext) (int, error) {
-	runtime.forLoopSuspendCount++
-	a := int(ctx.Arg0)
-	index, err := registerNumber(thread, frame, a)
-	if err != nil {
-		return 0, err
-	}
-	limit, err := registerNumber(thread, frame, a+1)
-	if err != nil {
-		return 0, err
-	}
-	step, err := registerNumber(thread, frame, a+2)
-	if err != nil {
-		return 0, err
-	}
-	index += step
-	if err := thread.SetRegister(frame, uint16(a), value.NumberValue(index)); err != nil {
-		return 0, err
-	}
-	if (step > 0 && index <= limit) || (step <= 0 && index >= limit) {
-		if err := thread.SetRegister(frame, uint16(a+3), value.NumberValue(index)); err != nil {
-			return 0, err
-		}
-		return int(ctx.Arg1), nil
-	}
-	return int(ctx.ResumePC), nil
 }
 
 func registerNumber(thread *state.ThreadState, frame *state.CallFrameHeader, index int) (float64, error) {
@@ -341,10 +262,16 @@ func registerNumber(thread *state.ThreadState, frame *state.CallFrameHeader, ind
 }
 
 func storeFrameCallResults(thread *state.ThreadState, frame *state.CallFrameHeader, a int, c int, results []value.TValue) error {
-	if c <= 1 {
+	if c == 1 {
 		return nil
 	}
 	wanted := c - 1
+	if c == 0 {
+		wanted = int(frame.RegisterCount) - a
+		if wanted < 0 {
+			wanted = 0
+		}
+	}
 	for index := 0; index < wanted; index++ {
 		slotValue := value.NilValue()
 		if index < len(results) {
@@ -398,22 +325,5 @@ func collectThreadResults(thread *state.ThreadState, base uintptr, count int) ([
 }
 
 func (runtime *Runtime) syncCompiledMetadata(protoRef value.HeapRef44, compiled *CompiledCode) error {
-	flags := uint8(0)
-	if compiled != nil && compiled.Supported && compiledRunsWithoutSuspend(compiled.Proto) {
-		flags |= rtproto.ProtoCompiledFlagNoSuspend
-	}
-	return runtime.Engine.Protos.SyncCompiledMetadata(protoRef, compiled.Entry, flags)
-}
-
-func compiledRunsWithoutSuspend(proto *bytecode.Proto) bool {
-	if proto == nil {
-		return false
-	}
-	for _, instruction := range proto.Code {
-		switch instruction.Opcode() {
-		case bytecode.OP_CALL, bytecode.OP_TAILCALL:
-			return false
-		}
-	}
-	return true
+	return runtime.Engine.Protos.SyncCompiledMetadata(protoRef, compiled.Entry, 0)
 }

@@ -249,7 +249,20 @@ func TestThreadUsesPinnedNativeAddressableArenas(t *testing.T) {
 	if uintptr(vheader.ActiveThreadFrameEnd) != thread.frameBase+uintptr(len(thread.frames))*CallFrameHeaderSize {
 		t.Fatalf("native active frame end %#x does not match thread frame end %#x", uintptr(vheader.ActiveThreadFrameEnd), thread.frameBase+uintptr(len(thread.frames))*CallFrameHeaderSize)
 	}
+	if uintptr(vheader.ActiveThreadStateBase) != uintptr(thread.NativePointer()) {
+		t.Fatalf("native active thread state %#x does not match thread header %#x", uintptr(vheader.ActiveThreadStateBase), uintptr(thread.NativePointer()))
+	}
 	if vheader.ThreadCount != 1 {
 		t.Fatalf("native thread count = %d, want 1", vheader.ThreadCount)
+	}
+	theader := (*ThreadStateHeader)(thread.NativePointer())
+	if uintptr(theader.StackBase) != thread.stackBase {
+		t.Fatalf("thread header stack base %#x does not match stack base %#x", uintptr(theader.StackBase), thread.stackBase)
+	}
+	if uintptr(theader.FrameBase) != thread.frameBase {
+		t.Fatalf("thread header frame base %#x does not match frame base %#x", uintptr(theader.FrameBase), thread.frameBase)
+	}
+	if theader.OpenUpvalueHead != 0 {
+		t.Fatalf("thread header open upvalue head = %#x, want 0", theader.OpenUpvalueHead)
 	}
 }

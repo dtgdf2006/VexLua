@@ -16,6 +16,22 @@ type Handle struct {
 	Value value.TValue
 }
 
+type FastAccessKind uint8
+
+const (
+	FastAccessInvalid FastAccessKind = iota
+	FastAccessArray
+	FastAccessHash
+)
+
+type FastAccess struct {
+	Kind         FastAccessKind
+	TableRef     value.HeapRef44
+	TableVersion uint32
+	SlotIndex    uint32
+	KeyBits      value.Raw
+}
+
 type Store struct {
 	heap *heap.Heap
 }
@@ -129,6 +145,89 @@ func (store *Store) SetMetatable(tableRef value.HeapRef44, metatable value.TValu
 	}
 	object.BumpVersion()
 	return store.writeObject(offset, objectBytes, object)
+}
+
+func (store *Store) DescribeFastGet(tableRef value.HeapRef44, key value.TValue) (FastAccess, bool, error) {
+	if err := validateKey(key); err != nil {
+		return FastAccess{}, false, err
+	}
+	_, _, object, err := store.loadObject(tableRef)
+	if err != nil {
+		return FastAccess{}, false, err
+	}
+	if object.Flags&(FlagIndexFastPathBlocked|FlagWeakKeys|FlagWeakValues|FlagRehashing) != 0 {
+		return FastAccess{}, false, nil
+	}
+	if index, ok := arrayIndex(key); ok && index <= object.ArrayCap {
+		slotValue, err := store.readArraySlot(object, index)
+		if err != nil {
+			return FastAccess{}, false, err
+		}
+		if !isNilValue(slotValue) {
+			return FastAccess{Kind: FastAccessArray, TableRef: tableRef, TableVersion: object.TableVersion, SlotIndex: index - 1, KeyBits: key.Bits()}, true, nil
+		}
+	}
+	if object.HashCapacity == 0 {
+		return FastAccess{}, false, nil
+	}
+	fullHash, keyClass, _, err := store.hashKey(object, key)
+	if err != nil {
+		return FastAccess{}, false, err
+	}
+	if keyClass != KeyClassInternedString {
+		return FastAccess{}, false, nil
+	}
+	slot, found, entry, err := store.findEntry(object, key, fullHash, keyClass)
+	if err != nil {
+		return FastAccess{}, false, err
+	}
+	if !found || isNilValue(entry.Value) {
+		return FastAccess{}, false, nil
+	}
+	return FastAccess{Kind: FastAccessHash, TableRef: tableRef, TableVersion: object.TableVersion, SlotIndex: slot, KeyBits: key.Bits()}, true, nil
+}
+
+func (store *Store) DescribeFastSet(tableRef value.HeapRef44, key value.TValue, newValue value.TValue) (FastAccess, bool, error) {
+	if err := validateKey(key); err != nil {
+		return FastAccess{}, false, err
+	}
+	if isNilValue(newValue) {
+		return FastAccess{}, false, nil
+	}
+	_, _, object, err := store.loadObject(tableRef)
+	if err != nil {
+		return FastAccess{}, false, err
+	}
+	if object.Flags&(FlagNewIndexFastPathBlocked|FlagWeakKeys|FlagWeakValues|FlagRehashing|FlagFrozen|FlagReadOnly) != 0 {
+		return FastAccess{}, false, nil
+	}
+	if index, ok := arrayIndex(key); ok && index <= object.ArrayCap {
+		slotValue, err := store.readArraySlot(object, index)
+		if err != nil {
+			return FastAccess{}, false, err
+		}
+		if !isNilValue(slotValue) {
+			return FastAccess{Kind: FastAccessArray, TableRef: tableRef, TableVersion: object.TableVersion, SlotIndex: index - 1, KeyBits: key.Bits()}, true, nil
+		}
+	}
+	if object.HashCapacity == 0 {
+		return FastAccess{}, false, nil
+	}
+	fullHash, keyClass, _, err := store.hashKey(object, key)
+	if err != nil {
+		return FastAccess{}, false, err
+	}
+	if keyClass != KeyClassInternedString {
+		return FastAccess{}, false, nil
+	}
+	slot, found, entry, err := store.findEntry(object, key, fullHash, keyClass)
+	if err != nil {
+		return FastAccess{}, false, err
+	}
+	if !found || isNilValue(entry.Value) {
+		return FastAccess{}, false, nil
+	}
+	return FastAccess{Kind: FastAccessHash, TableRef: tableRef, TableVersion: object.TableVersion, SlotIndex: slot, KeyBits: key.Bits()}, true, nil
 }
 
 func (store *Store) setValue(object Object, key value.TValue, newValue value.TValue) (Object, error) {
@@ -509,10 +608,7 @@ func (store *Store) loadObject(ref value.HeapRef44) (value.HeapOff64, []byte, Ob
 }
 
 func (store *Store) writeObject(offset value.HeapOff64, objectBytes []byte, object Object) error {
-	if err := WriteObject(objectBytes, object); err != nil {
-		return err
-	}
-	return store.heap.WriteHeader(offset, object.Common)
+	return WriteObject(objectBytes, object)
 }
 
 func shouldUseArrayPath(currentCap uint32, index uint32, newValue value.TValue) bool {

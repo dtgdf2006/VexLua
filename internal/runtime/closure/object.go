@@ -15,8 +15,9 @@ const (
 	FlagsOffset        = 0x22
 	Reserved0Offset    = 0x24
 	UpvaluesDataOffset = 0x28
-	Reserved1Offset    = 0x30
-	Reserved2Offset    = 0x38
+	FeedbackVectorOff  = 0x30
+	FeedbackSlotsOff   = 0x38
+	Reserved2Offset    = 0x3C
 )
 
 type Object struct {
@@ -26,6 +27,8 @@ type Object struct {
 	UpvalueCount uint16
 	Flags        uint16
 	UpvaluesData value.HeapOff64
+	FeedbackData value.HeapOff64
+	FeedbackSize uint32
 }
 
 type Handle struct {
@@ -69,6 +72,8 @@ func ReadObject(buffer []byte) (Object, error) {
 		UpvalueCount: binary.LittleEndian.Uint16(buffer[UpvalueCountOffset : UpvalueCountOffset+2]),
 		Flags:        binary.LittleEndian.Uint16(buffer[FlagsOffset : FlagsOffset+2]),
 		UpvaluesData: value.HeapOff64(binary.LittleEndian.Uint64(buffer[UpvaluesDataOffset : UpvaluesDataOffset+8])),
+		FeedbackData: value.HeapOff64(binary.LittleEndian.Uint64(buffer[FeedbackVectorOff : FeedbackVectorOff+8])),
+		FeedbackSize: binary.LittleEndian.Uint32(buffer[FeedbackSlotsOff : FeedbackSlotsOff+4]),
 	}, nil
 }
 
@@ -85,7 +90,8 @@ func WriteObject(buffer []byte, object Object) error {
 	binary.LittleEndian.PutUint16(buffer[FlagsOffset:FlagsOffset+2], object.Flags)
 	binary.LittleEndian.PutUint32(buffer[Reserved0Offset:Reserved0Offset+4], 0)
 	binary.LittleEndian.PutUint64(buffer[UpvaluesDataOffset:UpvaluesDataOffset+8], uint64(object.UpvaluesData))
-	binary.LittleEndian.PutUint64(buffer[Reserved1Offset:Reserved1Offset+8], 0)
-	binary.LittleEndian.PutUint64(buffer[Reserved2Offset:Reserved2Offset+8], 0)
+	binary.LittleEndian.PutUint64(buffer[FeedbackVectorOff:FeedbackVectorOff+8], uint64(object.FeedbackData))
+	binary.LittleEndian.PutUint32(buffer[FeedbackSlotsOff:FeedbackSlotsOff+4], object.FeedbackSize)
+	binary.LittleEndian.PutUint32(buffer[Reserved2Offset:Reserved2Offset+4], 0)
 	return nil
 }

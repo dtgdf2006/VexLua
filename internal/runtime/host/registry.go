@@ -23,17 +23,10 @@ type Setter func(target any, key string, newValue any) error
 type Caller func(target any, args []any) ([]any, error)
 
 type Descriptor struct {
-	ID        uint32
-	Kind      DescriptorKind
-	Version   uint32
-	Name      string
-	ShapeID   uint32
-	CacheSlot uint32
-	Arity     uint16
-	Flags     DescriptorFlags
-	Get       Getter
-	Set       Setter
-	Call      Caller
+	Name string
+	Get  Getter
+	Set  Setter
+	Call Caller
 }
 
 type entry struct {
@@ -41,7 +34,6 @@ type entry struct {
 	descriptor *Descriptor
 	target     any
 	refCount   uint32
-	version    uint32
 	nativeMeta value.HeapOff64
 }
 
@@ -112,8 +104,8 @@ func (registry *Registry) RegisterObject(name string, target any) (Handle, error
 			return existing, nil
 		}
 	}
-	descriptor := registry.getOrCreateDescriptorLocked(name, DescriptorKindObject, 0, DescriptorFlagIndexable|DescriptorFlagWritable, makeGetter(), makeSetter(), nil)
-	handle, err := registry.allocEntryLocked(target, descriptor)
+	descriptor := registry.getOrCreateDescriptorLocked(name, DescriptorKindObject, makeGetter(), makeSetter(), nil)
+	handle, err := registry.allocEntryLocked(target, descriptor, DescriptorKindObject, 0, DescriptorFlagIndexable|DescriptorFlagWritable)
 	if err != nil {
 		return 0, err
 	}
@@ -137,8 +129,8 @@ func (registry *Registry) RegisterFunction(name string, function any) (Handle, e
 	if callable.Type().IsVariadic() {
 		flags |= DescriptorFlagVariadic
 	}
-	descriptor := registry.getOrCreateDescriptorLocked(name, DescriptorKindFunction, uint16(callable.Type().NumIn()), flags, nil, nil, makeCaller())
-	handle, err := registry.allocEntryLocked(function, descriptor)
+	descriptor := registry.getOrCreateDescriptorLocked(name, DescriptorKindFunction, nil, nil, makeCaller())
+	handle, err := registry.allocEntryLocked(function, descriptor, DescriptorKindFunction, uint16(callable.Type().NumIn()), flags)
 	if err != nil {
 		return 0, err
 	}
@@ -152,12 +144,17 @@ func (registry *Registry) WrapObject(handle Handle, env value.TValue) (HostObjec
 		registry.mu.Unlock()
 		return HostObject{}, fmt.Errorf("unknown host handle %d", handle)
 	}
-	if entry.descriptor.Kind != DescriptorKindObject {
+	native, err := registry.readEntryNativeDescriptorLocked(entry)
+	if err != nil {
+		registry.mu.Unlock()
+		return HostObject{}, err
+	}
+	if native.Kind != DescriptorKindObject {
 		registry.mu.Unlock()
 		return HostObject{}, fmt.Errorf("host handle %d is not of expected kind %d", handle, DescriptorKindObject)
 	}
 	entry.refCount++
-	header := newHostObjectHeader(uint64(handle), entry.descriptor.ID, entry.version, entry.descriptor.CacheSlot, env, entry.nativeMeta)
+	header := newHostObjectHeader(uint64(handle), native.DescriptorVersion, env, entry.nativeMeta)
 	registry.mu.Unlock()
 	allocation, err := registry.heap.AllocObject(header.Common)
 	if err != nil {
@@ -183,12 +180,17 @@ func (registry *Registry) WrapFunction(handle Handle, env value.TValue) (HostFun
 		registry.mu.Unlock()
 		return HostFunction{}, fmt.Errorf("unknown host handle %d", handle)
 	}
-	if entry.descriptor.Kind != DescriptorKindFunction {
+	native, err := registry.readEntryNativeDescriptorLocked(entry)
+	if err != nil {
+		registry.mu.Unlock()
+		return HostFunction{}, err
+	}
+	if native.Kind != DescriptorKindFunction {
 		registry.mu.Unlock()
 		return HostFunction{}, fmt.Errorf("host handle %d is not of expected kind %d", handle, DescriptorKindFunction)
 	}
 	entry.refCount++
-	header := newHostFunctionHeader(uint64(handle), entry.descriptor.ID, entry.version, entry.descriptor.CacheSlot, env, entry.nativeMeta)
+	header := newHostFunctionHeader(uint64(handle), native.DescriptorVersion, env, entry.nativeMeta)
 	registry.mu.Unlock()
 	allocation, err := registry.heap.AllocObject(header.Common)
 	if err != nil {
@@ -212,9 +214,16 @@ func (registry *Registry) ReadHostObject(ref value.HeapRef44) (WrapperHeader, an
 	if err != nil {
 		return WrapperHeader{}, nil, nil, err
 	}
-	entry, err := registry.lookup(Handle(header.HostHandle), DescriptorKindObject)
+	entry, err := registry.lookupAny(Handle(header.HostHandle))
 	if err != nil {
 		return WrapperHeader{}, nil, nil, err
+	}
+	native, err := registry.readEntryNativeDescriptor(entry)
+	if err != nil {
+		return WrapperHeader{}, nil, nil, err
+	}
+	if native.Kind != DescriptorKindObject {
+		return WrapperHeader{}, nil, nil, fmt.Errorf("host handle %d is not of expected kind %d", header.HostHandle, DescriptorKindObject)
 	}
 	return header, entry.target, entry.descriptor, nil
 }
@@ -224,9 +233,16 @@ func (registry *Registry) ReadHostFunction(ref value.HeapRef44) (WrapperHeader, 
 	if err != nil {
 		return WrapperHeader{}, nil, nil, err
 	}
-	entry, err := registry.lookup(Handle(header.HostHandle), DescriptorKindFunction)
+	entry, err := registry.lookupAny(Handle(header.HostHandle))
 	if err != nil {
 		return WrapperHeader{}, nil, nil, err
+	}
+	native, err := registry.readEntryNativeDescriptor(entry)
+	if err != nil {
+		return WrapperHeader{}, nil, nil, err
+	}
+	if native.Kind != DescriptorKindFunction {
+		return WrapperHeader{}, nil, nil, fmt.Errorf("host handle %d is not of expected kind %d", header.HostHandle, DescriptorKindFunction)
 	}
 	return header, entry.target, entry.descriptor, nil
 }
@@ -236,7 +252,11 @@ func (registry *Registry) DescriptorVersion(handle Handle) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	return entry.version, nil
+	native, err := registry.readEntryNativeDescriptor(entry)
+	if err != nil {
+		return 0, err
+	}
+	return native.DescriptorVersion, nil
 }
 
 func (registry *Registry) BumpDescriptorVersion(handle Handle) error {
@@ -246,9 +266,13 @@ func (registry *Registry) BumpDescriptorVersion(handle Handle) error {
 	if !ok {
 		return fmt.Errorf("unknown host handle %d", handle)
 	}
-	entry.version++
-	entry.descriptor.Version = entry.version
-	return registry.syncEntryNativeDescriptorLocked(entry)
+	native, err := registry.readEntryNativeDescriptorLocked(entry)
+	if err != nil {
+		return err
+	}
+	native.DescriptorVersion++
+	native.Common.Version = native.DescriptorVersion
+	return registry.writeEntryNativeDescriptorLocked(entry, native)
 }
 
 func (registry *Registry) Release(handle Handle) error {
@@ -272,10 +296,10 @@ func (registry *Registry) Release(handle Handle) error {
 	return nil
 }
 
-func (registry *Registry) allocEntryLocked(target any, descriptor *Descriptor) (Handle, error) {
+func (registry *Registry) allocEntryLocked(target any, descriptor *Descriptor, kind DescriptorKind, arity uint16, flags DescriptorFlags) (Handle, error) {
 	handle := registry.nextHandle
 	registry.nextHandle++
-	nativeMeta, err := registry.allocNativeDescriptorLocked(descriptor, descriptor.Version)
+	nativeMeta, err := registry.allocNativeDescriptorLocked(kind, arity, flags)
 	if err != nil {
 		return 0, err
 	}
@@ -284,13 +308,12 @@ func (registry *Registry) allocEntryLocked(target any, descriptor *Descriptor) (
 		descriptor: descriptor,
 		target:     target,
 		refCount:   1,
-		version:    descriptor.Version,
 		nativeMeta: nativeMeta,
 	}
 	return handle, nil
 }
 
-func (registry *Registry) getOrCreateDescriptorLocked(name string, kind DescriptorKind, arity uint16, flags DescriptorFlags, getter Getter, setter Setter, caller Caller) *Descriptor {
+func (registry *Registry) getOrCreateDescriptorLocked(name string, kind DescriptorKind, getter Getter, setter Setter, caller Caller) *Descriptor {
 	key := fmt.Sprintf("%d:%s", kind, name)
 	if descriptor, ok := registry.byDescName[key]; ok {
 		descriptor.Get = getter
@@ -299,21 +322,11 @@ func (registry *Registry) getOrCreateDescriptorLocked(name string, kind Descript
 		return descriptor
 	}
 	descriptor := &Descriptor{
-		ID:        registry.nextDescID,
-		Kind:      kind,
-		Version:   1,
-		Name:      name,
-		ShapeID:   registry.nextShapeID,
-		CacheSlot: registry.nextCacheSlot,
-		Arity:     arity,
-		Flags:     flags,
-		Get:       getter,
-		Set:       setter,
-		Call:      caller,
+		Name: name,
+		Get:  getter,
+		Set:  setter,
+		Call: caller,
 	}
-	registry.nextDescID++
-	registry.nextShapeID++
-	registry.nextCacheSlot++
 	registry.byDescName[key] = descriptor
 	return descriptor
 }
@@ -329,15 +342,41 @@ func (registry *Registry) ReadNativeDescriptor(offset value.HeapOff64) (NativeDe
 	return readNativeDescriptor(bytes)
 }
 
-func (registry *Registry) lookup(handle Handle, kind DescriptorKind) (*entry, error) {
-	entry, err := registry.lookupAny(handle)
+func (registry *Registry) RefreshWrapper(ref value.HeapRef44) (WrapperHeader, error) {
+	header, bytes, err := registry.readAnyWrapperBytes(ref)
 	if err != nil {
-		return nil, err
+		return WrapperHeader{}, err
 	}
-	if entry.descriptor.Kind != kind {
-		return nil, fmt.Errorf("host handle %d is not of expected kind %d", handle, kind)
+	entry, err := registry.lookupAny(Handle(header.HostHandle))
+	if err != nil {
+		return WrapperHeader{}, err
 	}
-	return entry, nil
+	native, err := registry.readEntryNativeDescriptor(entry)
+	if err != nil {
+		return WrapperHeader{}, err
+	}
+	switch header.Common.Kind {
+	case value.KindHostObject:
+		if native.Kind != DescriptorKindObject {
+			return WrapperHeader{}, fmt.Errorf("host handle %d is not of expected kind %d", header.HostHandle, DescriptorKindObject)
+		}
+	case value.KindHostFunction:
+		if native.Kind != DescriptorKindFunction {
+			return WrapperHeader{}, fmt.Errorf("host handle %d is not of expected kind %d", header.HostHandle, DescriptorKindFunction)
+		}
+	default:
+		return WrapperHeader{}, fmt.Errorf("expected host wrapper, got %s", header.Common.Kind)
+	}
+	expectedFlags := WrapperFlagsForDescriptor(native.Kind, native.Flags)
+	if header.DescriptorVersion == native.DescriptorVersion && header.Flags == expectedFlags {
+		return header, nil
+	}
+	header.DescriptorVersion = native.DescriptorVersion
+	header.Flags = expectedFlags
+	if err := writeWrapperHeader(bytes, header); err != nil {
+		return WrapperHeader{}, err
+	}
+	return header, nil
 }
 
 func (registry *Registry) lookupAny(handle Handle) (*entry, error) {
@@ -350,19 +389,43 @@ func (registry *Registry) lookupAny(handle Handle) (*entry, error) {
 	return entry, nil
 }
 
-func (registry *Registry) allocNativeDescriptorLocked(descriptor *Descriptor, version uint32) (value.HeapOff64, error) {
-	allocation, err := registry.heap.AllocObject(newNativeDescriptor(descriptor.ID, version, descriptor.ShapeID, descriptor.CacheSlot, descriptor.Arity, descriptor.Flags, descriptor.Kind).Common)
+func (registry *Registry) allocNativeDescriptorLocked(kind DescriptorKind, arity uint16, flags DescriptorFlags) (value.HeapOff64, error) {
+	descriptorID := registry.nextDescID
+	shapeID := registry.nextShapeID
+	cacheSlot := registry.nextCacheSlot
+	registry.nextDescID++
+	registry.nextShapeID++
+	registry.nextCacheSlot++
+	native := newNativeDescriptor(descriptorID, 1, shapeID, cacheSlot, arity, flags, kind)
+	allocation, err := registry.heap.AllocObject(native.Common)
 	if err != nil {
 		return 0, err
 	}
-	native := newNativeDescriptor(descriptor.ID, version, descriptor.ShapeID, descriptor.CacheSlot, descriptor.Arity, descriptor.Flags, descriptor.Kind)
 	if err := writeNativeDescriptor(allocation.Bytes, native); err != nil {
 		return 0, err
 	}
 	return allocation.Offset, nil
 }
 
-func (registry *Registry) syncEntryNativeDescriptorLocked(entry *entry) error {
+func (registry *Registry) readEntryNativeDescriptor(entry *entry) (NativeDescriptor, error) {
+	if entry == nil {
+		return NativeDescriptor{}, fmt.Errorf("entry cannot be nil")
+	}
+	return registry.ReadNativeDescriptor(entry.nativeMeta)
+}
+
+func (registry *Registry) readEntryNativeDescriptorLocked(entry *entry) (NativeDescriptor, error) {
+	if entry == nil {
+		return NativeDescriptor{}, fmt.Errorf("entry cannot be nil")
+	}
+	bytes, err := registry.heap.Resolve(entry.nativeMeta, hostDescriptorSize)
+	if err != nil {
+		return NativeDescriptor{}, err
+	}
+	return readNativeDescriptor(bytes)
+}
+
+func (registry *Registry) writeEntryNativeDescriptorLocked(entry *entry, native NativeDescriptor) error {
 	if entry == nil {
 		return fmt.Errorf("entry cannot be nil")
 	}
@@ -370,7 +433,6 @@ func (registry *Registry) syncEntryNativeDescriptorLocked(entry *entry) error {
 	if err != nil {
 		return err
 	}
-	native := newNativeDescriptor(entry.descriptor.ID, entry.version, entry.descriptor.ShapeID, entry.descriptor.CacheSlot, entry.descriptor.Arity, entry.descriptor.Flags, entry.descriptor.Kind)
 	return writeNativeDescriptor(bytes, native)
 }
 
@@ -388,6 +450,35 @@ func (registry *Registry) readWrapper(ref value.HeapRef44, expectedKind value.Ob
 		return WrapperHeader{}, err
 	}
 	return readWrapperHeader(bytes, expectedKind, expectedSize)
+}
+
+func (registry *Registry) readAnyWrapperBytes(ref value.HeapRef44) (WrapperHeader, []byte, error) {
+	address, err := registry.heap.DecodeHeapRef(ref)
+	if err != nil {
+		return WrapperHeader{}, nil, err
+	}
+	offset, err := registry.heap.OffsetForAddress(address)
+	if err != nil {
+		return WrapperHeader{}, nil, err
+	}
+	bytes, err := registry.heap.Resolve(offset, hostObjectSize)
+	if err != nil {
+		return WrapperHeader{}, nil, err
+	}
+	common, err := value.ReadCommonHeader(bytes)
+	if err != nil {
+		return WrapperHeader{}, nil, err
+	}
+	switch common.Kind {
+	case value.KindHostObject:
+		header, err := readWrapperHeader(bytes, value.KindHostObject, hostObjectSize)
+		return header, bytes, err
+	case value.KindHostFunction:
+		header, err := readWrapperHeader(bytes, value.KindHostFunction, hostFunctionSize)
+		return header, bytes, err
+	default:
+		return WrapperHeader{}, nil, fmt.Errorf("expected host wrapper, got %s", common.Kind)
+	}
 }
 
 func hostIdentity(target any) (uintptr, bool) {

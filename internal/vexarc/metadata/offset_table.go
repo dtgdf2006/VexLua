@@ -8,6 +8,51 @@ import (
 
 const UnmappedOffset = math.MaxUint32
 
+type ContinuationKind uint32
+
+const (
+	ContinuationInvalid ContinuationKind = iota
+	ContinuationGetGlobal
+	ContinuationGetTable
+	ContinuationSetGlobal
+	ContinuationSetTable
+	ContinuationCall
+	ContinuationTailCall
+	ContinuationForPrep
+	ContinuationForLoop
+	ContinuationDeopt
+)
+
+const (
+	ContinuationFlagAlternateResume uint32 = 1 << iota
+	ContinuationFlagFinalExit
+)
+
+type ContinuationSite struct {
+	Kind             ContinuationKind
+	Flags            uint32
+	StubID           uint32
+	BytecodePC       uint32
+	DeoptPC          uint32
+	ResumePC         uint32
+	ResumeCodeOffset uint32
+	AltResumePC      uint32
+	AltResumeCodeOff uint32
+	Operand0         uint32
+	Operand1         uint32
+	Operand2         uint32
+	Operand3         uint32
+	LiveSlots        uint32
+}
+
+func (site ContinuationSite) HasAlternateResume() bool {
+	return site.Flags&ContinuationFlagAlternateResume != 0
+}
+
+func (site ContinuationSite) IsFinalExit() bool {
+	return site.Flags&ContinuationFlagFinalExit != 0
+}
+
 type OffsetTableBuilder struct {
 	previous uint32
 	bytes    []byte
@@ -30,6 +75,7 @@ func (builder *OffsetTableBuilder) Bytes() []byte {
 type CodeMetadata struct {
 	BytecodeToCode []uint32
 	OffsetTable    []byte
+	Sites          []ContinuationSite
 }
 
 func NewCodeMetadata(instructionCount int) CodeMetadata {
@@ -48,12 +94,24 @@ func (metadata *CodeMetadata) RecordBytecodeOffset(bytecodeOffset int, codeOffse
 	return nil
 }
 
+func (metadata *CodeMetadata) AddContinuationSite(site ContinuationSite) uint32 {
+	site.ResumeCodeOffset = UnmappedOffset
+	site.AltResumeCodeOff = UnmappedOffset
+	metadata.Sites = append(metadata.Sites, site)
+	return uint32(len(metadata.Sites) - 1)
+}
+
 func (metadata *CodeMetadata) Finalize(builder *OffsetTableBuilder) {
 	if builder == nil {
 		metadata.OffsetTable = nil
-		return
+	} else {
+		metadata.OffsetTable = builder.Bytes()
 	}
-	metadata.OffsetTable = builder.Bytes()
+	for index := range metadata.Sites {
+		site := &metadata.Sites[index]
+		site.ResumeCodeOffset = metadata.lookupCodeOffset(site.ResumePC)
+		site.AltResumeCodeOff = metadata.lookupCodeOffset(site.AltResumePC)
+	}
 }
 
 func (metadata CodeMetadata) CodeOffset(bytecodeOffset int) (uint32, bool) {
@@ -65,6 +123,24 @@ func (metadata CodeMetadata) CodeOffset(bytecodeOffset int) (uint32, bool) {
 		return 0, false
 	}
 	return offset, true
+}
+
+func (metadata CodeMetadata) ContinuationSite(siteID uint32) (ContinuationSite, bool) {
+	if int(siteID) < 0 || int(siteID) >= len(metadata.Sites) {
+		return ContinuationSite{}, false
+	}
+	return metadata.Sites[siteID], true
+}
+
+func (metadata CodeMetadata) lookupCodeOffset(bytecodePC uint32) uint32 {
+	if bytecodePC == UnmappedOffset {
+		return UnmappedOffset
+	}
+	offset, ok := metadata.CodeOffset(int(bytecodePC))
+	if !ok {
+		return UnmappedOffset
+	}
+	return offset
 }
 
 type OffsetIterator struct {

@@ -4,6 +4,10 @@ type ID uint32
 
 const (
 	StubInvalid ID = iota
+	StubGetGlobal
+	StubGetTable
+	StubSetGlobal
+	StubSetTable
 	StubLuaCall
 	StubTailCall
 	StubForPrep
@@ -16,10 +20,14 @@ type Descriptor struct {
 }
 
 var Catalog = map[ID]Descriptor{
-	StubLuaCall:  {ID: StubLuaCall, Name: "lua-call"},
-	StubTailCall: {ID: StubTailCall, Name: "tail-call"},
-	StubForPrep:  {ID: StubForPrep, Name: "for-prep"},
-	StubForLoop:  {ID: StubForLoop, Name: "for-loop"},
+	StubGetGlobal: {ID: StubGetGlobal, Name: "get-global"},
+	StubGetTable:  {ID: StubGetTable, Name: "get-table"},
+	StubSetGlobal: {ID: StubSetGlobal, Name: "set-global"},
+	StubSetTable:  {ID: StubSetTable, Name: "set-table"},
+	StubLuaCall:   {ID: StubLuaCall, Name: "lua-call"},
+	StubTailCall:  {ID: StubTailCall, Name: "tail-call"},
+	StubForPrep:   {ID: StubForPrep, Name: "for-prep"},
+	StubForLoop:   {ID: StubForLoop, Name: "for-loop"},
 }
 
 func Lookup(id ID) (Descriptor, bool) {

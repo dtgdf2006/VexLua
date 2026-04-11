@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"vexlua/internal/bytecode"
+	"vexlua/internal/runtime/feedback"
 	"vexlua/internal/runtime/heap"
 	rproto "vexlua/internal/runtime/proto"
 	"vexlua/internal/runtime/value"
@@ -45,9 +46,6 @@ func (store *Store) NewLuaClosure(proto *bytecode.Proto, env value.TValue, upval
 		for index, ref := range upvalues {
 			binary.LittleEndian.PutUint64(allocation.Bytes[index*8:(index+1)*8], uint64(ref))
 		}
-		if err := store.heap.SyncNative(allocation.Offset, allocation.Bytes); err != nil {
-			return Handle{}, err
-		}
 		upvaluesOffset = allocation.Offset
 	}
 	object := NewObject(protoHandle.Value, env, uint16(len(upvalues)), upvaluesOffset)
@@ -56,9 +54,6 @@ func (store *Store) NewLuaClosure(proto *bytecode.Proto, env value.TValue, upval
 		return Handle{}, err
 	}
 	if err := WriteObject(allocation.Bytes, object); err != nil {
-		return Handle{}, err
-	}
-	if err := store.heap.SyncNative(allocation.Offset, allocation.Bytes); err != nil {
 		return Handle{}, err
 	}
 	ref, err := store.heap.EncodeHeapRef(allocation.Address)
@@ -150,6 +145,111 @@ func (store *Store) UpvalueRefs(ref value.HeapRef44) ([]value.HeapRef44, error) 
 		refs[index] = upvalueRef
 	}
 	return refs, nil
+}
+
+func (store *Store) EnsureFeedbackVector(ref value.HeapRef44, layout *feedback.Layout) (uintptr, error) {
+	if layout == nil || layout.SlotCount() == 0 {
+		return 0, nil
+	}
+	_, objectBytes, err := store.objectBytes(ref)
+	if err != nil {
+		return 0, err
+	}
+	object, err := ReadObject(objectBytes)
+	if err != nil {
+		return 0, err
+	}
+	if object.FeedbackData != 0 {
+		if object.FeedbackSize != layout.SlotCount() {
+			return 0, fmt.Errorf("closure %#x feedback slot count mismatch: have %d want %d", uint64(ref), object.FeedbackSize, layout.SlotCount())
+		}
+		return store.heap.NativeAddressForOffset(object.FeedbackData)
+	}
+	vector, err := store.heap.Alloc(feedback.VectorSize(layout.SlotCount()))
+	if err != nil {
+		return 0, err
+	}
+	if err := feedback.WriteHeader(vector.Bytes[:feedback.HeaderSize], feedback.NewHeader(layout.SlotCount())); err != nil {
+		return 0, err
+	}
+	for index, slot := range layout.Slots() {
+		start := feedback.CellOffset(uint32(index))
+		if err := feedback.WriteCell(vector.Bytes[start:start+feedback.CellSize], feedback.NewGenericCell(slot.Kind)); err != nil {
+			return 0, err
+		}
+	}
+	object.FeedbackData = vector.Offset
+	object.FeedbackSize = layout.SlotCount()
+	if err := WriteObject(objectBytes, object); err != nil {
+		return 0, err
+	}
+	return store.heap.NativeAddressForOffset(object.FeedbackData)
+}
+
+func (store *Store) FeedbackVectorBase(ref value.HeapRef44) (uintptr, error) {
+	object, err := store.Object(ref)
+	if err != nil {
+		return 0, err
+	}
+	if object.FeedbackData == 0 {
+		return 0, nil
+	}
+	return store.heap.NativeAddressForOffset(object.FeedbackData)
+}
+
+func (store *Store) ReadFeedbackHeader(ref value.HeapRef44) (feedback.Header, error) {
+	object, err := store.Object(ref)
+	if err != nil {
+		return feedback.Header{}, err
+	}
+	if object.FeedbackData == 0 {
+		return feedback.Header{}, fmt.Errorf("closure %#x has no feedback vector", uint64(ref))
+	}
+	bytes, err := store.heap.Resolve(object.FeedbackData, feedback.HeaderSize)
+	if err != nil {
+		return feedback.Header{}, err
+	}
+	return feedback.ReadHeader(bytes)
+}
+
+func (store *Store) ReadFeedbackCell(ref value.HeapRef44, slot uint32) (feedback.Cell, error) {
+	object, err := store.Object(ref)
+	if err != nil {
+		return feedback.Cell{}, err
+	}
+	if object.FeedbackData == 0 {
+		return feedback.Cell{}, fmt.Errorf("closure %#x has no feedback vector", uint64(ref))
+	}
+	if slot >= object.FeedbackSize {
+		return feedback.Cell{}, fmt.Errorf("feedback slot %d is outside %d slots", slot, object.FeedbackSize)
+	}
+	bytes, err := store.heap.Resolve(object.FeedbackData+value.HeapOff64(feedback.CellOffset(slot)), feedback.CellSize)
+	if err != nil {
+		return feedback.Cell{}, err
+	}
+	return feedback.ReadCell(bytes)
+}
+
+func (store *Store) WriteFeedbackCell(ref value.HeapRef44, slot uint32, cell feedback.Cell) error {
+	object, err := store.Object(ref)
+	if err != nil {
+		return err
+	}
+	if object.FeedbackData == 0 {
+		return fmt.Errorf("closure %#x has no feedback vector", uint64(ref))
+	}
+	if slot >= object.FeedbackSize {
+		return fmt.Errorf("feedback slot %d is outside %d slots", slot, object.FeedbackSize)
+	}
+	cellOffset := object.FeedbackData + value.HeapOff64(feedback.CellOffset(slot))
+	bytes, err := store.heap.Resolve(cellOffset, feedback.CellSize)
+	if err != nil {
+		return err
+	}
+	if err := feedback.WriteCell(bytes, cell); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (store *Store) objectBytes(ref value.HeapRef44) (value.HeapOff64, []byte, error) {

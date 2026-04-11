@@ -66,18 +66,10 @@ type threadContext struct {
 }
 
 type activation struct {
-	thread        *state.ThreadState
-	frame         *state.CallFrameHeader
-	closureRef    value.HeapRef44
-	closureObject closure.Object
-	proto         *bytecode.Proto
-	upvalueRefs   []value.HeapRef44
-	env           value.TValue
-	registerBase  uint32
-	baseAddress   uintptr
-	reservedSlots uint32
-	top           uint32
-	pc            int
+	thread *state.ThreadState
+	frame  *state.CallFrameHeader
+	top    uint32
+	pc     int
 }
 
 type threadSnapshot struct {
@@ -87,6 +79,7 @@ type threadSnapshot struct {
 func New() *Engine {
 	runtimeHeap := heap.MustNew(0, 0)
 	protos := rproto.NewStore(runtimeHeap)
+	vmState := state.NewVMState(runtimeHeap)
 	return &Engine{
 		Heap:     runtimeHeap,
 		Strings:  rtstring.NewInternTable(runtimeHeap, 0x9E3779B9),
@@ -94,8 +87,8 @@ func New() *Engine {
 		Hosts:    host.NewRegistry(runtimeHeap),
 		Protos:   protos,
 		Closures: closure.NewStore(runtimeHeap, protos),
-		Upvalues: upvalue.NewManager(runtimeHeap),
-		State:    state.NewVMState(runtimeHeap),
+		Upvalues: upvalue.NewManager(runtimeHeap, vmState),
+		State:    vmState,
 		threads:  make(map[uint64]*threadContext),
 	}
 }
@@ -153,7 +146,7 @@ func (engine *Engine) SetGlobal(env value.TValue, name string, slotValue value.T
 	if err != nil {
 		return err
 	}
-	return engine.setTable(env, key.Value, slotValue)
+	return engine.WriteIndexBoundary(env, key.Value, slotValue)
 }
 
 func (engine *Engine) GetGlobal(env value.TValue, name string) (value.TValue, bool, error) {
@@ -161,7 +154,7 @@ func (engine *Engine) GetGlobal(env value.TValue, name string) (value.TValue, bo
 	if err != nil {
 		return value.NilValue(), false, err
 	}
-	return engine.getTable(env, key.Value)
+	return engine.ReadIndexBoundary(env, key.Value)
 }
 
 func (engine *Engine) Call(thread *state.ThreadState, callee value.TValue, args []value.TValue, nresults int) ([]value.TValue, error) {
@@ -200,14 +193,7 @@ func (engine *Engine) ProtectedCall(thread *state.ThreadState, callee value.TVal
 }
 
 func (engine *Engine) callValue(thread *state.ThreadState, callee value.TValue, args []value.TValue, nresults int) ([]value.TValue, error) {
-	if callee.IsBoxedTag(value.TagHostFunctionRef) {
-		return engine.callHostFunction(callee, args, nresults)
-	}
-	if !callee.IsBoxedTag(value.TagLuaClosureRef) {
-		return nil, fmt.Errorf("interpreter only supports LuaClosure and HostFunction calls, got %s", callee)
-	}
-	ref, _ := callee.HeapRef()
-	return engine.callLuaClosure(thread, ref, args, nresults)
+	return engine.CallValueBoundary(thread, callee, args, nresults)
 }
 
 func (engine *Engine) threadState(thread *state.ThreadState) *threadContext {
@@ -231,11 +217,27 @@ func (engine *Engine) restoreSnapshot(thread *state.ThreadState, snapshot thread
 	ctx := engine.threadState(thread)
 	for len(ctx.activations) > snapshot.activations {
 		act := ctx.activations[len(ctx.activations)-1]
-		_, _ = engine.Upvalues.CloseAtOrAbove(thread, act.baseAddress)
+		_, _ = engine.Upvalues.CloseAtOrAbove(thread, activationBaseAddress(act))
 		_, _ = thread.PopFrame()
 		ctx.activations = ctx.activations[:len(ctx.activations)-1]
-		engine.clearSlots(thread, act.registerBase, act.reservedSlots)
+		if registerBase, err := thread.SlotIndexForAddress(activationBaseAddress(act)); err == nil {
+			engine.clearSlots(thread, registerBase, activationReservedSlots(act))
+		}
 	}
+}
+
+func activationBaseAddress(act *activation) uintptr {
+	if act == nil || act.frame == nil {
+		return 0
+	}
+	return uintptr(act.frame.RegsBase)
+}
+
+func activationReservedSlots(act *activation) uint32 {
+	if act == nil || act.frame == nil || act.frame.RegisterCount == 0 {
+		return 1
+	}
+	return uint32(act.frame.RegisterCount)
 }
 
 func (engine *Engine) clearSlots(thread *state.ThreadState, start uint32, count uint32) {

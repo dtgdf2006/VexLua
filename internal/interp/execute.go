@@ -1,11 +1,12 @@
 package interp
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 
 	"vexlua/internal/bytecode"
-	"vexlua/internal/runtime/host"
+	"vexlua/internal/runtime/feedback"
 	"vexlua/internal/runtime/state"
 	rtstring "vexlua/internal/runtime/string"
 	"vexlua/internal/runtime/value"
@@ -21,10 +22,6 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 		return nil, fmt.Errorf("closure %#x has invalid proto reference %s", uint64(closureRef), closureObject.Proto)
 	}
 	proto, err := engine.Protos.Resolve(protoRef)
-	if err != nil {
-		return nil, err
-	}
-	upvalueRefs, err := engine.Closures.UpvalueRefs(closureRef)
 	if err != nil {
 		return nil, err
 	}
@@ -44,10 +41,6 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 	}
 	if registerBase+reservedSlots > thread.StackSlots() {
 		return nil, fmt.Errorf("thread stack exhausted: need %d slots, have %d", registerBase+reservedSlots, thread.StackSlots())
-	}
-	baseAddress, err := thread.SlotAddress(registerBase)
-	if err != nil {
-		return nil, err
 	}
 	constBase, err := engine.Protos.ConstantBase(proto, engine.Strings)
 	if err != nil {
@@ -74,18 +67,10 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 	engine.clearSlots(thread, registerBase, reservedSlots)
 
 	activation := &activation{
-		thread:        thread,
-		frame:         frame,
-		closureRef:    closureRef,
-		closureObject: closureObject,
-		proto:         proto,
-		upvalueRefs:   upvalueRefs,
-		env:           closureObject.Env,
-		registerBase:  registerBase,
-		baseAddress:   baseAddress,
-		reservedSlots: reservedSlots,
-		top:           uint32(minInt(len(args), int(registerCount))),
-		pc:            0,
+		thread: thread,
+		frame:  frame,
+		top:    uint32(minInt(len(args), int(registerCount))),
+		pc:     0,
 	}
 	ctx.activations = append(ctx.activations, activation)
 
@@ -103,7 +88,7 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 	}
 
 	results, execErr := engine.executeActivation(activation, varargs)
-	_, closeErr := engine.Upvalues.CloseAtOrAbove(thread, activation.baseAddress)
+	_, closeErr := engine.Upvalues.CloseAtOrAbove(thread, uintptr(frame.RegsBase))
 	_, popErr := thread.PopFrame()
 	ctx.activations = ctx.activations[:len(ctx.activations)-1]
 	engine.clearSlots(thread, registerBase, reservedSlots)
@@ -120,10 +105,51 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 	return normalizeResults(results, nresults), nil
 }
 
+func (engine *Engine) ResumeLuaFrame(thread *state.ThreadState, frame *state.CallFrameHeader, startPC int) ([]value.TValue, error) {
+	if thread == nil {
+		return nil, fmt.Errorf("thread cannot be nil")
+	}
+	if frame == nil {
+		return nil, fmt.Errorf("frame cannot be nil")
+	}
+	if thread.CurrentFrame() != frame {
+		return nil, fmt.Errorf("resume target must be the active frame")
+	}
+	protoRef, ok := frame.Proto.HeapRef()
+	if !ok {
+		return nil, fmt.Errorf("frame proto is not a proto reference: %s", frame.Proto)
+	}
+	proto, err := engine.Protos.Resolve(protoRef)
+	if err != nil {
+		return nil, err
+	}
+	if err := bytecode.ValidateProto(proto); err != nil {
+		return nil, err
+	}
+	varargs, err := engine.frameVarargs(thread, frame)
+	if err != nil {
+		return nil, err
+	}
+	activation := &activation{thread: thread, frame: frame, top: uint32(frame.RegisterCount), pc: startPC}
+	ctx := engine.threadState(thread)
+	ctx.activations = append(ctx.activations, activation)
+	defer func() {
+		ctx.activations = ctx.activations[:len(ctx.activations)-1]
+	}()
+	return engine.executeActivation(activation, varargs)
+}
+
 func (engine *Engine) executeActivation(act *activation, varargs []value.TValue) ([]value.TValue, error) {
-	for act.pc < len(act.proto.Code) {
+	for {
+		proto, err := engine.activationProto(act)
+		if err != nil {
+			return nil, err
+		}
+		if act.pc >= len(proto.Code) {
+			break
+		}
 		pc := act.pc
-		instruction := act.proto.Code[pc]
+		instruction := proto.Code[pc]
 		opcode := instruction.Opcode()
 		act.frame.SavedBCOff = uint32(pc)
 		act.pc++
@@ -140,7 +166,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 		case bytecode.OP_LOADK:
 			constantValue, err := engine.constantValue(act, instruction.Bx())
 			if err != nil {
-				return nil, runtimeError(act.proto, pc, opcode, err.Error())
+				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
 			if err := engine.setRegister(act, instruction.A(), constantValue); err != nil {
 				return nil, err
@@ -159,10 +185,11 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 				}
 			}
 		case bytecode.OP_GETUPVAL:
-			if instruction.B() >= len(act.upvalueRefs) {
-				return nil, runtimeError(act.proto, pc, opcode, fmt.Sprintf("upvalue %d is out of range", instruction.B()))
+			upvalueRef, err := engine.activationUpvalueRef(act, instruction.B())
+			if err != nil {
+				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
-			upvalueValue, err := engine.Upvalues.Get(act.upvalueRefs[instruction.B()])
+			upvalueValue, err := engine.Upvalues.Get(upvalueRef)
 			if err != nil {
 				return nil, err
 			}
@@ -172,12 +199,17 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 		case bytecode.OP_GETGLOBAL:
 			key, err := engine.constantValue(act, instruction.Bx())
 			if err != nil {
-				return nil, runtimeError(act.proto, pc, opcode, err.Error())
+				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
-			globalValue, _, err := engine.getTable(act.env, key)
+			env, err := engine.activationEnv(act)
 			if err != nil {
 				return nil, err
 			}
+			globalValue, _, err := engine.getTable(env, key)
+			if err != nil {
+				return nil, err
+			}
+			engine.recordGetFeedback(act, pc, feedback.SlotGetGlobal, env, key)
 			if err := engine.setRegister(act, instruction.A(), globalValue); err != nil {
 				return nil, err
 			}
@@ -194,30 +226,37 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
+			engine.recordGetFeedback(act, pc, feedback.SlotGetTable, tableValue, key)
 			if err := engine.setRegister(act, instruction.A(), result); err != nil {
 				return nil, err
 			}
 		case bytecode.OP_SETGLOBAL:
 			key, err := engine.constantValue(act, instruction.Bx())
 			if err != nil {
-				return nil, runtimeError(act.proto, pc, opcode, err.Error())
+				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
 			registerValue, err := engine.registerValue(act, instruction.A())
 			if err != nil {
 				return nil, err
 			}
-			if err := engine.setTable(act.env, key, registerValue); err != nil {
+			env, err := engine.activationEnv(act)
+			if err != nil {
 				return nil, err
 			}
+			if err := engine.setTable(env, key, registerValue); err != nil {
+				return nil, err
+			}
+			engine.recordSetFeedback(act, pc, feedback.SlotSetGlobal, env, key, registerValue)
 		case bytecode.OP_SETUPVAL:
-			if instruction.B() >= len(act.upvalueRefs) {
-				return nil, runtimeError(act.proto, pc, opcode, fmt.Sprintf("upvalue %d is out of range", instruction.B()))
-			}
 			registerValue, err := engine.registerValue(act, instruction.A())
 			if err != nil {
 				return nil, err
 			}
-			if err := engine.Upvalues.Set(act.upvalueRefs[instruction.B()], registerValue); err != nil {
+			upvalueRef, err := engine.activationUpvalueRef(act, instruction.B())
+			if err != nil {
+				return nil, runtimeError(proto, pc, opcode, err.Error())
+			}
+			if err := engine.Upvalues.Set(upvalueRef, registerValue); err != nil {
 				return nil, err
 			}
 		case bytecode.OP_SETTABLE:
@@ -236,6 +275,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err := engine.setTable(tableValue, key, slotValue); err != nil {
 				return nil, err
 			}
+			engine.recordSetFeedback(act, pc, feedback.SlotSetTable, tableValue, key, slotValue)
 		case bytecode.OP_NEWTABLE:
 			handle, err := engine.Tables.New(uint32(fb2int(instruction.B())), uint32(fb2int(instruction.C())))
 			if err != nil {
@@ -292,7 +332,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			}
 			equal, err := engine.valuesEqual(left, right)
 			if err != nil {
-				return nil, runtimeError(act.proto, pc, opcode, err.Error())
+				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
 			if equal == (instruction.A() != 0) {
 				if err := engine.takeTestJump(act, pc, opcode); err != nil {
@@ -312,7 +352,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			}
 			less, err := engine.valuesLess(left, right)
 			if err != nil {
-				return nil, runtimeError(act.proto, pc, opcode, err.Error())
+				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
 			if less == (instruction.A() != 0) {
 				if err := engine.takeTestJump(act, pc, opcode); err != nil {
@@ -332,7 +372,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			}
 			lessEqual, err := engine.valuesLessEqual(left, right)
 			if err != nil {
-				return nil, runtimeError(act.proto, pc, opcode, err.Error())
+				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
 			if lessEqual == (instruction.A() != 0) {
 				if err := engine.takeTestJump(act, pc, opcode); err != nil {
@@ -394,7 +434,11 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 		case bytecode.OP_RETURN:
 			return engine.collectReturnValues(act, instruction.A(), instruction.B())
 		case bytecode.OP_CLOSE:
-			address, err := act.thread.SlotAddress(act.registerBase + uint32(instruction.A()))
+			registerBase, err := engine.activationRegisterBase(act)
+			if err != nil {
+				return nil, err
+			}
+			address, err := act.thread.SlotAddress(registerBase + uint32(instruction.A()))
 			if err != nil {
 				return nil, err
 			}
@@ -403,15 +447,19 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			}
 		case bytecode.OP_CLOSURE:
 			childProtoIndex := instruction.Bx()
-			if childProtoIndex < 0 || childProtoIndex >= len(act.proto.Protos) {
-				return nil, runtimeError(act.proto, pc, opcode, fmt.Sprintf("child proto %d is out of range", childProtoIndex))
+			if childProtoIndex < 0 || childProtoIndex >= len(proto.Protos) {
+				return nil, runtimeError(proto, pc, opcode, fmt.Sprintf("child proto %d is out of range", childProtoIndex))
 			}
-			childProto := act.proto.Protos[childProtoIndex]
+			childProto := proto.Protos[childProtoIndex]
 			capturedRefs, err := engine.captureUpvalues(act, childProto, pc, opcode)
 			if err != nil {
 				return nil, err
 			}
-			closureHandle, err := engine.Closures.NewLuaClosure(childProto, act.env, capturedRefs)
+			env, err := engine.activationEnv(act)
+			if err != nil {
+				return nil, err
+			}
+			closureHandle, err := engine.Closures.NewLuaClosure(childProto, env, capturedRefs)
 			if err != nil {
 				return nil, err
 			}
@@ -423,22 +471,26 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 				return nil, err
 			}
 		default:
-			return nil, runtimeError(act.proto, pc, opcode, "opcode not implemented in Stage 4 interpreter")
+			return nil, runtimeError(proto, pc, opcode, "opcode not implemented in Stage 4 interpreter")
 		}
 	}
-	return nil, runtimeError(act.proto, len(act.proto.Code), bytecode.OP_RETURN, "function fell off the end without RETURN")
+	proto, err := engine.activationProto(act)
+	if err != nil {
+		return nil, err
+	}
+	return nil, runtimeError(proto, len(proto.Code), bytecode.OP_RETURN, "function fell off the end without RETURN")
 }
 
 func (engine *Engine) registerValue(act *activation, index int) (value.TValue, error) {
 	if index < 0 || index >= int(act.frame.RegisterCount) {
-		return value.NilValue(), runtimeError(act.proto, act.pc-1, bytecode.OP_MOVE, fmt.Sprintf("register %d is out of range", index))
+		return value.NilValue(), engine.activationRuntimeError(act, act.pc-1, bytecode.OP_MOVE, fmt.Sprintf("register %d is out of range", index))
 	}
 	return act.thread.Register(act.frame, uint16(index))
 }
 
 func (engine *Engine) setRegister(act *activation, index int, slotValue value.TValue) error {
 	if index < 0 || index >= int(act.frame.RegisterCount) {
-		return runtimeError(act.proto, act.pc-1, bytecode.OP_MOVE, fmt.Sprintf("register %d is out of range", index))
+		return engine.activationRuntimeError(act, act.pc-1, bytecode.OP_MOVE, fmt.Sprintf("register %d is out of range", index))
 	}
 	if uint32(index+1) > act.top {
 		act.top = uint32(index + 1)
@@ -446,14 +498,79 @@ func (engine *Engine) setRegister(act *activation, index int, slotValue value.TV
 	return act.thread.SetRegister(act.frame, uint16(index), slotValue)
 }
 
+func (engine *Engine) activationClosureRef(act *activation) (value.HeapRef44, error) {
+	if act == nil || act.frame == nil {
+		return 0, fmt.Errorf("activation frame is not set")
+	}
+	ref, ok := act.frame.Closure.HeapRef()
+	if !ok {
+		return 0, fmt.Errorf("frame closure is not a closure reference: %s", act.frame.Closure)
+	}
+	return ref, nil
+}
+
+func (engine *Engine) activationEnv(act *activation) (value.TValue, error) {
+	closureRef, err := engine.activationClosureRef(act)
+	if err != nil {
+		return value.NilValue(), err
+	}
+	return engine.Closures.Env(closureRef)
+}
+
+func (engine *Engine) activationUpvalueRef(act *activation, index int) (value.HeapRef44, error) {
+	closureRef, err := engine.activationClosureRef(act)
+	if err != nil {
+		return 0, err
+	}
+	return engine.Closures.UpvalueRefAt(closureRef, index)
+}
+
+func (engine *Engine) activationProto(act *activation) (*bytecode.Proto, error) {
+	if act == nil || act.frame == nil {
+		return nil, fmt.Errorf("activation frame is not set")
+	}
+	protoRef, ok := act.frame.Proto.HeapRef()
+	if !ok {
+		return nil, fmt.Errorf("frame proto is not a proto reference: %s", act.frame.Proto)
+	}
+	return engine.Protos.Resolve(protoRef)
+}
+
+func (engine *Engine) activationRegisterBase(act *activation) (uint32, error) {
+	if act == nil || act.thread == nil || act.frame == nil {
+		return 0, fmt.Errorf("activation frame is not set")
+	}
+	return act.thread.SlotIndexForAddress(uintptr(act.frame.RegsBase))
+}
+
+func (engine *Engine) activationRuntimeError(act *activation, pc int, opcode bytecode.Opcode, reason string) error {
+	proto, err := engine.activationProto(act)
+	if err != nil {
+		return fmt.Errorf("%s: %w", reason, err)
+	}
+	return runtimeError(proto, pc, opcode, reason)
+}
+
 func (engine *Engine) constantValue(act *activation, index int) (value.TValue, error) {
-	if act == nil || act.proto == nil || act.frame == nil || index < 0 || index >= len(act.proto.Constants) {
+	proto, err := engine.activationProto(act)
+	if err != nil {
+		return value.NilValue(), err
+	}
+	if act == nil || act.frame == nil || index < 0 || index >= len(proto.Constants) {
 		return value.NilValue(), fmt.Errorf("constant %d is out of range", index)
 	}
 	if act.frame.ConstBase == 0 {
 		return value.NilValue(), fmt.Errorf("frame const base is not set")
 	}
-	return engine.Protos.ConstantValue(act.proto, index, engine.Strings)
+	baseOffset, err := engine.Heap.OffsetForNativeAddress(uintptr(act.frame.ConstBase))
+	if err != nil {
+		return value.NilValue(), fmt.Errorf("frame const base %#x is not heap-backed: %w", act.frame.ConstBase, err)
+	}
+	bytes, err := engine.Heap.Resolve(baseOffset+value.HeapOff64(index*value.TValueSize), value.TValueSize)
+	if err != nil {
+		return value.NilValue(), err
+	}
+	return value.FromRaw(value.Raw(binary.LittleEndian.Uint64(bytes))), nil
 }
 
 func (engine *Engine) rkValue(act *activation, operand int) (value.TValue, error) {
@@ -470,7 +587,7 @@ func (engine *Engine) registerNumber(act *activation, index int, pc int, opcode 
 	}
 	number, ok := registerValue.Float64()
 	if !ok {
-		return 0, runtimeError(act.proto, pc, opcode, fmt.Sprintf("register %d is not a number: %s", index, registerValue))
+		return 0, engine.activationRuntimeError(act, pc, opcode, fmt.Sprintf("register %d is not a number: %s", index, registerValue))
 	}
 	return number, nil
 }
@@ -482,7 +599,7 @@ func (engine *Engine) rkNumber(act *activation, operand int, pc int, opcode byte
 	}
 	number, ok := v.Float64()
 	if !ok {
-		return 0, runtimeError(act.proto, pc, opcode, fmt.Sprintf("operand %d is not a number: %s", operand, v))
+		return 0, engine.activationRuntimeError(act, pc, opcode, fmt.Sprintf("operand %d is not a number: %s", operand, v))
 	}
 	return number, nil
 }
@@ -595,16 +712,24 @@ func (engine *Engine) storeVarargs(act *activation, a int, b int, varargs []valu
 }
 
 func (engine *Engine) captureUpvalues(act *activation, childProto *bytecode.Proto, pc int, opcode bytecode.Opcode) ([]value.HeapRef44, error) {
+	proto, err := engine.activationProto(act)
+	if err != nil {
+		return nil, err
+	}
+	registerBase, err := engine.activationRegisterBase(act)
+	if err != nil {
+		return nil, err
+	}
 	captured := make([]value.HeapRef44, int(childProto.NumUpvalues))
 	for index := range captured {
-		if act.pc >= len(act.proto.Code) {
-			return nil, runtimeError(act.proto, pc, opcode, "missing capture instruction after CLOSURE")
+		if act.pc >= len(proto.Code) {
+			return nil, runtimeError(proto, pc, opcode, "missing capture instruction after CLOSURE")
 		}
-		capture := act.proto.Code[act.pc]
+		capture := proto.Code[act.pc]
 		act.pc++
 		switch capture.Opcode() {
 		case bytecode.OP_MOVE:
-			address, err := act.thread.SlotAddress(act.registerBase + uint32(capture.B()))
+			address, err := act.thread.SlotAddress(registerBase + uint32(capture.B()))
 			if err != nil {
 				return nil, err
 			}
@@ -614,149 +739,24 @@ func (engine *Engine) captureUpvalues(act *activation, childProto *bytecode.Prot
 			}
 			captured[index] = handle.Ref
 		case bytecode.OP_GETUPVAL:
-			if capture.B() >= len(act.upvalueRefs) {
-				return nil, runtimeError(act.proto, pc, opcode, fmt.Sprintf("parent upvalue %d is out of range", capture.B()))
+			upvalueRef, err := engine.activationUpvalueRef(act, capture.B())
+			if err != nil {
+				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
-			captured[index] = act.upvalueRefs[capture.B()]
+			captured[index] = upvalueRef
 		default:
-			return nil, runtimeError(act.proto, pc, opcode, fmt.Sprintf("invalid upvalue capture opcode %s", capture.Opcode()))
+			return nil, runtimeError(proto, pc, opcode, fmt.Sprintf("invalid upvalue capture opcode %s", capture.Opcode()))
 		}
 	}
 	return captured, nil
 }
 
 func (engine *Engine) getTable(tableValue value.TValue, key value.TValue) (value.TValue, bool, error) {
-	if tableValue.IsBoxedTag(value.TagHostObjectRef) {
-		return engine.hostObjectGet(tableValue, key)
-	}
-	if !tableValue.IsBoxedTag(value.TagTableRef) {
-		return value.NilValue(), false, fmt.Errorf("table operation requires table, got %s", tableValue)
-	}
-	ref, _ := tableValue.HeapRef()
-	return engine.Tables.Get(ref, key)
+	return engine.ReadIndexBoundary(tableValue, key)
 }
 
 func (engine *Engine) setTable(tableValue value.TValue, key value.TValue, slotValue value.TValue) error {
-	if tableValue.IsBoxedTag(value.TagHostObjectRef) {
-		return engine.hostObjectSet(tableValue, key, slotValue)
-	}
-	if !tableValue.IsBoxedTag(value.TagTableRef) {
-		return fmt.Errorf("table operation requires table, got %s", tableValue)
-	}
-	ref, _ := tableValue.HeapRef()
-	return engine.Tables.Set(ref, key, slotValue)
-}
-
-func (engine *Engine) hostObjectGet(objectValue value.TValue, key value.TValue) (value.TValue, bool, error) {
-	keyText, err := engine.hostKeyString(key)
-	if err != nil {
-		return value.NilValue(), false, err
-	}
-	ref, _ := objectValue.HeapRef()
-	header, target, descriptor, err := engine.Hosts.ReadHostObject(ref)
-	if err != nil {
-		return value.NilValue(), false, err
-	}
-	native, err := engine.Hosts.ReadNativeDescriptor(header.NativeMeta)
-	if err != nil {
-		return value.NilValue(), false, err
-	}
-	if native.DescriptorVersion != header.DescriptorVersion {
-		return value.NilValue(), false, fmt.Errorf("host object descriptor version mismatch: wrapper=%d current=%d", header.DescriptorVersion, native.DescriptorVersion)
-	}
-	if native.Kind != host.DescriptorKindObject || native.Flags&host.DescriptorFlagIndexable == 0 {
-		return value.NilValue(), false, fmt.Errorf("host object metadata is not indexable")
-	}
-	if descriptor.Get == nil {
-		return value.NilValue(), false, fmt.Errorf("host object %q does not support property read", descriptor.Name)
-	}
-	result, found, err := descriptor.Get(target, keyText)
-	if err != nil {
-		return value.NilValue(), false, err
-	}
-	if !found {
-		return value.NilValue(), false, nil
-	}
-	boxed, err := host.FromHostValue(engine.Strings, result)
-	if err != nil {
-		return value.NilValue(), false, err
-	}
-	return boxed, true, nil
-}
-
-func (engine *Engine) hostObjectSet(objectValue value.TValue, key value.TValue, slotValue value.TValue) error {
-	keyText, err := engine.hostKeyString(key)
-	if err != nil {
-		return err
-	}
-	hostValue, err := host.ToHostValue(engine.Strings, slotValue)
-	if err != nil {
-		return err
-	}
-	ref, _ := objectValue.HeapRef()
-	header, target, descriptor, err := engine.Hosts.ReadHostObject(ref)
-	if err != nil {
-		return err
-	}
-	native, err := engine.Hosts.ReadNativeDescriptor(header.NativeMeta)
-	if err != nil {
-		return err
-	}
-	if native.DescriptorVersion != header.DescriptorVersion {
-		return fmt.Errorf("host object descriptor version mismatch: wrapper=%d current=%d", header.DescriptorVersion, native.DescriptorVersion)
-	}
-	if native.Kind != host.DescriptorKindObject || native.Flags&host.DescriptorFlagWritable == 0 {
-		return fmt.Errorf("host object metadata is not writable")
-	}
-	if descriptor.Set == nil {
-		return fmt.Errorf("host object %q does not support property write", descriptor.Name)
-	}
-	return descriptor.Set(target, keyText, hostValue)
-}
-
-func (engine *Engine) callHostFunction(functionValue value.TValue, args []value.TValue, nresults int) ([]value.TValue, error) {
-	ref, _ := functionValue.HeapRef()
-	header, target, descriptor, err := engine.Hosts.ReadHostFunction(ref)
-	if err != nil {
-		return nil, err
-	}
-	native, err := engine.Hosts.ReadNativeDescriptor(header.NativeMeta)
-	if err != nil {
-		return nil, err
-	}
-	if native.DescriptorVersion != header.DescriptorVersion {
-		return nil, fmt.Errorf("host function descriptor version mismatch: wrapper=%d current=%d", header.DescriptorVersion, native.DescriptorVersion)
-	}
-	if native.Kind != host.DescriptorKindFunction || native.Flags&host.DescriptorFlagCallable == 0 {
-		return nil, fmt.Errorf("host function metadata is not callable")
-	}
-	if native.Flags&host.DescriptorFlagVariadic == 0 && int(native.Arity) != len(args) {
-		return nil, fmt.Errorf("host function expects %d args, got %d", native.Arity, len(args))
-	}
-	if descriptor.Call == nil {
-		return nil, fmt.Errorf("host function %q does not support call", descriptor.Name)
-	}
-	hostArgs := make([]any, 0, len(args))
-	for _, slotValue := range args {
-		converted, err := host.ToHostValue(engine.Strings, slotValue)
-		if err != nil {
-			return nil, err
-		}
-		hostArgs = append(hostArgs, converted)
-	}
-	results, err := descriptor.Call(target, hostArgs)
-	if err != nil {
-		return nil, err
-	}
-	boxed := make([]value.TValue, 0, len(results))
-	for _, result := range results {
-		converted, err := host.FromHostValue(engine.Strings, result)
-		if err != nil {
-			return nil, err
-		}
-		boxed = append(boxed, converted)
-	}
-	return normalizeResults(boxed, nresults), nil
+	return engine.WriteIndexBoundary(tableValue, key, slotValue)
 }
 
 func (engine *Engine) hostKeyString(key value.TValue) (string, error) {
@@ -824,12 +824,16 @@ func (engine *Engine) valuesLessEqual(left value.TValue, right value.TValue) (bo
 }
 
 func (engine *Engine) takeTestJump(act *activation, pc int, opcode bytecode.Opcode) error {
-	if act.pc >= len(act.proto.Code) {
-		return runtimeError(act.proto, pc, opcode, "test opcode is missing trailing JMP")
+	proto, err := engine.activationProto(act)
+	if err != nil {
+		return err
 	}
-	jump := act.proto.Code[act.pc]
+	if act.pc >= len(proto.Code) {
+		return runtimeError(proto, pc, opcode, "test opcode is missing trailing JMP")
+	}
+	jump := proto.Code[act.pc]
 	if jump.Opcode() != bytecode.OP_JMP {
-		return runtimeError(act.proto, pc, opcode, fmt.Sprintf("expected trailing JMP after test, got %s", jump.Opcode()))
+		return runtimeError(proto, pc, opcode, fmt.Sprintf("expected trailing JMP after test, got %s", jump.Opcode()))
 	}
 	act.pc += 1 + jump.SBx()
 	return nil
@@ -885,4 +889,26 @@ func minInt(left int, right int) int {
 		return left
 	}
 	return right
+}
+
+func maxUint32(left uint32, right uint32) uint32 {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func (engine *Engine) frameVarargs(thread *state.ThreadState, frame *state.CallFrameHeader) ([]value.TValue, error) {
+	if thread == nil || frame == nil || frame.VarargCount == 0 || frame.VarargBase == 0 {
+		return nil, nil
+	}
+	varargs := make([]value.TValue, 0, frame.VarargCount)
+	for index := uint32(0); index < frame.VarargCount; index++ {
+		slotValue, err := thread.ValueAtAddress(uintptr(frame.VarargBase) + uintptr(index)*value.TValueSize)
+		if err != nil {
+			return nil, err
+		}
+		varargs = append(varargs, slotValue)
+	}
+	return varargs, nil
 }
