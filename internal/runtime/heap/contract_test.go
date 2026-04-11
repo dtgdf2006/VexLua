@@ -21,6 +21,7 @@ func TestNativeBoundaryContractsStayConstrained(t *testing.T) {
 	assertSymbolFiles(t, collectNamedSymbolFiles(t, repoRoot, "OffsetForNativeAddress"), []string{
 		"internal/interp/execute.go",
 		"internal/interp/host_bridge_test.go",
+		"internal/runtime/closure/store_test.go",
 		"internal/runtime/heap/heap.go",
 		"internal/runtime/heap/heap_test.go",
 	})

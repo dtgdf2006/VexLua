@@ -218,6 +218,9 @@ func (runtime *Runtime) callCompiled(thread *state.ThreadState, closureRef value
 	for {
 		runtime.Engine.State.SyncActiveThread(thread)
 		status, aux := abi.EnterCompiled(entry, runtime.Engine.Heap.NativeBase(), runtime.Engine.State.NativePointer(), unsafe.Pointer(frame), regsBase, unsafe.Pointer(&ctx))
+		if err := thread.SyncCurrentFrameFromNative(); err != nil {
+			return nil, err
+		}
 		switch status {
 		case compiledStatusOK:
 			results, err := collectThreadResults(thread, uintptr(frame.ResultBase), int(aux))
@@ -232,6 +235,58 @@ func (runtime *Runtime) callCompiled(thread *state.ThreadState, closureRef value
 			}
 			if finished {
 				return finalResults, nil
+			}
+			if nextEntry < 0x10000 {
+				return nil, fmt.Errorf("invalid continuation entry %#x for stub %d at site %d (compiled entry %#x)", nextEntry, aux, ctx.SiteID, compiled.Entry)
+			}
+			entry = nextEntry
+		case compiledStatusDeopt:
+			runtime.deoptCount++
+			results, err := runtime.deoptFromContext(thread, frame, compiled, &ctx)
+			if err != nil {
+				return nil, err
+			}
+			return normalizeResults(results, nresults), nil
+		case compiledStatusError:
+			return nil, fmt.Errorf("compiled code returned error status")
+		default:
+			return nil, fmt.Errorf("unexpected compiled status %d", status)
+		}
+	}
+}
+
+func (runtime *Runtime) resumeCompiledFrame(thread *state.ThreadState, frame *state.CallFrameHeader, closureRef value.HeapRef44, compiled *CompiledCode, entry uintptr, nresults int) ([]value.TValue, error) {
+	if thread == nil {
+		return nil, fmt.Errorf("thread cannot be nil")
+	}
+	if frame == nil {
+		return nil, fmt.Errorf("frame cannot be nil")
+	}
+	if compiled == nil || !compiled.Supported {
+		return nil, fmt.Errorf("compiled frame requires supported compiled code")
+	}
+	ctx := executionContext{}
+	regsBase := uintptr(frame.RegsBase)
+	for {
+		runtime.Engine.State.SyncActiveThread(thread)
+		status, aux := abi.EnterCompiled(entry, runtime.Engine.Heap.NativeBase(), runtime.Engine.State.NativePointer(), unsafe.Pointer(frame), regsBase, unsafe.Pointer(&ctx))
+		if err := thread.SyncCurrentFrameFromNative(); err != nil {
+			return nil, err
+		}
+		switch status {
+		case compiledStatusOK:
+			results, err := collectThreadResults(thread, uintptr(frame.ResultBase), int(aux))
+			if err != nil {
+				return nil, err
+			}
+			return normalizeResults(results, nresults), nil
+		case compiledStatusStub:
+			nextEntry, finished, finalResults, err := runtime.handleStub(thread, frame, closureRef, compiled, &ctx, stubs.ID(aux), nresults)
+			if err != nil {
+				return nil, err
+			}
+			if finished {
+				return normalizeResults(finalResults, nresults), nil
 			}
 			entry = nextEntry
 		case compiledStatusDeopt:
@@ -322,6 +377,17 @@ func collectThreadResults(thread *state.ThreadState, base uintptr, count int) ([
 		results = append(results, slotValue)
 	}
 	return results, nil
+}
+
+func clearFrameSlots(thread *state.ThreadState, frame *state.CallFrameHeader) {
+	if thread == nil || frame == nil {
+		return
+	}
+	registerBase, err := thread.SlotIndexForAddress(uintptr(frame.RegsBase))
+	if err != nil {
+		return
+	}
+	clearThreadSlots(thread, registerBase, uint32(frame.RegisterCount)+uint32(frame.SpillCount))
 }
 
 func (runtime *Runtime) syncCompiledMetadata(protoRef value.HeapRef44, compiled *CompiledCode) error {

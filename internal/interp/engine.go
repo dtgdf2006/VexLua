@@ -93,6 +93,18 @@ func New() *Engine {
 	}
 }
 
+func (engine *Engine) Close() error {
+	if engine == nil {
+		return nil
+	}
+	if engine.State != nil {
+		engine.State.Close()
+		engine.State = nil
+	}
+	engine.threads = nil
+	return nil
+}
+
 func (engine *Engine) NewThread(stackSlots uint32, frameCapacity uint32) (*state.ThreadState, error) {
 	return engine.State.NewThread(stackSlots, frameCapacity)
 }

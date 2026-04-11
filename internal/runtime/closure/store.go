@@ -212,6 +212,21 @@ func (store *Store) ReadFeedbackHeader(ref value.HeapRef44) (feedback.Header, er
 	return feedback.ReadHeader(bytes)
 }
 
+func (store *Store) WriteFeedbackHeader(ref value.HeapRef44, header feedback.Header) error {
+	object, err := store.Object(ref)
+	if err != nil {
+		return err
+	}
+	if object.FeedbackData == 0 {
+		return fmt.Errorf("closure %#x has no feedback vector", uint64(ref))
+	}
+	bytes, err := store.heap.Resolve(object.FeedbackData, feedback.HeaderSize)
+	if err != nil {
+		return err
+	}
+	return feedback.WriteHeader(bytes, header)
+}
+
 func (store *Store) ReadFeedbackCell(ref value.HeapRef44, slot uint32) (feedback.Cell, error) {
 	object, err := store.Object(ref)
 	if err != nil {

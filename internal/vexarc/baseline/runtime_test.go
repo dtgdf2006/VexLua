@@ -236,8 +236,8 @@ func TestBaselineRuntimeCallStubResumesContinuation(t *testing.T) {
 		t.Fatalf("runtime call: %v", err)
 	}
 	assertValuesEqual(t, results, []value.TValue{value.NumberValue(99)})
-	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
-		t.Fatalf("call boundary should use one shared stub hit, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 0 {
+		t.Fatalf("covered Lua-to-Lua call should stay inside native call builtin, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
 	}
 	if runtime.DeoptCount() != 0 {
 		t.Fatalf("call continuation should avoid deopt, got %d", runtime.DeoptCount())
@@ -306,12 +306,218 @@ func TestBaselineRuntimeCallStubChainsAcrossCompiledFrames(t *testing.T) {
 		t.Fatalf("runtime call: %v", err)
 	}
 	assertValuesEqual(t, results, []value.TValue{value.NumberValue(77)})
-	if runtime.SlowStubCount(stubs.StubLuaCall) != 2 {
-		t.Fatalf("expected two shared call-stub hits, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 0 {
+		t.Fatalf("covered compiled call chain should stay inside native call builtin, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
 	}
 	if runtime.DeoptCount() != 0 {
 		t.Fatalf("compiled call chain should avoid deopt, got %d", runtime.DeoptCount())
 	}
+}
+
+func TestBaselineRuntimeNestedCompiledCallCanReachHostBoundary(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	addOne, err := engine.RegisterHostFunction("add1", func(v float64) float64 {
+		return v + 1
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register host function: %v", err)
+	}
+	midProto := &bytecode.Proto{
+		Source:       "@mid-host-call.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	mid, err := engine.NewClosure(midProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new mid closure: %v", err)
+	}
+	if _, err := runtime.Compile(midProto); err != nil {
+		t.Fatalf("compile mid: %v", err)
+	}
+	topProto := &bytecode.Proto{
+		Source:       "@top-host-call.lua",
+		NumParams:    3,
+		MaxStackSize: 3,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 3, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	top, err := engine.NewClosure(topProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, top.Value, []value.TValue{mid.Value, addOne.Value, value.NumberValue(41)}, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("nested host boundary should use exactly one terminal call stub, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("nested host boundary should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeDirectCompiledCallCopiesMultipleArguments(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	calleeProto := &bytecode.Proto{
+		Source:       "@copy-args-callee.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 3, 0),
+		},
+	}
+	callee, err := engine.NewClosure(calleeProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new callee closure: %v", err)
+	}
+	if _, err := runtime.Compile(calleeProto); err != nil {
+		t.Fatalf("compile callee: %v", err)
+	}
+	topProto := &bytecode.Proto{
+		Source:       "@copy-args-top.lua",
+		NumParams:    3,
+		MaxStackSize: 3,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 3, 3),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 3, 0),
+		},
+	}
+	top, err := engine.NewClosure(topProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, top.Value, []value.TValue{callee.Value, value.NumberValue(11), value.NumberValue(22)}, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(11), value.NumberValue(22)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 0 {
+		t.Fatalf("direct compiled call argument copy test should stay inside native call builtin, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+}
+
+func TestBaselineRuntimeDirectCompiledCallPreservesSecondArgumentAfterBoxedFirst(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	boxed, err := engine.RegisterHostFunction("boxed", func(v float64) float64 {
+		return v
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register host function: %v", err)
+	}
+	calleeProto := &bytecode.Proto{
+		Source:       "@boxed-arg-callee.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_RETURN, 1, 2, 0),
+		},
+	}
+	callee, err := engine.NewClosure(calleeProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new callee closure: %v", err)
+	}
+	if _, err := runtime.Compile(calleeProto); err != nil {
+		t.Fatalf("compile callee: %v", err)
+	}
+	topProto := &bytecode.Proto{
+		Source:       "@boxed-arg-top.lua",
+		NumParams:    3,
+		MaxStackSize: 3,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 3, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	top, err := engine.NewClosure(topProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, top.Value, []value.TValue{callee.Value, boxed.Value, value.NumberValue(41)}, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 0 {
+		t.Fatalf("boxed-first-arg direct compiled call should stay inside native call builtin, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+}
+
+func TestBaselineRuntimeCompiledFrameRetainsSecondArgumentAfterBoxedFirst(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	boxed, err := engine.RegisterHostFunction("boxed-top", func(v float64) float64 {
+		return v
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register host function: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@boxed-top-return.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_RETURN, 1, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	if _, err := runtime.Compile(proto); err != nil {
+		t.Fatalf("compile proto: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{boxed.Value, value.NumberValue(41)}, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
 }
 
 func TestBaselineRuntimeCompiledTailCall(t *testing.T) {
@@ -359,11 +565,188 @@ func TestBaselineRuntimeCompiledTailCall(t *testing.T) {
 		t.Fatalf("runtime call: %v", err)
 	}
 	assertValuesEqual(t, results, []value.TValue{value.NumberValue(123)})
-	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
-		t.Fatalf("tailcall should use one shared tail stub hit, got %d", runtime.SlowStubCount(stubs.StubTailCall))
+	if runtime.SlowStubCount(stubs.StubTailCall) != 0 {
+		t.Fatalf("covered Lua-to-Lua tailcall should stay inside native tailcall builtin, got %d shared tail stubs", runtime.SlowStubCount(stubs.StubTailCall))
 	}
 	if runtime.DeoptCount() != 0 {
 		t.Fatalf("tailcall continuation should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeNestedCompiledTailCallCanReachHostBoundary(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	addOne, err := engine.RegisterHostFunction("add1", func(v float64) float64 {
+		return v + 1
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register host function: %v", err)
+	}
+	midProto := &bytecode.Proto{
+		Source:       "@mid-tail-host-call.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	mid, err := engine.NewClosure(midProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new mid closure: %v", err)
+	}
+	if _, err := runtime.Compile(midProto); err != nil {
+		t.Fatalf("compile mid: %v", err)
+	}
+	topProto := &bytecode.Proto{
+		Source:       "@top-tail-host-call.lua",
+		NumParams:    3,
+		MaxStackSize: 3,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_TAILCALL, 0, 3, 0),
+		},
+	}
+	top, err := engine.NewClosure(topProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, top.Value, []value.TValue{mid.Value, addOne.Value, value.NumberValue(41)}, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubTailCall) != 0 {
+		t.Fatalf("nested compiled tailcall should not need a Go tail stub, got %d", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("nested tailcall host boundary should use exactly one terminal call stub, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("nested tailcall host boundary should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeNativeBuiltinCompositionStaysInCompiledIsland(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	box, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new box: %v", err)
+	}
+	upvalueSlot, err := thread.SlotAddress(32)
+	if err != nil {
+		t.Fatalf("upvalue slot address: %v", err)
+	}
+	if err := thread.SetValueAtAddress(upvalueSlot, value.NumberValue(41)); err != nil {
+		t.Fatalf("seed upvalue slot: %v", err)
+	}
+	open, err := engine.Upvalues.FindOrCreateOpen(thread, upvalueSlot)
+	if err != nil {
+		t.Fatalf("open upvalue: %v", err)
+	}
+	leafProto := &bytecode.Proto{
+		Source:       "@native-combo-leaf.lua",
+		NumParams:    1,
+		MaxStackSize: 1,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	leaf, err := engine.NewClosure(leafProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new leaf: %v", err)
+	}
+	if _, err := runtime.Compile(leafProto); err != nil {
+		t.Fatalf("compile leaf: %v", err)
+	}
+	midProto := &bytecode.Proto{
+		Source:       "@native-combo-mid.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_TAILCALL, 0, 2, 0),
+		},
+	}
+	mid, err := engine.NewClosure(midProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new mid: %v", err)
+	}
+	if _, err := runtime.Compile(midProto); err != nil {
+		t.Fatalf("compile mid: %v", err)
+	}
+	topProto := &bytecode.Proto{
+		Source:       "@native-builtin-composition.lua",
+		NumParams:    3,
+		NumUpvalues:  1,
+		MaxStackSize: 10,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("missing"),
+			bytecode.NumberConstant(1),
+			bytecode.NumberConstant(1),
+			bytecode.NumberConstant(1),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_GETUPVAL, 3, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 4, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 5, 2),
+			bytecode.CreateABx(bytecode.OP_LOADK, 6, 3),
+			bytecode.CreateAsBx(bytecode.OP_FORPREP, 4, 1),
+			bytecode.CreateABC(bytecode.OP_GETTABLE, 7, 0, bytecode.RKAsk(0)),
+			bytecode.CreateAsBx(bytecode.OP_FORLOOP, 4, -2),
+			bytecode.CreateABC(bytecode.OP_MOVE, 7, 1, 0),
+			bytecode.CreateABC(bytecode.OP_MOVE, 8, 2, 0),
+			bytecode.CreateABC(bytecode.OP_MOVE, 9, 3, 0),
+			bytecode.CreateABC(bytecode.OP_CALL, 7, 3, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 7, 2, 0),
+		},
+	}
+	top, err := engine.NewClosure(topProto, env.Value, []value.HeapRef44{open.Ref})
+	if err != nil {
+		t.Fatalf("new top: %v", err)
+	}
+	if _, err := runtime.Compile(topProto); err != nil {
+		t.Fatalf("compile top: %v", err)
+	}
+	results, err := runtime.Call(thread, top.Value, []value.TValue{box.Value, mid.Value, leaf.Value}, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	if runtime.SlowStubCount(stubs.StubGetTable) != 0 {
+		t.Fatalf("covered GETTABLE miss in composition should stay inside native builtin, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	}
+	if runtime.SlowStubCount(stubs.StubGetUpvalue) != 0 {
+		t.Fatalf("covered GETUPVAL in composition should stay inside native builtin, got %d", runtime.SlowStubCount(stubs.StubGetUpvalue))
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 0 {
+		t.Fatalf("covered CALL in composition should stay inside native builtin, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.SlowStubCount(stubs.StubTailCall) != 0 {
+		t.Fatalf("covered TAILCALL in composition should stay inside native builtin, got %d", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	if runtime.SlowStubCount(stubs.StubForPrep) != 0 || runtime.SlowStubCount(stubs.StubForLoop) != 0 {
+		t.Fatalf("numeric for composition should stay inside native builtin, got prep=%d loop=%d", runtime.SlowStubCount(stubs.StubForPrep), runtime.SlowStubCount(stubs.StubForLoop))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("covered native builtin composition should avoid deopt, got %d", runtime.DeoptCount())
 	}
 }
 
@@ -625,8 +1008,8 @@ func TestBaselineRuntimeTableFastPathPreservesCompiledIsland(t *testing.T) {
 	if runtime.SlowStubCount(stubs.StubGetTable) != before.callSuspend {
 		t.Fatalf("table fast path should avoid extra get-table slow stubs: before=%d after=%d", before.callSuspend, runtime.SlowStubCount(stubs.StubGetTable))
 	}
-	if runtime.SlowStubCount(stubs.StubLuaCall) != before.forPrep+1 {
-		t.Fatalf("call boundary should still use one shared call stub per invocation: before=%d after=%d", before.forPrep, runtime.SlowStubCount(stubs.StubLuaCall))
+	if runtime.SlowStubCount(stubs.StubLuaCall) != before.forPrep {
+		t.Fatalf("covered compiled table+call path should stay inside native call builtin: before=%d after=%d", before.forPrep, runtime.SlowStubCount(stubs.StubLuaCall))
 	}
 	if runtime.DeoptCount() != before.deopt {
 		t.Fatalf("table fast path should avoid deopt: before=%d after=%d", before.deopt, runtime.DeoptCount())
@@ -677,8 +1060,8 @@ func TestBaselineRuntimeGenericGetTableMissUsesSlowStubContinuation(t *testing.T
 		t.Fatalf("first runtime call: %v", err)
 	}
 	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
-	if runtime.SlowStubCount(stubs.StubGetTable) != 1 {
-		t.Fatalf("generic miss should go through one get-table slow stub, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	if runtime.SlowStubCount(stubs.StubGetTable) != 0 {
+		t.Fatalf("covered generic gettable should stay inside native builtin, got slow-stub count %d", runtime.SlowStubCount(stubs.StubGetTable))
 	}
 	if runtime.DeoptCount() != 0 {
 		t.Fatalf("slow-stub continuation should avoid deopt, got %d", runtime.DeoptCount())
@@ -688,8 +1071,355 @@ func TestBaselineRuntimeGenericGetTableMissUsesSlowStubContinuation(t *testing.T
 		t.Fatalf("second runtime call: %v", err)
 	}
 	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
-	if runtime.SlowStubCount(stubs.StubGetTable) != 1 {
-		t.Fatalf("monomorphic fast path should avoid extra slow stubs, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	if runtime.SlowStubCount(stubs.StubGetTable) != 0 {
+		t.Fatalf("monomorphic gettable hit should still avoid Go slow stubs, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	}
+}
+
+func TestBaselineRuntimeTableSlowStubContinuesIntoCall(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	box, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new box table: %v", err)
+	}
+	ret99, err := engine.RegisterHostFunction("ret99", func() float64 {
+		return 99
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register ret99: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "ret99", ret99.Value); err != nil {
+		t.Fatalf("set global ret99: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@slow-gettable-call.lua",
+		NumParams:    1,
+		MaxStackSize: 3,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("missing"),
+			bytecode.StringConstant("ret99"),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_GETTABLE, 1, 0, bytecode.RKAsk(0)),
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 2, 1),
+			bytecode.CreateABC(bytecode.OP_CALL, 2, 1, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 2, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{box.Value}, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(99)})
+	if runtime.SlowStubCount(stubs.StubGetTable) != 0 {
+		t.Fatalf("covered missing-key gettable should stay inside native builtin, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("slow-stub continuation should still reach shared call stub, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("covered table miss should stay in compiled island, got deopt=%d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeMetatableBlockedTableUsesSharedSlowStub(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	keyValue, err := engine.InternString("value")
+	if err != nil {
+		t.Fatalf("intern key: %v", err)
+	}
+	box, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new box table: %v", err)
+	}
+	meta, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable: %v", err)
+	}
+	if err := engine.Tables.Set(box.Ref, keyValue.Value, value.NumberValue(42)); err != nil {
+		t.Fatalf("seed box table: %v", err)
+	}
+	if err := engine.Tables.SetMetatable(box.Ref, meta.Value); err != nil {
+		t.Fatalf("set metatable: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@blocked-gettable.lua",
+		NumParams:    1,
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("value"),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_GETTABLE, 1, 0, bytecode.RKAsk(0)),
+			bytecode.CreateABC(bytecode.OP_RETURN, 1, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{box.Value}, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubGetTable) != 0 {
+		t.Fatalf("blocked-table covered path should stay inside native builtin, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{box.Value}, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubGetTable) != 0 {
+		t.Fatalf("blocked-table covered path should continue to avoid Go slow stubs, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("metatable blocker should not deopt current covered semantics, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeUpvalueStubsResumeCompiledContinuation(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	ret1, err := engine.RegisterHostFunction("add1", func(v float64) float64 {
+		return v + 1
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register add1: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "add1", ret1.Value); err != nil {
+		t.Fatalf("set global add1: %v", err)
+	}
+	upvalueSlot, err := thread.SlotAddress(8)
+	if err != nil {
+		t.Fatalf("upvalue slot address: %v", err)
+	}
+	if err := thread.SetValueAtAddress(upvalueSlot, value.NumberValue(41)); err != nil {
+		t.Fatalf("seed upvalue slot: %v", err)
+	}
+	open, err := engine.Upvalues.FindOrCreateOpen(thread, upvalueSlot)
+	if err != nil {
+		t.Fatalf("open upvalue: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-getupval-call.lua",
+		NumUpvalues:  1,
+		MaxStackSize: 4,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("add1"),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_GETUPVAL, 0, 0, 0),
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 1, 0),
+			bytecode.CreateABC(bytecode.OP_MOVE, 2, 0, 0),
+			bytecode.CreateABC(bytecode.OP_CALL, 1, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 1, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, []value.HeapRef44{open.Ref})
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubGetUpvalue) != 0 {
+		t.Fatalf("GETUPVAL native builtin should avoid Go slow stub, got %d", runtime.SlowStubCount(stubs.StubGetUpvalue))
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("upvalue continuation should still reach shared call stub, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("upvalue stub continuation should avoid deopt, got %d", runtime.DeoptCount())
+	}
+	if err := thread.SetValueAtAddress(upvalueSlot, value.NumberValue(99)); err != nil {
+		t.Fatalf("mutate open upvalue slot: %v", err)
+	}
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(100)})
+	if runtime.SlowStubCount(stubs.StubGetUpvalue) != 0 {
+		t.Fatalf("GETUPVAL native builtin should remain inside compiled island, got %d", runtime.SlowStubCount(stubs.StubGetUpvalue))
+	}
+}
+
+func TestBaselineRuntimeSetUpvalueStubResumesCompiledContinuation(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	upvalueSlot, err := thread.SlotAddress(8)
+	if err != nil {
+		t.Fatalf("upvalue slot address: %v", err)
+	}
+	if err := thread.SetValueAtAddress(upvalueSlot, value.NumberValue(1)); err != nil {
+		t.Fatalf("seed upvalue slot: %v", err)
+	}
+	open, err := engine.Upvalues.FindOrCreateOpen(thread, upvalueSlot)
+	if err != nil {
+		t.Fatalf("open upvalue: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-setupval.lua",
+		NumUpvalues:  1,
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.NumberConstant(40),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABC(bytecode.OP_SETUPVAL, 0, 0, 0),
+			bytecode.CreateABC(bytecode.OP_GETUPVAL, 1, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 1, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, []value.HeapRef44{open.Ref})
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(40)})
+	current, err := thread.ValueAtAddress(upvalueSlot)
+	if err != nil {
+		t.Fatalf("read updated upvalue slot: %v", err)
+	}
+	if current.Bits() != value.NumberValue(40).Bits() {
+		t.Fatalf("open upvalue slot = %s, want %s", current, value.NumberValue(40))
+	}
+	if runtime.SlowStubCount(stubs.StubSetUpvalue) != 0 {
+		t.Fatalf("SETUPVAL native builtin should avoid Go slow stub, got %d", runtime.SlowStubCount(stubs.StubSetUpvalue))
+	}
+	if runtime.SlowStubCount(stubs.StubGetUpvalue) != 0 {
+		t.Fatalf("GETUPVAL native builtin should stay inside compiled island after SETUPVAL, got %d", runtime.SlowStubCount(stubs.StubGetUpvalue))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("setupval/getupval continuation should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeClosedUpvalueNativeBuiltinResumesCompiledContinuation(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	upvalueSlot, err := thread.SlotAddress(8)
+	if err != nil {
+		t.Fatalf("upvalue slot address: %v", err)
+	}
+	if err := thread.SetValueAtAddress(upvalueSlot, value.NumberValue(10)); err != nil {
+		t.Fatalf("seed upvalue slot: %v", err)
+	}
+	open, err := engine.Upvalues.FindOrCreateOpen(thread, upvalueSlot)
+	if err != nil {
+		t.Fatalf("open upvalue: %v", err)
+	}
+	closed, err := engine.Upvalues.CloseAtOrAbove(thread, upvalueSlot)
+	if err != nil {
+		t.Fatalf("close upvalue: %v", err)
+	}
+	if len(closed) != 1 || closed[0].Ref != open.Ref {
+		t.Fatalf("closed upvalue handles = %+v, want ref %#x", closed, uint64(open.Ref))
+	}
+	if err := thread.SetValueAtAddress(upvalueSlot, value.NumberValue(99)); err != nil {
+		t.Fatalf("mutate former stack slot: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-closed-upvalue.lua",
+		NumUpvalues:  1,
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.NumberConstant(40),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABC(bytecode.OP_SETUPVAL, 0, 0, 0),
+			bytecode.CreateABC(bytecode.OP_GETUPVAL, 1, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 1, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, []value.HeapRef44{closed[0].Ref})
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(40)})
+	current, err := thread.ValueAtAddress(upvalueSlot)
+	if err != nil {
+		t.Fatalf("read former stack slot: %v", err)
+	}
+	if current.Bits() != value.NumberValue(99).Bits() {
+		t.Fatalf("closed upvalue should not write back to former stack slot, got %s want %s", current, value.NumberValue(99))
+	}
+	closedValue, err := engine.Upvalues.Get(closed[0].Ref)
+	if err != nil {
+		t.Fatalf("read closed upvalue value: %v", err)
+	}
+	if closedValue.Bits() != value.NumberValue(40).Bits() {
+		t.Fatalf("closed upvalue value = %s, want %s", closedValue, value.NumberValue(40))
+	}
+	if runtime.SlowStubCount(stubs.StubSetUpvalue) != 0 || runtime.SlowStubCount(stubs.StubGetUpvalue) != 0 {
+		t.Fatalf("closed upvalue native builtins should avoid Go slow stubs, got set=%d get=%d", runtime.SlowStubCount(stubs.StubSetUpvalue), runtime.SlowStubCount(stubs.StubGetUpvalue))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("closed upvalue native builtins should avoid deopt, got %d", runtime.DeoptCount())
 	}
 }
 
@@ -751,6 +1481,63 @@ func TestBaselineRuntimeCompiledSetTableFastPathAfterWarmup(t *testing.T) {
 	}
 	if !found || stored.Bits() != value.NumberValue(123).Bits() {
 		t.Fatalf("stored value = %s, want %s", stored, value.NumberValue(123))
+	}
+}
+
+func TestBaselineRuntimeCompiledSetGlobalFastPathAfterWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	keyValue, err := engine.InternString("answer")
+	if err != nil {
+		t.Fatalf("intern answer key: %v", err)
+	}
+	if err := engine.Tables.Set(env.Ref, keyValue.Value, value.NumberValue(1)); err != nil {
+		t.Fatalf("seed global value: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-setglobal.lua",
+		NumParams:    1,
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("answer"),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_SETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 1, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 1, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{value.NumberValue(99)}, -1)
+	if err != nil {
+		t.Fatalf("warm runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(99)})
+	before := captureRuntimeCounters(runtime)
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{value.NumberValue(123)}, -1)
+	if err != nil {
+		t.Fatalf("compiled runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(123)})
+	assertCounterDeltaZero(t, runtime, before)
+	stored, found, err := engine.Tables.Get(env.Ref, keyValue.Value)
+	if err != nil {
+		t.Fatalf("read global value: %v", err)
+	}
+	if !found || stored.Bits() != value.NumberValue(123).Bits() {
+		t.Fatalf("global value = %s, want %s", stored, value.NumberValue(123))
 	}
 }
 
@@ -958,8 +1745,8 @@ func TestBaselineRuntimeFeedbackTransitionsToMegamorphic(t *testing.T) {
 	if _, err := runtime.Call(thread, closure.Value, []value.TValue{left.Value}, -1); err != nil {
 		t.Fatalf("post-mega call: %v", err)
 	}
-	if runtime.SlowStubCount(stubs.StubGetTable) != before+1 {
-		t.Fatalf("megamorphic call should continue through shared get-table slow stub: before=%d after=%d", before, runtime.SlowStubCount(stubs.StubGetTable))
+	if runtime.SlowStubCount(stubs.StubGetTable) != before {
+		t.Fatalf("megamorphic covered path should stay inside native builtin: before=%d after=%d", before, runtime.SlowStubCount(stubs.StubGetTable))
 	}
 	if runtime.DeoptCount() != 0 {
 		t.Fatalf("megamorphic call should avoid entry replay deopt, got %d", runtime.DeoptCount())
@@ -1026,8 +1813,8 @@ func TestBaselineRuntimeVersionMissRewarmsMonomorphicCell(t *testing.T) {
 	if _, err := runtime.Call(thread, closure.Value, []value.TValue{box.Value}, -1); err != nil {
 		t.Fatalf("version-miss call: %v", err)
 	}
-	if runtime.SlowStubCount(stubs.StubGetTable) != beforeStub+1 {
-		t.Fatalf("version mismatch should trigger one get-table slow stub and rewarm: before=%d after=%d", beforeStub, runtime.SlowStubCount(stubs.StubGetTable))
+	if runtime.SlowStubCount(stubs.StubGetTable) != beforeStub {
+		t.Fatalf("version mismatch should rewarm inside native builtin: before=%d after=%d", beforeStub, runtime.SlowStubCount(stubs.StubGetTable))
 	}
 	if runtime.DeoptCount() != 0 {
 		t.Fatalf("version mismatch should avoid deopt replay, got %d", runtime.DeoptCount())
@@ -1206,8 +1993,8 @@ func TestBaselineRuntimeLoopSlowStubResumesContinuation(t *testing.T) {
 		t.Fatalf("runtime call: %v", err)
 	}
 	assertValuesEqual(t, results, []value.TValue{value.NilValue()})
-	if runtime.SlowStubCount(stubs.StubForPrep) != 1 || runtime.SlowStubCount(stubs.StubForLoop) != 1 {
-		t.Fatalf("expected one FORPREP and one FORLOOP shared stub hit, got prep=%d loop=%d", runtime.SlowStubCount(stubs.StubForPrep), runtime.SlowStubCount(stubs.StubForLoop))
+	if runtime.SlowStubCount(stubs.StubForPrep) != 0 || runtime.SlowStubCount(stubs.StubForLoop) != 0 {
+		t.Fatalf("numeric-for native builtins should avoid Go slow stubs, got prep=%d loop=%d", runtime.SlowStubCount(stubs.StubForPrep), runtime.SlowStubCount(stubs.StubForLoop))
 	}
 	if runtime.DeoptCount() != 0 {
 		t.Fatalf("loop slow stub should resume compiled continuation without deopt, got %d", runtime.DeoptCount())

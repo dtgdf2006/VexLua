@@ -16,6 +16,8 @@ const (
 	ContinuationGetTable
 	ContinuationSetGlobal
 	ContinuationSetTable
+	ContinuationGetUpvalue
+	ContinuationSetUpvalue
 	ContinuationCall
 	ContinuationTailCall
 	ContinuationForPrep
@@ -26,6 +28,8 @@ const (
 const (
 	ContinuationFlagAlternateResume uint32 = 1 << iota
 	ContinuationFlagFinalExit
+	ContinuationFlagNativeBuiltinABI
+	ContinuationFlagDeoptOnUncovered
 )
 
 type ContinuationSite struct {
@@ -51,6 +55,14 @@ func (site ContinuationSite) HasAlternateResume() bool {
 
 func (site ContinuationSite) IsFinalExit() bool {
 	return site.Flags&ContinuationFlagFinalExit != 0
+}
+
+func (site ContinuationSite) UsesNativeBuiltinABI() bool {
+	return site.Flags&ContinuationFlagNativeBuiltinABI != 0
+}
+
+func (site ContinuationSite) DeoptsOnUncovered() bool {
+	return site.Flags&ContinuationFlagDeoptOnUncovered != 0
 }
 
 type OffsetTableBuilder struct {

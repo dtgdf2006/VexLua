@@ -265,4 +265,7 @@ func TestThreadUsesPinnedNativeAddressableArenas(t *testing.T) {
 	if theader.OpenUpvalueHead != 0 {
 		t.Fatalf("thread header open upvalue head = %#x, want 0", theader.OpenUpvalueHead)
 	}
+	if theader.CurrentFrame != 0 {
+		t.Fatalf("thread header current frame = %#x, want 0", theader.CurrentFrame)
+	}
 }

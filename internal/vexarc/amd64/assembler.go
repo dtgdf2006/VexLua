@@ -189,6 +189,10 @@ func (assembler *Assembler) AddRegImm32(dst Register, value int32) {
 	assembler.buffer.emitInt32(value)
 }
 
+func (assembler *Assembler) SubRegImm32(dst Register, value int32) {
+	assembler.AddRegImm32(dst, -value)
+}
+
 func (assembler *Assembler) OrRegImm32(dst Register, value uint32) {
 	assembler.emitRex(true, 0, 0, hiBit(dst))
 	assembler.buffer.emitByte(0x81)

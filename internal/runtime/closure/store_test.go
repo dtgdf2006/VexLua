@@ -360,3 +360,61 @@ func TestClosureFeedbackVectorUsesNativeHeapLayout(t *testing.T) {
 		t.Fatalf("feedback cell = %+v, want %+v", decodedCell, updated)
 	}
 }
+
+func TestClosureFeedbackHeaderNativeStateStaysCanonical(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	protos := rproto.NewStore(runtimeHeap)
+	closures := NewStore(runtimeHeap, protos)
+	proto := &bytecode.Proto{
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closureHandle, err := closures.NewLuaClosure(proto, value.NilValue(), nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	layout := feedback.LayoutForProto(proto)
+	base, err := closures.EnsureFeedbackVector(closureHandle.Ref, layout)
+	if err != nil {
+		t.Fatalf("ensure feedback vector: %v", err)
+	}
+	object, err := closures.Object(closureHandle.Ref)
+	if err != nil {
+		t.Fatalf("read closure object: %v", err)
+	}
+	offset, err := runtimeHeap.OffsetForNativeAddress(base)
+	if err != nil {
+		t.Fatalf("feedback vector offset: %v", err)
+	}
+	if offset != object.FeedbackData {
+		t.Fatalf("feedback offset %#x, want %#x", uint64(offset), uint64(object.FeedbackData))
+	}
+	updated := feedback.Header{SlotCount: layout.SlotCount(), InterruptBudget: 64, LoopHotness: 5, OSRState: 3, Flags: 0xA5}
+	if err := closures.WriteFeedbackHeader(closureHandle.Ref, updated); err != nil {
+		t.Fatalf("write feedback header: %v", err)
+	}
+	decoded, err := closures.ReadFeedbackHeader(closureHandle.Ref)
+	if err != nil {
+		t.Fatalf("read feedback header: %v", err)
+	}
+	if decoded != updated {
+		t.Fatalf("decoded header = %+v, want %+v", decoded, updated)
+	}
+	bytes, err := runtimeHeap.Resolve(object.FeedbackData, feedback.HeaderSize)
+	if err != nil {
+		t.Fatalf("resolve native feedback header: %v", err)
+	}
+	nativeUpdated := feedback.Header{SlotCount: layout.SlotCount(), InterruptBudget: -7, LoopHotness: 11, OSRState: 9, Flags: 0x5A}
+	if err := feedback.WriteHeader(bytes, nativeUpdated); err != nil {
+		t.Fatalf("write canonical feedback bytes: %v", err)
+	}
+	decoded, err = closures.ReadFeedbackHeader(closureHandle.Ref)
+	if err != nil {
+		t.Fatalf("read mutated feedback header: %v", err)
+	}
+	if decoded != nativeUpdated {
+		t.Fatalf("mutated header = %+v, want %+v", decoded, nativeUpdated)
+	}
+}

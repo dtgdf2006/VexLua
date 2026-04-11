@@ -32,7 +32,7 @@ func (state *compileState) emitGetGlobal(bytecodePC int, dst int, keyIndex int, 
 	hashPath := state.assembler.NewLabel()
 	done := state.assembler.NewLabel()
 	deopt := state.assembler.NewLabel()
-	siteID := state.recordContinuationSite(metadata.ContinuationGetGlobal, stubs.StubGetGlobal, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(dst), uint32(keyIndex), slotIndex, 0, 0)
+	siteID := state.recordContinuationSite(metadata.ContinuationGetGlobal, stubs.StubGetGlobal, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(dst), uint32(keyIndex), slotIndex, 0, metadata.ContinuationFlagNativeBuiltinABI|metadata.ContinuationFlagDeoptOnUncovered)
 
 	state.emitLoadClosureObject(amd64.RegRBX)
 	state.emitLoadFeedbackCellBase(amd64.RegRSI, amd64.RegRBX, slotIndex, deopt)
@@ -58,7 +58,7 @@ func (state *compileState) emitGetGlobal(bytecodePC int, dst int, keyIndex int, 
 	state.assembler.Jmp(done)
 
 	_ = state.assembler.Bind(deopt)
-	state.emitStubExit(stubs.StubGetGlobal, siteID)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubGetGlobal], siteID, stubs.StubGetGlobal, uint64(dst), uint64(keyIndex), uint64(slotIndex), 0, 0)
 	_ = state.assembler.Bind(done)
 }
 
@@ -67,7 +67,7 @@ func (state *compileState) emitGetTable(bytecodePC int, dst int, tableSlot int, 
 	hashPath := state.assembler.NewLabel()
 	done := state.assembler.NewLabel()
 	deopt := state.assembler.NewLabel()
-	siteID := state.recordContinuationSite(metadata.ContinuationGetTable, stubs.StubGetTable, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(dst), uint32(tableSlot), uint32(keyOperand), slotIndex, 0)
+	siteID := state.recordContinuationSite(metadata.ContinuationGetTable, stubs.StubGetTable, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(dst), uint32(tableSlot), uint32(keyOperand), slotIndex, metadata.ContinuationFlagNativeBuiltinABI|metadata.ContinuationFlagDeoptOnUncovered)
 
 	state.emitLoadClosureObject(amd64.RegRBX)
 	state.emitLoadFeedbackCellBase(amd64.RegRSI, amd64.RegRBX, slotIndex, deopt)
@@ -95,7 +95,7 @@ func (state *compileState) emitGetTable(bytecodePC int, dst int, tableSlot int, 
 	state.assembler.Jmp(done)
 
 	_ = state.assembler.Bind(deopt)
-	state.emitStubExit(stubs.StubGetTable, siteID)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubGetTable], siteID, stubs.StubGetTable, uint64(dst), uint64(tableSlot), uint64(keyOperand), uint64(slotIndex), 0)
 	_ = state.assembler.Bind(done)
 }
 
@@ -104,7 +104,7 @@ func (state *compileState) emitSetGlobal(bytecodePC int, src int, keyIndex int, 
 	hashPath := state.assembler.NewLabel()
 	done := state.assembler.NewLabel()
 	deopt := state.assembler.NewLabel()
-	siteID := state.recordContinuationSite(metadata.ContinuationSetGlobal, stubs.StubSetGlobal, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(src), uint32(keyIndex), slotIndex, 0, 0)
+	siteID := state.recordContinuationSite(metadata.ContinuationSetGlobal, stubs.StubSetGlobal, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(src), uint32(keyIndex), slotIndex, 0, metadata.ContinuationFlagNativeBuiltinABI|metadata.ContinuationFlagDeoptOnUncovered)
 
 	state.emitLoadClosureObject(amd64.RegRBX)
 	state.emitLoadFeedbackCellBase(amd64.RegRSI, amd64.RegRBX, slotIndex, deopt)
@@ -132,7 +132,7 @@ func (state *compileState) emitSetGlobal(bytecodePC int, src int, keyIndex int, 
 	state.assembler.Jmp(done)
 
 	_ = state.assembler.Bind(deopt)
-	state.emitStubExit(stubs.StubSetGlobal, siteID)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubSetGlobal], siteID, stubs.StubSetGlobal, uint64(src), uint64(keyIndex), uint64(slotIndex), 0, 0)
 	_ = state.assembler.Bind(done)
 }
 
@@ -141,7 +141,7 @@ func (state *compileState) emitSetTable(bytecodePC int, tableSlot int, keyOperan
 	hashPath := state.assembler.NewLabel()
 	done := state.assembler.NewLabel()
 	deopt := state.assembler.NewLabel()
-	siteID := state.recordContinuationSite(metadata.ContinuationSetTable, stubs.StubSetTable, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(tableSlot), uint32(keyOperand), uint32(valueOperand), slotIndex, 0)
+	siteID := state.recordContinuationSite(metadata.ContinuationSetTable, stubs.StubSetTable, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(tableSlot), uint32(keyOperand), uint32(valueOperand), slotIndex, metadata.ContinuationFlagNativeBuiltinABI|metadata.ContinuationFlagDeoptOnUncovered)
 
 	state.emitLoadClosureObject(amd64.RegRBX)
 	state.emitLoadFeedbackCellBase(amd64.RegRSI, amd64.RegRBX, slotIndex, deopt)
@@ -171,7 +171,7 @@ func (state *compileState) emitSetTable(bytecodePC int, tableSlot int, keyOperan
 	state.assembler.Jmp(done)
 
 	_ = state.assembler.Bind(deopt)
-	state.emitStubExit(stubs.StubSetTable, siteID)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubSetTable], siteID, stubs.StubSetTable, uint64(tableSlot), uint64(keyOperand), uint64(valueOperand), uint64(slotIndex), 0)
 	_ = state.assembler.Bind(done)
 }
 

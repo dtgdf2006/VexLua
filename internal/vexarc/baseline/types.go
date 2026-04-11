@@ -21,6 +21,17 @@ const (
 const (
 	execCtxSiteIDOffset = 0x00
 	execCtxFlagsOffset  = 0x04
+	execCtxReserved0Off = 0x08
+	execCtxReserved1Off = 0x0C
+	execCtxReserved2Off = 0x10
+	execCtxReserved3Off = 0x14
+)
+
+const (
+	execCtxFlagAlternateResume uint32 = 1 << iota
+	execCtxFlagNestedCallPending
+	execCtxFlagNestedCallDeopt
+	execCtxFlagNestedCallError
 )
 
 type executionContext struct {

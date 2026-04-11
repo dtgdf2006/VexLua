@@ -33,6 +33,19 @@ const (
 	hostDescriptorReserved2Off  = 0x38
 )
 
+const (
+	WrapperHostHandleOffset        = hostHandleOffset
+	WrapperDescriptorVersionOffset = descriptorVersionOffset
+	WrapperFlagsOffset             = flagsOffset
+	WrapperEnvOffset               = envOffset
+	WrapperNativeMetaOffset        = nativeMetaOffset
+
+	NativeDescriptorVersionOffset = hostDescriptorVersionOffset
+	NativeDescriptorArityOffset   = hostDescriptorArityOffset
+	NativeDescriptorFlagsOffset   = hostDescriptorFlagsOffset
+	NativeDescriptorKindOffset    = hostDescriptorKindOffset
+)
+
 type WrapperFlags uint32
 
 type DescriptorFlags uint16

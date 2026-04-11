@@ -12,8 +12,7 @@ const (
 	ThreadFrameBaseOffset       = 0x10
 	ThreadFrameEndOffset        = 0x18
 	ThreadOpenUpvalueHeadOffset = 0x20
-	ThreadFlagsOffset           = 0x28
-	ThreadReservedOffset        = 0x2C
+	ThreadCurrentFrameOffset    = 0x28
 )
 
 type ThreadStateHeader struct {
@@ -22,8 +21,7 @@ type ThreadStateHeader struct {
 	FrameBase       uint64
 	FrameEnd        uint64
 	OpenUpvalueHead uint64
-	Flags           uint32
-	Reserved        uint32
+	CurrentFrame    uint64
 }
 
 func ValidateThreadStateLayout() error {
@@ -45,11 +43,8 @@ func ValidateThreadStateLayout() error {
 	if unsafe.Offsetof(ThreadStateHeader{}.OpenUpvalueHead) != ThreadOpenUpvalueHeadOffset {
 		return fmt.Errorf("ThreadStateHeader.OpenUpvalueHead offset mismatch: got %#x want %#x", unsafe.Offsetof(ThreadStateHeader{}.OpenUpvalueHead), ThreadOpenUpvalueHeadOffset)
 	}
-	if unsafe.Offsetof(ThreadStateHeader{}.Flags) != ThreadFlagsOffset {
-		return fmt.Errorf("ThreadStateHeader.Flags offset mismatch: got %#x want %#x", unsafe.Offsetof(ThreadStateHeader{}.Flags), ThreadFlagsOffset)
-	}
-	if unsafe.Offsetof(ThreadStateHeader{}.Reserved) != ThreadReservedOffset {
-		return fmt.Errorf("ThreadStateHeader.Reserved offset mismatch: got %#x want %#x", unsafe.Offsetof(ThreadStateHeader{}.Reserved), ThreadReservedOffset)
+	if unsafe.Offsetof(ThreadStateHeader{}.CurrentFrame) != ThreadCurrentFrameOffset {
+		return fmt.Errorf("ThreadStateHeader.CurrentFrame offset mismatch: got %#x want %#x", unsafe.Offsetof(ThreadStateHeader{}.CurrentFrame), ThreadCurrentFrameOffset)
 	}
 	return nil
 }

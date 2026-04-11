@@ -38,7 +38,7 @@ func TestCodeMetadataFinalizesContinuationSites(t *testing.T) {
 	}
 	siteID := metadata.AddContinuationSite(ContinuationSite{
 		Kind:        ContinuationGetTable,
-		Flags:       ContinuationFlagAlternateResume,
+		Flags:       ContinuationFlagAlternateResume | ContinuationFlagNativeBuiltinABI | ContinuationFlagDeoptOnUncovered,
 		StubID:      42,
 		BytecodePC:  1,
 		DeoptPC:     1,
@@ -65,6 +65,12 @@ func TestCodeMetadataFinalizesContinuationSites(t *testing.T) {
 	}
 	if !site.HasAlternateResume() {
 		t.Fatalf("expected alternate resume flag on site: %+v", site)
+	}
+	if !site.UsesNativeBuiltinABI() {
+		t.Fatalf("expected native builtin ABI flag on site: %+v", site)
+	}
+	if !site.DeoptsOnUncovered() {
+		t.Fatalf("expected deopt-on-uncovered flag on site: %+v", site)
 	}
 	if site.Operand0 != 9 || site.Operand1 != 10 || site.Operand2 != 11 || site.LiveSlots != 4 {
 		t.Fatalf("unexpected continuation operands/live slots: %+v", site)
