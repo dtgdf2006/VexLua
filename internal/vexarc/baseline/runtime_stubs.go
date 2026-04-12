@@ -34,6 +34,8 @@ func (runtime *Runtime) handleStub(thread *state.ThreadState, frame *state.CallF
 		return runtime.handleSetGlobalStub(thread, frame, closureRef, compiled, site, nresults)
 	case stubs.StubSetTable:
 		return runtime.handleSetTableStub(thread, frame, closureRef, compiled, site, nresults)
+	case stubs.StubSetList:
+		return runtime.handleSetListStub(thread, frame, compiled, site, nresults)
 	case stubs.StubLuaCall:
 		return runtime.handleCallStub(thread, frame, compiled, site, ctx)
 	case stubs.StubTailCall:
@@ -89,6 +91,9 @@ func (runtime *Runtime) handleGetGlobalStub(thread *state.ThreadState, frame *st
 	if err := thread.SetRegister(frame, uint16(site.Operand0), result); err != nil {
 		return 0, false, nil, err
 	}
+	if err := advanceFrameTopForSlot(frame, int(site.Operand0)); err != nil {
+		return 0, false, nil, err
+	}
 	entry, err := compiled.EntryAtSite(site, false)
 	return entry, false, nil, err
 }
@@ -112,6 +117,9 @@ func (runtime *Runtime) handleGetTableStub(thread *state.ThreadState, frame *sta
 		return runtime.deoptThroughSite(thread, frame, site, nresults)
 	}
 	if err := thread.SetRegister(frame, uint16(site.Operand0), result); err != nil {
+		return 0, false, nil, err
+	}
+	if err := advanceFrameTopForSlot(frame, int(site.Operand0)); err != nil {
 		return 0, false, nil, err
 	}
 	entry, err := compiled.EntryAtSite(site, false)
@@ -166,20 +174,71 @@ func (runtime *Runtime) handleSetTableStub(thread *state.ThreadState, frame *sta
 	return entry, false, nil, err
 }
 
+func (runtime *Runtime) handleSetListStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, _ int) (uintptr, bool, []value.TValue, error) {
+	tableValue, err := thread.Register(frame, uint16(site.Operand0))
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if !tableValue.IsBoxedTag(value.TagTableRef) {
+		return runtime.deoptThroughSite(thread, frame, site, -1)
+	}
+	count := int(site.Operand1)
+	if count == 0 {
+		top := int(frame.LogicalTop())
+		if top <= int(site.Operand0)+1 {
+			count = 0
+		} else {
+			count = top - int(site.Operand0) - 1
+		}
+	}
+	if count == 0 {
+		entry, err := compiled.EntryAtSite(site, false)
+		return entry, false, nil, err
+	}
+	baseIndex := (int(site.Operand2) - 1) * setListFieldsPerFlush
+	values := make([]value.TValue, count)
+	for index := 0; index < count; index++ {
+		slotValue, err := thread.Register(frame, uint16(int(site.Operand0)+index+1))
+		if err != nil {
+			return 0, false, nil, err
+		}
+		values[index] = slotValue
+	}
+	ref, _ := tableValue.HeapRef()
+	handled, err := runtime.Engine.Tables.SetListArray(ref, uint32(baseIndex+1), values)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if !handled {
+		return runtime.deoptThroughSite(thread, frame, site, -1)
+	}
+	entry, err := compiled.EntryAtSite(site, false)
+	return entry, false, nil, err
+}
+
 func (runtime *Runtime) handleCallStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, ctx *executionContext) (uintptr, bool, []value.TValue, error) {
 	a := int(site.Operand0)
 	b := int(site.Operand1)
 	c := int(site.Operand2)
+	resultBase := a
+	previousTop := frame.LogicalTop()
+	if site.HasAlternateResume() && site.Operand3 != 0 {
+		resultBase = a + 3
+	}
 	if ctx != nil && ctx.Flags&execCtxFlagNestedCallPending != 0 {
 		results, err := runtime.finishNestedCompiledCall(thread, frame, ctx)
 		if err != nil {
 			return 0, false, nil, err
 		}
-		if err := storeFrameCallResults(thread, frame, a, c, results); err != nil {
+		if err := storeFrameCallResults(thread, frame, resultBase, c, results); err != nil {
 			return 0, false, nil, err
 		}
-		entry, err := compiled.EntryAtSite(site, false)
-		return entry, false, nil, err
+		if site.HasAlternateResume() && previousTop > frame.LogicalTop() {
+			if err := frame.SetTop(previousTop); err != nil {
+				return 0, false, nil, err
+			}
+		}
+		return runtime.resumeCallContinuation(thread, frame, compiled, site)
 	}
 	callee, args, err := runtime.collectFrameCallArguments(thread, frame, a, b)
 	if err != nil {
@@ -193,8 +252,30 @@ func (runtime *Runtime) handleCallStub(thread *state.ThreadState, frame *state.C
 	if err != nil {
 		return 0, false, nil, err
 	}
-	if err := storeFrameCallResults(thread, frame, a, c, results); err != nil {
+	if err := storeFrameCallResults(thread, frame, resultBase, c, results); err != nil {
 		return 0, false, nil, err
+	}
+	if site.HasAlternateResume() && previousTop > frame.LogicalTop() {
+		if err := frame.SetTop(previousTop); err != nil {
+			return 0, false, nil, err
+		}
+	}
+	return runtime.resumeCallContinuation(thread, frame, compiled, site)
+}
+
+func (runtime *Runtime) resumeCallContinuation(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite) (uintptr, bool, []value.TValue, error) {
+	if site.HasAlternateResume() && site.Operand3 != 0 {
+		firstResult, err := thread.Register(frame, uint16(site.Operand0+3))
+		if err != nil {
+			return 0, false, nil, err
+		}
+		if !firstResult.IsBoxedTag(value.TagNil) {
+			if err := thread.SetRegister(frame, uint16(site.Operand3), firstResult); err != nil {
+				return 0, false, nil, err
+			}
+			entry, err := compiled.EntryAtSite(site, true)
+			return entry, false, nil, err
+		}
 	}
 	entry, err := compiled.EntryAtSite(site, false)
 	return entry, false, nil, err
@@ -314,6 +395,20 @@ func (runtime *Runtime) compiledFrameState(frame *state.CallFrameHeader) (value.
 	}
 	return closureRef, compiled, nil
 }
+
+func advanceFrameTopForSlot(frame *state.CallFrameHeader, slot int) error {
+	if frame == nil {
+		return fmt.Errorf("frame cannot be nil")
+	}
+	if slot < 0 {
+		return fmt.Errorf("slot %d is invalid", slot)
+	}
+	if slot+1 <= int(frame.LogicalTop()) {
+		return nil
+	}
+	return frame.SetTop(uint16(slot + 1))
+}
+
 func (runtime *Runtime) collectFrameCallArguments(thread *state.ThreadState, frame *state.CallFrameHeader, a int, b int) (value.TValue, []value.TValue, error) {
 	callee, err := thread.Register(frame, uint16(a))
 	if err != nil {
@@ -321,7 +416,7 @@ func (runtime *Runtime) collectFrameCallArguments(thread *state.ThreadState, fra
 	}
 	argumentCount := 0
 	if b == 0 {
-		argumentCount = int(frame.RegisterCount) - a - 1
+		argumentCount = int(frame.LogicalTop()) - a - 1
 		if argumentCount < 0 {
 			argumentCount = 0
 		}

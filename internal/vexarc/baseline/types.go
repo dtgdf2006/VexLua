@@ -34,6 +34,14 @@ const (
 	execCtxFlagNestedCallError
 )
 
+const (
+	builtinCallBlockFlagOpenArgs uint32 = 1 << iota
+	builtinCallBlockFlagOpenResults
+	builtinCallBlockFlagTForLoop
+)
+
+const setListFieldsPerFlush = 50
+
 type executionContext struct {
 	SiteID    uint32
 	Flags     uint32

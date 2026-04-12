@@ -18,6 +18,7 @@ const (
 	StubArithmetic
 	StubUnaryTest
 	StubLen
+	StubSetList
 	StubCompare
 )
 
@@ -41,6 +42,7 @@ var Catalog = map[ID]Descriptor{
 	StubArithmetic: {ID: StubArithmetic, Name: "arithmetic"},
 	StubUnaryTest:  {ID: StubUnaryTest, Name: "unary-test"},
 	StubLen:        {ID: StubLen, Name: "len"},
+	StubSetList:    {ID: StubSetList, Name: "set-list"},
 	StubCompare:    {ID: StubCompare, Name: "compare"},
 }
 

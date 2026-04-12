@@ -110,6 +110,8 @@ func slotKindForOpcode(opcode bytecode.Opcode) (SlotKind, bool) {
 		return SlotSetUpvalue, true
 	case bytecode.OP_CALL:
 		return SlotCall, true
+	case bytecode.OP_TFORLOOP:
+		return SlotCall, true
 	case bytecode.OP_TAILCALL:
 		return SlotTailCall, true
 	default:

@@ -17,14 +17,15 @@ func TestLayoutBuildsSlotsForCoveredCellFamilies(t *testing.T) {
 			bytecode.CreateABC(bytecode.OP_SETTABLE, 0, bytecode.RKAsk(3), 1),
 			bytecode.CreateABC(bytecode.OP_CALL, 0, 1, 1),
 			bytecode.CreateABC(bytecode.OP_TAILCALL, 0, 1, 0),
+			bytecode.CreateABC(bytecode.OP_TFORLOOP, 0, 0, 1),
 			bytecode.CreateAsBx(bytecode.OP_FORPREP, 0, 1),
 			bytecode.CreateAsBx(bytecode.OP_FORLOOP, 0, -1),
 			bytecode.CreateABC(bytecode.OP_RETURN, 0, 1, 0),
 		},
 	}
 	layout := LayoutForProto(proto)
-	if layout.SlotCount() != 8 {
-		t.Fatalf("slot count = %d, want 8", layout.SlotCount())
+	if layout.SlotCount() != 9 {
+		t.Fatalf("slot count = %d, want 9", layout.SlotCount())
 	}
 	tests := []struct {
 		pc   int
@@ -38,6 +39,7 @@ func TestLayoutBuildsSlotsForCoveredCellFamilies(t *testing.T) {
 		{pc: 5, kind: SlotSetTable},
 		{pc: 6, kind: SlotCall},
 		{pc: 7, kind: SlotTailCall},
+		{pc: 8, kind: SlotCall},
 	}
 	for index, test := range tests {
 		slot, slotIndex, ok := layout.SlotAtPC(test.pc)
@@ -51,7 +53,7 @@ func TestLayoutBuildsSlotsForCoveredCellFamilies(t *testing.T) {
 			t.Fatalf("pc %d slot kind = %d, want %d", test.pc, slot.Kind, test.kind)
 		}
 	}
-	for _, pc := range []int{8, 9, 10} {
+	for _, pc := range []int{9, 10, 11} {
 		if _, _, ok := layout.SlotAtPC(pc); ok {
 			t.Fatalf("pc %d should not get a feedback cell slot", pc)
 		}

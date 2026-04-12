@@ -14,7 +14,7 @@ func TestStage0LayoutConstants(t *testing.T) {
 	if value.CommonHeaderSize != 0x10 {
 		t.Fatalf("unexpected common header size: %#x", value.CommonHeaderSize)
 	}
-	if state.CallFrameHeaderSize != 0x50 {
+	if state.CallFrameHeaderSize != 0x60 {
 		t.Fatalf("unexpected call frame header size: %#x", state.CallFrameHeaderSize)
 	}
 	if state.StubCallBlockSize != 0x30 {

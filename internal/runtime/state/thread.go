@@ -27,6 +27,8 @@ type FrameSpec struct {
 	VarargCount   uint32
 	RegisterCount uint16
 	SpillCount    uint16
+	Top           uint16
+	ResultCap     uint16
 }
 
 type VMState struct {
@@ -334,6 +336,8 @@ func (thread *ThreadState) PushFrame(spec FrameSpec) (*CallFrameHeader, error) {
 		RegisterCount: spec.RegisterCount,
 		SpillCount:    spec.SpillCount,
 		ResultBase:    uint64(spec.ResultBase),
+		Top:           spec.Top,
+		ResultCap:     spec.ResultCap,
 	}
 	if thread.currentFrame >= 0 {
 		previousAddress, err := thread.FrameAddress(thread.currentFrame)

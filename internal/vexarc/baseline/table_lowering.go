@@ -48,6 +48,7 @@ func (state *compileState) emitGetGlobal(bytecodePC int, dst int, keyIndex int, 
 	state.emitGuardTableValueAgainstCell(amd64.RegRAX, amd64.RegRSI, deopt)
 	state.emitLoadArrayValueFromCachedCell(amd64.RegRDX, amd64.RegRSI, amd64.RegRDI, amd64.RegR8, deopt)
 	state.assembler.MoveMemReg64(amd64.RegR12, slotDisp(dst), amd64.RegRAX)
+	state.emitAdvanceTopForSlot(dst)
 	state.assembler.Jmp(done)
 
 	_ = state.assembler.Bind(hashPath)
@@ -55,6 +56,7 @@ func (state *compileState) emitGetGlobal(bytecodePC int, dst int, keyIndex int, 
 	state.emitGuardTableValueAgainstCell(amd64.RegRAX, amd64.RegRSI, deopt)
 	state.emitLoadHashValueFromCachedCell(amd64.RegRDX, amd64.RegRSI, amd64.RegRDI, amd64.RegR8, deopt)
 	state.assembler.MoveMemReg64(amd64.RegR12, slotDisp(dst), amd64.RegRAX)
+	state.emitAdvanceTopForSlot(dst)
 	state.assembler.Jmp(done)
 
 	_ = state.assembler.Bind(deopt)
@@ -84,6 +86,7 @@ func (state *compileState) emitGetTable(bytecodePC int, dst int, tableSlot int, 
 	state.emitGuardRegisterKeyMatchesCell(keyOperand, amd64.RegRSI, amd64.RegR9, amd64.RegR10, deopt)
 	state.emitLoadArrayValueFromCachedCell(amd64.RegRDX, amd64.RegRSI, amd64.RegRDI, amd64.RegR8, deopt)
 	state.assembler.MoveMemReg64(amd64.RegR12, slotDisp(dst), amd64.RegRAX)
+	state.emitAdvanceTopForSlot(dst)
 	state.assembler.Jmp(done)
 
 	_ = state.assembler.Bind(hashPath)
@@ -92,6 +95,7 @@ func (state *compileState) emitGetTable(bytecodePC int, dst int, tableSlot int, 
 	state.emitGuardRegisterKeyMatchesCell(keyOperand, amd64.RegRSI, amd64.RegR9, amd64.RegR10, deopt)
 	state.emitLoadHashValueFromCachedCell(amd64.RegRDX, amd64.RegRSI, amd64.RegRDI, amd64.RegR8, deopt)
 	state.assembler.MoveMemReg64(amd64.RegR12, slotDisp(dst), amd64.RegRAX)
+	state.emitAdvanceTopForSlot(dst)
 	state.assembler.Jmp(done)
 
 	_ = state.assembler.Bind(deopt)

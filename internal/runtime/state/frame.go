@@ -11,7 +11,7 @@ import (
 type FrameFlags uint16
 
 const (
-	CallFrameHeaderSize = 0x50
+	CallFrameHeaderSize = 0x60
 	StubCallBlockSize   = 0x30
 )
 
@@ -30,6 +30,10 @@ const (
 	CallFrameRegisterCountOff  = 0x44
 	CallFrameSpillCountOffset  = 0x46
 	CallFrameResultBaseOffset  = 0x48
+	CallFrameTopOffset         = 0x50
+	CallFrameResultCapOffset   = 0x52
+	CallFrameReservedU32Offset = 0x54
+	CallFrameReservedU64Offset = 0x58
 )
 
 const (
@@ -68,6 +72,10 @@ type CallFrameHeader struct {
 	RegisterCount uint16
 	SpillCount    uint16
 	ResultBase    uint64
+	Top           uint16
+	ResultCap     uint16
+	ReservedU32   uint32
+	ReservedU64   uint64
 }
 
 type StubCallBlock struct {
@@ -114,6 +122,42 @@ func (frame CallFrameHeader) Validate() error {
 	if frame.VarargCount > 0 && !frame.Flags.Has(FrameFlagHasVararg) {
 		return fmt.Errorf("vararg_count is non-zero but has_vararg flag is not set")
 	}
+	if frame.Top > frame.RegisterCount {
+		return fmt.Errorf("top %d exceeds register_count %d", frame.Top, frame.RegisterCount)
+	}
+	if frame.ResultCap > 0 && frame.ResultBase == 0 {
+		return fmt.Errorf("result_cap %d requires result_base", frame.ResultCap)
+	}
+	return nil
+}
+
+func (frame CallFrameHeader) LogicalTop() uint16 {
+	return frame.Top
+}
+
+func (frame *CallFrameHeader) SetTop(top uint16) error {
+	if frame == nil {
+		return fmt.Errorf("frame cannot be nil")
+	}
+	if top > frame.RegisterCount {
+		return fmt.Errorf("top %d exceeds register_count %d", top, frame.RegisterCount)
+	}
+	frame.Top = top
+	return nil
+}
+
+func (frame CallFrameHeader) ResultCapacity() uint16 {
+	return frame.ResultCap
+}
+
+func (frame *CallFrameHeader) SetResultCapacity(capacity uint16) error {
+	if frame == nil {
+		return fmt.Errorf("frame cannot be nil")
+	}
+	if capacity > 0 && frame.ResultBase == 0 {
+		return fmt.Errorf("result capacity %d requires result_base", capacity)
+	}
+	frame.ResultCap = capacity
 	return nil
 }
 
@@ -184,6 +228,18 @@ func ValidateLayout() error {
 	}
 	if unsafe.Offsetof(CallFrameHeader{}.ResultBase) != CallFrameResultBaseOffset {
 		return fmt.Errorf("ResultBase offset mismatch: got %#x want %#x", unsafe.Offsetof(CallFrameHeader{}.ResultBase), CallFrameResultBaseOffset)
+	}
+	if unsafe.Offsetof(CallFrameHeader{}.Top) != CallFrameTopOffset {
+		return fmt.Errorf("Top offset mismatch: got %#x want %#x", unsafe.Offsetof(CallFrameHeader{}.Top), CallFrameTopOffset)
+	}
+	if unsafe.Offsetof(CallFrameHeader{}.ResultCap) != CallFrameResultCapOffset {
+		return fmt.Errorf("ResultCap offset mismatch: got %#x want %#x", unsafe.Offsetof(CallFrameHeader{}.ResultCap), CallFrameResultCapOffset)
+	}
+	if unsafe.Offsetof(CallFrameHeader{}.ReservedU32) != CallFrameReservedU32Offset {
+		return fmt.Errorf("ReservedU32 offset mismatch: got %#x want %#x", unsafe.Offsetof(CallFrameHeader{}.ReservedU32), CallFrameReservedU32Offset)
+	}
+	if unsafe.Offsetof(CallFrameHeader{}.ReservedU64) != CallFrameReservedU64Offset {
+		return fmt.Errorf("ReservedU64 offset mismatch: got %#x want %#x", unsafe.Offsetof(CallFrameHeader{}.ReservedU64), CallFrameReservedU64Offset)
 	}
 	if unsafe.Sizeof(StubCallBlock{}) != StubCallBlockSize {
 		return fmt.Errorf("StubCallBlock size mismatch: got %#x want %#x", unsafe.Sizeof(StubCallBlock{}), StubCallBlockSize)

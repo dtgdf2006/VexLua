@@ -129,6 +129,56 @@ func (store *Store) Set(tableRef value.HeapRef44, key value.TValue, newValue val
 	return store.writeObject(offset, objectBytes, updated)
 }
 
+func (store *Store) SetListArray(tableRef value.HeapRef44, startIndex uint32, values []value.TValue) (bool, error) {
+	if startIndex == 0 {
+		return false, fmt.Errorf("setlist start index must be >= 1")
+	}
+	if len(values) == 0 {
+		return true, nil
+	}
+	lastIndex64 := uint64(startIndex) + uint64(len(values)) - 1
+	if lastIndex64 > math.MaxUint32 {
+		return false, fmt.Errorf("setlist end index %d exceeds uint32 range", lastIndex64)
+	}
+	lastIndex := uint32(lastIndex64)
+	offset, objectBytes, object, err := store.loadObject(tableRef)
+	if err != nil {
+		return false, err
+	}
+	if object.Flags&(FlagNewIndexFastPathBlocked|FlagWeakKeys|FlagWeakValues|FlagRehashing|FlagFrozen|FlagReadOnly) != 0 {
+		return false, nil
+	}
+	object, err = store.ensureArrayCapacity(object, lastIndex)
+	if err != nil {
+		return false, err
+	}
+	structuralChange := false
+	for index, slotValue := range values {
+		arrayIndex := startIndex + uint32(index)
+		previous, err := store.readArraySlot(object, arrayIndex)
+		if err != nil {
+			return false, err
+		}
+		if previous.Bits() != slotValue.Bits() && isNilValue(previous) != isNilValue(slotValue) {
+			structuralChange = true
+		}
+		if err := store.writeArraySlot(object, arrayIndex, slotValue); err != nil {
+			return false, err
+		}
+	}
+	if structuralChange {
+		object.BumpVersion()
+	}
+	if err := store.refreshArrayLenHint(&object); err != nil {
+		return false, err
+	}
+	object.SyncLayoutFlags()
+	if err := store.writeObject(offset, objectBytes, object); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (store *Store) SetMetatable(tableRef value.HeapRef44, metatable value.TValue) error {
 	offset, objectBytes, object, err := store.loadObject(tableRef)
 	if err != nil {

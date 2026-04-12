@@ -203,6 +203,8 @@ func (runtime *Runtime) callCompiled(thread *state.ThreadState, closureRef value
 		VarargCount:   uint32(varargCount),
 		RegisterCount: uint16(registerCount),
 		SpillCount:    uint16(resultSlots + varargCount),
+		Top:           uint16(minInt(len(args), registerCount)),
+		ResultCap:     uint16(resultSlots),
 	})
 	if err != nil {
 		return nil, err
@@ -340,14 +342,19 @@ func registerNumber(thread *state.ThreadState, frame *state.CallFrameHeader, ind
 
 func storeFrameCallResults(thread *state.ThreadState, frame *state.CallFrameHeader, a int, c int, results []value.TValue) error {
 	if c == 1 {
+		if err := frame.SetTop(uint16(a)); err != nil {
+			return err
+		}
 		return nil
 	}
 	wanted := c - 1
 	if c == 0 {
-		wanted = int(frame.RegisterCount) - a
-		if wanted < 0 {
-			wanted = 0
+		for index, slotValue := range results {
+			if err := thread.SetRegister(frame, uint16(a+index), slotValue); err != nil {
+				return err
+			}
 		}
+		return frame.SetTop(uint16(a + len(results)))
 	}
 	for index := 0; index < wanted; index++ {
 		slotValue := value.NilValue()
@@ -358,7 +365,7 @@ func storeFrameCallResults(thread *state.ThreadState, frame *state.CallFrameHead
 			return err
 		}
 	}
-	return nil
+	return frame.SetTop(uint16(a + wanted))
 }
 
 func normalizeResults(results []value.TValue, nresults int) []value.TValue {

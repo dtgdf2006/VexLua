@@ -32,6 +32,7 @@ func TestStubManagerInstallsAllCoveredNativeBuiltinBodies(t *testing.T) {
 		stubs.StubTailCall,
 		stubs.StubForPrep,
 		stubs.StubForLoop,
+		stubs.StubSetList,
 	} {
 		if manager.stubBodies[id] == nil {
 			t.Fatalf("stub %d should install a native body block", id)
@@ -235,6 +236,7 @@ func TestCompilerEmitsNativeBuiltinContinuationContracts(t *testing.T) {
 	compilerText := string(compilerSource)
 	for _, needle := range []string{
 		"recordContinuationSite(metadata.ContinuationCall, stubs.StubLuaCall",
+		"recordContinuationSite(metadata.ContinuationSetList, stubs.StubSetList",
 		"recordContinuationSite(metadata.ContinuationGetUpvalue, stubs.StubGetUpvalue",
 		"recordContinuationSite(metadata.ContinuationSetUpvalue, stubs.StubSetUpvalue",
 		"recordContinuationSite(metadata.ContinuationTailCall, stubs.StubTailCall",

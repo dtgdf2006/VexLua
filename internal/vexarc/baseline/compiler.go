@@ -56,6 +56,7 @@ func NewCompiler(engine *interp.Engine, cache *codecache.Cache, manager *stubMan
 		stubs.StubForLoop,
 		stubs.StubSelf,
 		stubs.StubLen,
+		stubs.StubSetList,
 	} {
 		entry, err := manager.StubEntry(id)
 		if err != nil {
@@ -166,6 +167,9 @@ func (state *compileState) dispositionForInstruction(offset int, instruction byt
 		bytecode.OP_CALL,
 		bytecode.OP_TAILCALL,
 		bytecode.OP_RETURN,
+		bytecode.OP_SETLIST,
+		bytecode.OP_TFORLOOP,
+		bytecode.OP_VARARG,
 		bytecode.OP_FORPREP,
 		bytecode.OP_FORLOOP:
 		return instructionDispositionCompiled
@@ -294,6 +298,7 @@ func (state *compileState) emitInstruction(offset int, instruction bytecode.Inst
 	case bytecode.OP_MOVE:
 		state.assembler.MoveRegMem64(amd64.RegRAX, amd64.RegR12, slotDisp(instruction.B()))
 		state.assembler.MoveMemReg64(amd64.RegR12, slotDisp(instruction.A()), amd64.RegRAX)
+		state.emitAdvanceTopForSlot(instruction.A())
 	case bytecode.OP_LOADK:
 		state.emitLoadConstant(instruction.A(), instruction.Bx())
 	case bytecode.OP_LOADBOOL:
@@ -350,12 +355,18 @@ func (state *compileState) emitInstruction(offset int, instruction bytecode.Inst
 		return state.emitCompareInstruction(offset, instruction)
 	case bytecode.OP_TEST, bytecode.OP_TESTSET:
 		return state.emitTestInstruction(offset, instruction)
+	case bytecode.OP_TFORLOOP:
+		return state.emitTForLoopInstruction(offset, instruction)
 	case bytecode.OP_CALL:
 		return state.emitCallInstruction(offset, instruction)
 	case bytecode.OP_TAILCALL:
 		return state.emitTailCallInstruction(offset, instruction)
 	case bytecode.OP_RETURN:
 		return state.emitReturnInstruction(offset, instruction)
+	case bytecode.OP_SETLIST:
+		return state.emitSetListInstruction(offset, instruction)
+	case bytecode.OP_VARARG:
+		return state.emitVarargInstruction(offset, instruction)
 	case bytecode.OP_FORPREP:
 		return state.emitForPrepInstruction(offset, instruction)
 	case bytecode.OP_FORLOOP:
@@ -424,11 +435,32 @@ func (state *compileState) emitTestInstruction(offset int, instruction bytecode.
 	return nil
 }
 
-func (state *compileState) emitCallInstruction(offset int, instruction bytecode.Instruction) error {
-	if instruction.B() == 0 || instruction.C() == 0 {
+func (state *compileState) emitTForLoopInstruction(offset int, instruction bytecode.Instruction) error {
+	if instruction.C() == 0 {
 		state.emitUncoveredInstructionDeopt(offset)
 		return nil
 	}
+	target, err := state.testJumpTarget(offset, instruction.Opcode())
+	if err != nil {
+		return err
+	}
+	slotIndex, err := state.feedbackSlotIndex(offset, feedback.SlotCall)
+	if err != nil {
+		return err
+	}
+	siteID := state.recordContinuationSite(metadata.ContinuationCall, stubs.StubLuaCall, offset, offset, offset+2, target, uint32(instruction.A()), 3, uint32(instruction.C()+1), uint32(instruction.A()+2), metadata.ContinuationFlagAlternateResume|metadata.ContinuationFlagNativeBuiltinABI)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubLuaCall], siteID, stubs.StubLuaCall, uint64(instruction.A()), 3, uint64(instruction.C()+1), uint64(slotIndex), builtinCallBlockFlagTForLoop)
+	state.assembler.MoveRegMem64(amd64.RegRAX, amd64.RegR12, slotDisp(instruction.A()+3))
+	state.assembler.MoveRegImm64(amd64.RegRCX, uint64(value.NilValue().Bits()))
+	state.assembler.CmpRegReg(amd64.RegRAX, amd64.RegRCX)
+	state.assembler.Jcc(amd64.CondEqual, state.labelFor(offset+2))
+	state.assembler.MoveMemReg64(amd64.RegR12, slotDisp(instruction.A()+2), amd64.RegRAX)
+	state.emitAdvanceTopForSlot(instruction.A() + 2)
+	state.assembler.Jmp(state.labelFor(target))
+	return nil
+}
+
+func (state *compileState) emitCallInstruction(offset int, instruction bytecode.Instruction) error {
 	slotIndex, err := state.feedbackSlotIndex(offset, feedback.SlotCall)
 	if err != nil {
 		return err
@@ -438,7 +470,7 @@ func (state *compileState) emitCallInstruction(offset int, instruction bytecode.
 }
 
 func (state *compileState) emitTailCallInstruction(offset int, instruction bytecode.Instruction) error {
-	if instruction.B() == 0 || instruction.C() != 0 {
+	if instruction.C() != 0 {
 		state.emitUncoveredInstructionDeopt(offset)
 		return nil
 	}
@@ -452,7 +484,29 @@ func (state *compileState) emitTailCallInstruction(offset int, instruction bytec
 
 func (state *compileState) emitReturnInstruction(offset int, instruction bytecode.Instruction) error {
 	if instruction.B() == 0 {
-		state.emitUncoveredInstructionDeopt(offset)
+		noValues := state.assembler.NewLabel()
+
+		state.assembler.MoveRegMem64(amd64.RegR10, amd64.RegR13, state.CallFrameResultBaseOffset())
+		state.assembler.MoveRegMem32(amd64.RegRCX, amd64.RegR13, state.CallFrameTopOffset())
+		state.assembler.AndRegImm32(amd64.RegRCX, 0xFFFF)
+		state.assembler.CmpRegImm32(amd64.RegRCX, uint32(instruction.A()))
+		state.assembler.Jcc(amd64.CondBelowEqual, noValues)
+		if instruction.A() != 0 {
+			state.assembler.SubRegImm32(amd64.RegRCX, int32(instruction.A()))
+		}
+		state.assembler.MoveRegReg(amd64.RegRDX, amd64.RegRCX)
+		state.assembler.MoveRegReg(amd64.RegR8, amd64.RegR12)
+		if instruction.A() != 0 {
+			state.assembler.AddRegImm32(amd64.RegR8, slotDisp(instruction.A()))
+		}
+		emitCopySlots(state.assembler, amd64.RegR10, amd64.RegR8, amd64.RegRCX)
+		state.assembler.XorRegReg(amd64.RegRAX, amd64.RegRAX)
+		state.assembler.Ret()
+
+		_ = state.assembler.Bind(noValues)
+		state.assembler.XorRegReg(amd64.RegRAX, amd64.RegRAX)
+		state.assembler.XorRegReg(amd64.RegRDX, amd64.RegRDX)
+		state.assembler.Ret()
 		return nil
 	}
 	count := instruction.B() - 1
@@ -462,6 +516,47 @@ func (state *compileState) emitReturnInstruction(offset int, instruction bytecod
 		state.assembler.MoveMemReg64(amd64.RegR10, slotDisp(index), amd64.RegRAX)
 	}
 	state.emitStatus(compiledStatusOK, uint32(count))
+	return nil
+}
+
+func (state *compileState) emitSetListInstruction(offset int, instruction bytecode.Instruction) error {
+	block := instruction.C()
+	resumePC := offset + 1
+	if block == 0 {
+		if offset+1 >= len(state.proto.Code) {
+			return fmt.Errorf("SETLIST expects trailing extra argument instruction at pc %d", offset)
+		}
+		block = int(state.proto.Code[offset+1])
+		resumePC = offset + 2
+	}
+	state.emitSetList(offset, instruction.A(), instruction.B(), block, resumePC)
+	return nil
+}
+
+func (state *compileState) emitVarargInstruction(_ int, instruction bytecode.Instruction) error {
+	state.assembler.MoveRegMem64(amd64.RegR10, amd64.RegR13, state.CallFrameVarargBaseOffset())
+	state.assembler.MoveRegMem32(amd64.RegRCX, amd64.RegR13, state.CallFrameVarargCountOffset())
+	if instruction.B() == 0 {
+		state.assembler.MoveRegReg(amd64.RegRDX, amd64.RegRCX)
+		if instruction.A() != 0 {
+			state.assembler.AddRegImm32(amd64.RegRDX, int32(instruction.A()))
+			state.assembler.MoveRegReg(amd64.RegR8, amd64.RegR12)
+			state.assembler.AddRegImm32(amd64.RegR8, slotDisp(instruction.A()))
+		} else {
+			state.assembler.MoveRegReg(amd64.RegR8, amd64.RegR12)
+		}
+		emitCopySlots(state.assembler, amd64.RegR8, amd64.RegR10, amd64.RegRCX)
+		state.assembler.MoveMemReg32(amd64.RegR13, state.CallFrameTopOffset(), amd64.RegRDX)
+		return nil
+	}
+	state.assembler.MoveRegImm32(amd64.RegRDX, uint32(instruction.B()-1))
+	if instruction.A() != 0 {
+		state.assembler.MoveRegReg(amd64.RegR8, amd64.RegR12)
+		state.assembler.AddRegImm32(amd64.RegR8, slotDisp(instruction.A()))
+	} else {
+		state.assembler.MoveRegReg(amd64.RegR8, amd64.RegR12)
+	}
+	emitCopyResultsWithNilFill(state.assembler, amd64.RegR8, amd64.RegR10, amd64.RegRDX, amd64.RegRCX)
 	return nil
 }
 
@@ -589,6 +684,7 @@ func (state *compileState) emitStatus(status uint32, aux uint32) {
 func (state *compileState) emitStoreRawTValue(slot int, bits uint64) {
 	state.assembler.MoveRegImm64(amd64.RegRAX, bits)
 	state.assembler.MoveMemReg64(amd64.RegR12, slotDisp(slot), amd64.RegRAX)
+	state.emitAdvanceTopForSlot(slot)
 }
 
 func (state *compileState) emitLoadConstant(slot int, index int) {
@@ -598,11 +694,32 @@ func (state *compileState) emitLoadConstant(slot int, index int) {
 	}
 	state.assembler.MoveRegMem64(amd64.RegRAX, amd64.RegR10, 0)
 	state.assembler.MoveMemReg64(amd64.RegR12, slotDisp(slot), amd64.RegRAX)
+	state.emitAdvanceTopForSlot(slot)
+}
+
+func (state *compileState) emitAdvanceTopForSlot(slot int) {
+	done := state.assembler.NewLabel()
+	state.assembler.MoveRegMem32(amd64.RegRAX, amd64.RegR13, state.CallFrameTopOffset())
+	state.assembler.MoveRegReg(amd64.RegRCX, amd64.RegRAX)
+	state.assembler.AndRegImm32(amd64.RegRCX, 0xFFFF)
+	state.assembler.CmpRegImm32(amd64.RegRCX, uint32(slot+1))
+	state.assembler.Jcc(amd64.CondAboveEqual, done)
+	state.assembler.AndRegImm32(amd64.RegRAX, 0xFFFF0000)
+	state.assembler.AddRegImm32(amd64.RegRAX, int32(slot+1))
+	state.assembler.MoveMemReg32(amd64.RegR13, state.CallFrameTopOffset(), amd64.RegRAX)
+	_ = state.assembler.Bind(done)
 }
 
 func (state *compileState) emitCall(bytecodePC int, a int, b int, c int, resumePC uint32, slotIndex uint32) {
+	blockFlags := uint32(0)
+	if b == 0 {
+		blockFlags |= builtinCallBlockFlagOpenArgs
+	}
+	if c == 0 {
+		blockFlags |= builtinCallBlockFlagOpenResults
+	}
 	siteID := state.recordContinuationSite(metadata.ContinuationCall, stubs.StubLuaCall, bytecodePC, bytecodePC, int(resumePC), -1, uint32(a), uint32(b), uint32(c), 0, metadata.ContinuationFlagNativeBuiltinABI)
-	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubLuaCall], siteID, stubs.StubLuaCall, uint64(a), uint64(b), uint64(c), uint64(slotIndex), 0)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubLuaCall], siteID, stubs.StubLuaCall, uint64(a), uint64(b), uint64(c), uint64(slotIndex), blockFlags)
 }
 
 func (state *compileState) emitGetUpvalue(bytecodePC int, dst int, upvalueIndex int, slotIndex uint32) {
@@ -616,8 +733,17 @@ func (state *compileState) emitSetUpvalue(bytecodePC int, src int, upvalueIndex 
 }
 
 func (state *compileState) emitTailCall(bytecodePC int, a int, b int, slotIndex uint32) {
+	blockFlags := uint32(0)
+	if b == 0 {
+		blockFlags |= builtinCallBlockFlagOpenArgs
+	}
 	siteID := state.recordContinuationSite(metadata.ContinuationTailCall, stubs.StubTailCall, bytecodePC, bytecodePC, -1, -1, uint32(a), uint32(b), 0, 0, metadata.ContinuationFlagFinalExit|metadata.ContinuationFlagNativeBuiltinABI)
-	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubTailCall], siteID, stubs.StubTailCall, uint64(a), uint64(b), 0, uint64(slotIndex), 0)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubTailCall], siteID, stubs.StubTailCall, uint64(a), uint64(b), 0, uint64(slotIndex), blockFlags)
+}
+
+func (state *compileState) emitSetList(bytecodePC int, a int, b int, block int, resumePC int) {
+	siteID := state.recordContinuationSite(metadata.ContinuationSetList, stubs.StubSetList, bytecodePC, bytecodePC, resumePC, -1, uint32(a), uint32(b), uint32(block), 0, metadata.ContinuationFlagNativeBuiltinABI)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubSetList], siteID, stubs.StubSetList, uint64(a), uint64(b), uint64(block), 0, 0)
 }
 
 func (state *compileState) emitForPrep(bytecodePC int, a int, target int) {
@@ -629,6 +755,7 @@ func (state *compileState) emitForPrep(bytecodePC int, a int, target int) {
 	state.emitLoadNumericLoopSlot(a+2, amd64.XMM2, deopt)
 	state.assembler.SubsdXmmXmm(amd64.XMM0, amd64.XMM2)
 	state.assembler.MoveMemXmm64(amd64.RegR12, slotDisp(a), amd64.XMM0)
+	state.emitAdvanceTopForSlot(a)
 	state.assembler.Jmp(state.labelFor(target))
 
 	_ = state.assembler.Bind(deopt)
@@ -648,6 +775,7 @@ func (state *compileState) emitForLoop(bytecodePC int, a int, resumePC int, targ
 	state.emitLoadNumericLoopSlot(a+2, amd64.XMM2, deopt)
 	state.assembler.AddsdXmmXmm(amd64.XMM0, amd64.XMM2)
 	state.assembler.MoveMemXmm64(amd64.RegR12, slotDisp(a), amd64.XMM0)
+	state.emitAdvanceTopForSlot(a)
 	state.assembler.XorpsXmmXmm(amd64.XMM3, amd64.XMM3)
 	state.assembler.UcomisdXmmXmm(amd64.XMM2, amd64.XMM3)
 	state.assembler.Jcc(amd64.CondParity, deopt)
@@ -665,6 +793,7 @@ func (state *compileState) emitForLoop(bytecodePC int, a int, resumePC int, targ
 
 	_ = state.assembler.Bind(continueLoop)
 	state.assembler.MoveMemXmm64(amd64.RegR12, slotDisp(a+3), amd64.XMM0)
+	state.emitAdvanceTopForSlot(a + 3)
 	state.assembler.Jmp(state.labelFor(target))
 
 	_ = state.assembler.Bind(done)
@@ -751,6 +880,10 @@ func (state *compileState) CallFrameVarargCountOffset() int32 {
 
 func (state *compileState) CallFrameRegisterCountOffset() int32 {
 	return int32(rtstate.CallFrameRegisterCountOff)
+}
+
+func (state *compileState) CallFrameTopOffset() int32 {
+	return int32(rtstate.CallFrameTopOffset)
 }
 
 func (state *compileState) CallFrameResultBaseOffset() int32 {

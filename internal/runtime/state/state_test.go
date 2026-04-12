@@ -39,6 +39,8 @@ func TestThreadFrameRegisterAndSpillAccess(t *testing.T) {
 		RegisterCount: 8,
 		SpillCount:    2,
 		NResults:      2,
+		Top:           1,
+		ResultCap:     2,
 	})
 	if err != nil {
 		t.Fatalf("push frame1: %v", err)
@@ -69,9 +71,10 @@ func TestThreadFrameRegisterAndSpillAccess(t *testing.T) {
 	frame2, err := thread.PushFrame(FrameSpec{
 		RegisterBase:  10,
 		RegisterCount: 4,
-		SpillCount:    1,
+		SpillCount:    3,
 		VarargBase:    constBase,
 		VarargCount:   3,
+		Top:           2,
 	})
 	if err != nil {
 		t.Fatalf("push frame2: %v", err)
@@ -135,9 +138,11 @@ func TestPushFramePreservesNativeABIFields(t *testing.T) {
 		VarargBase:    varargBase,
 		ResultBase:    resultBase,
 		RegisterCount: 6,
-		SpillCount:    2,
+		SpillCount:    5,
 		VarargCount:   2,
 		NResults:      3,
+		Top:           4,
+		ResultCap:     3,
 	})
 	if err != nil {
 		t.Fatalf("push frame: %v", err)
@@ -158,11 +163,17 @@ func TestPushFramePreservesNativeABIFields(t *testing.T) {
 	if frame.ResultBase != uint64(resultBase) {
 		t.Fatalf("frame result base %#x, want %#x", frame.ResultBase, resultBase)
 	}
-	if frame.RegisterCount != 6 || frame.SpillCount != 2 || frame.VarargCount != 2 {
+	if frame.RegisterCount != 6 || frame.SpillCount != 5 || frame.VarargCount != 2 {
 		t.Fatalf("unexpected frame counts: regs=%d spill=%d vararg=%d", frame.RegisterCount, frame.SpillCount, frame.VarargCount)
 	}
 	if frame.NResults != 3 {
 		t.Fatalf("frame nresults = %d, want 3", frame.NResults)
+	}
+	if frame.Top != 4 {
+		t.Fatalf("frame top = %d, want 4", frame.Top)
+	}
+	if frame.ResultCapacity() != 3 {
+		t.Fatalf("frame result capacity = %d, want 3", frame.ResultCapacity())
 	}
 	if !frame.Flags.Has(FrameFlagIsLuaFrame | FrameFlagHasVararg) {
 		t.Fatalf("expected lua-frame and vararg flags, got %#x", uint16(frame.Flags))

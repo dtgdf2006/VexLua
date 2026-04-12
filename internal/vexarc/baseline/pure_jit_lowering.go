@@ -88,6 +88,7 @@ func (state *compileState) emitArithmetic(bytecodePC int, opcode bytecode.Opcode
 	default:
 		panic("unexpected arithmetic opcode")
 	}
+	state.emitAdvanceTopForSlot(a)
 	state.assembler.Jmp(done)
 
 	_ = state.assembler.Bind(deoptPath)
@@ -133,6 +134,7 @@ func (state *compileState) emitLength(bytecodePC int, dst int, src int) {
 	state.assembler.MoveRegMem32(amd64.RegRCX, amd64.RegRDX, rtstring.LengthOffset)
 	state.assembler.Cvtsi2sdXmmReg64(amd64.XMM0, amd64.RegRCX)
 	state.assembler.MoveMemXmm64(amd64.RegR12, slotDisp(dst), amd64.XMM0)
+	state.emitAdvanceTopForSlot(dst)
 	state.assembler.Jmp(done)
 
 	_ = state.assembler.Bind(tablePath)
@@ -145,6 +147,7 @@ func (state *compileState) emitLength(bytecodePC int, dst int, src int) {
 	state.assembler.MoveRegMem32(amd64.RegRCX, amd64.RegRDX, rttable.ArrayLenHintOffset)
 	state.assembler.Cvtsi2sdXmmReg64(amd64.XMM0, amd64.RegRCX)
 	state.assembler.MoveMemXmm64(amd64.RegR12, slotDisp(dst), amd64.XMM0)
+	state.emitAdvanceTopForSlot(dst)
 	state.assembler.Jmp(done)
 
 	_ = state.assembler.Bind(deoptPath)
@@ -216,6 +219,7 @@ func (state *compileState) emitSelf(bytecodePC int, dst int, tableSlot int, keyO
 
 	_ = state.assembler.Bind(storeResult)
 	state.assembler.MoveMemReg64(amd64.RegR12, slotDisp(dst), amd64.RegRDX)
+	state.emitAdvanceTopForSlot(dst + 1)
 	state.assembler.Jmp(done)
 
 	_ = state.assembler.Bind(deoptPath)

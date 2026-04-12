@@ -191,6 +191,63 @@ func TestHashPartVersionAndMetatableBlockers(t *testing.T) {
 	}
 }
 
+func TestSetListArrayPreallocatesAndRefreshesLenHint(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	tables := NewStore(runtimeHeap)
+	handle, err := tables.New(0, 0)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	handled, err := tables.SetListArray(handle.Ref, 1, []value.TValue{
+		value.NumberValue(11),
+		value.NumberValue(22),
+		value.NumberValue(33),
+	})
+	if err != nil {
+		t.Fatalf("setlist array: %v", err)
+	}
+	if !handled {
+		t.Fatalf("expected plain table setlist array to be handled")
+	}
+	object, err := tables.Object(handle.Ref)
+	if err != nil {
+		t.Fatalf("read table object: %v", err)
+	}
+	if object.ArrayCap < 3 {
+		t.Fatalf("expected array capacity >= 3, got %d", object.ArrayCap)
+	}
+	if object.ArrayLenHint != 3 {
+		t.Fatalf("array len hint = %d, want 3", object.ArrayLenHint)
+	}
+	for index, want := range []value.TValue{value.NumberValue(11), value.NumberValue(22), value.NumberValue(33)} {
+		got, found, err := tables.Get(handle.Ref, value.NumberValue(float64(index+1)))
+		if err != nil {
+			t.Fatalf("get key %d: %v", index+1, err)
+		}
+		if !found {
+			t.Fatalf("expected key %d to exist", index+1)
+		}
+		if got.Bits() != want.Bits() {
+			t.Fatalf("table[%d] = %s, want %s", index+1, got, want)
+		}
+	}
+
+	meta, err := tables.New(0, 0)
+	if err != nil {
+		t.Fatalf("create metatable: %v", err)
+	}
+	if err := tables.SetMetatable(handle.Ref, meta.Value); err != nil {
+		t.Fatalf("set metatable: %v", err)
+	}
+	handled, err = tables.SetListArray(handle.Ref, 4, []value.TValue{value.NumberValue(44)})
+	if err != nil {
+		t.Fatalf("setlist array with blocker: %v", err)
+	}
+	if handled {
+		t.Fatalf("blocked table should not stay on setlist array fast path")
+	}
+}
+
 func TestHashRehashAndDelete(t *testing.T) {
 	runtimeHeap := heap.MustNew(0, 0)
 	strings := rtstring.NewInternTable(runtimeHeap, 0x13572468)

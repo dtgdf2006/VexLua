@@ -44,6 +44,7 @@ func newStubManager(cache *codecache.Cache) (*stubManager, error) {
 		stubs.StubForLoop,
 		stubs.StubSelf,
 		stubs.StubLen,
+		stubs.StubSetList,
 	} {
 		var block *codecache.Block
 		switch id {
@@ -137,6 +138,14 @@ func newStubManager(cache *codecache.Cache) (*stubManager, error) {
 			block = entryBlock
 		case stubs.StubLen:
 			bodyBlock, entryBlock, err := manager.installManagedNativeBuiltin(buildLenBuiltinBody())
+			if err != nil {
+				_ = manager.Release()
+				return nil, err
+			}
+			manager.stubBodies[id] = bodyBlock
+			block = entryBlock
+		case stubs.StubSetList:
+			bodyBlock, entryBlock, err := manager.installManagedNativeBuiltin(buildSetListBuiltinBody())
 			if err != nil {
 				_ = manager.Release()
 				return nil, err

@@ -102,6 +102,7 @@ func TestStubManagerInstallsNativeUpvalueAndLoopBodies(t *testing.T) {
 		"buildGetTableBuiltinBody()",
 		"buildSetGlobalBuiltinBody()",
 		"buildSetTableBuiltinBody()",
+		"buildSetListBuiltinBody()",
 		"buildGetUpvalueBuiltinBody()",
 		"buildSetUpvalueBuiltinBody()",
 		"buildForPrepBuiltinBody()",

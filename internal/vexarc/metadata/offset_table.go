@@ -26,6 +26,7 @@ const (
 	ContinuationArithmetic
 	ContinuationUnaryTest
 	ContinuationLength
+	ContinuationSetList
 	ContinuationCompare
 	ContinuationDeopt
 )

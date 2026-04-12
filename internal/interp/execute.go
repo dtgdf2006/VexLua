@@ -69,6 +69,7 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 		VarargCount:   uint32(varargCount),
 		RegisterCount: uint16(registerCount),
 		SpillCount:    uint16(varargCount),
+		Top:           uint16(minInt(len(args), int(registerCount))),
 	})
 	if err != nil {
 		return nil, err
@@ -78,7 +79,7 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 	activation := &activation{
 		thread: thread,
 		frame:  frame,
-		top:    uint32(minInt(len(args), int(registerCount))),
+		top:    uint32(frame.LogicalTop()),
 		pc:     0,
 	}
 	ctx.activations = append(ctx.activations, activation)
@@ -98,7 +99,9 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 		}
 	}
 	if int(proto.NumParams) > len(args) {
-		activation.top = uint32(minInt(int(proto.NumParams), int(registerCount)))
+		if err := engine.setActivationTop(activation, uint32(minInt(int(proto.NumParams), int(registerCount)))); err != nil {
+			return nil, err
+		}
 	}
 
 	results, execErr := engine.executeActivation(activation, varargs)
@@ -144,7 +147,7 @@ func (engine *Engine) ResumeLuaFrame(thread *state.ThreadState, frame *state.Cal
 	if err != nil {
 		return nil, err
 	}
-	activation := &activation{thread: thread, frame: frame, top: uint32(frame.RegisterCount), pc: startPC}
+	activation := &activation{thread: thread, frame: frame, top: uint32(frame.LogicalTop()), pc: startPC}
 	ctx := engine.threadState(thread)
 	ctx.activations = append(ctx.activations, activation)
 	defer func() {
@@ -642,9 +645,22 @@ func (engine *Engine) setRegister(act *activation, index int, slotValue value.TV
 		return engine.activationRuntimeError(act, act.pc-1, bytecode.OP_MOVE, fmt.Sprintf("register %d is out of range", index))
 	}
 	if uint32(index+1) > act.top {
-		act.top = uint32(index + 1)
+		if err := engine.setActivationTop(act, uint32(index+1)); err != nil {
+			return err
+		}
 	}
 	return act.thread.SetRegister(act.frame, uint16(index), slotValue)
+}
+
+func (engine *Engine) setActivationTop(act *activation, top uint32) error {
+	if act == nil || act.frame == nil {
+		return fmt.Errorf("activation frame is not set")
+	}
+	if top > uint32(act.frame.RegisterCount) {
+		return fmt.Errorf("activation top %d exceeds register capacity %d", top, act.frame.RegisterCount)
+	}
+	act.top = top
+	return act.frame.SetTop(uint16(top))
 }
 
 func (engine *Engine) activationClosureRef(act *activation) (value.HeapRef44, error) {
@@ -886,7 +902,9 @@ func (engine *Engine) collectCallArguments(act *activation, a int, b int) (value
 
 func (engine *Engine) storeCallResults(act *activation, a int, c int, results []value.TValue) error {
 	if c == 1 {
-		act.top = uint32(a)
+		if err := engine.setActivationTop(act, uint32(a)); err != nil {
+			return err
+		}
 		return nil
 	}
 	if c == 0 {
@@ -895,7 +913,9 @@ func (engine *Engine) storeCallResults(act *activation, a int, c int, results []
 				return err
 			}
 		}
-		act.top = uint32(a + len(results))
+		if err := engine.setActivationTop(act, uint32(a+len(results))); err != nil {
+			return err
+		}
 		return nil
 	}
 	wanted := c - 1
@@ -908,10 +928,7 @@ func (engine *Engine) storeCallResults(act *activation, a int, c int, results []
 			return err
 		}
 	}
-	if uint32(a+wanted) > act.top {
-		act.top = uint32(a + wanted)
-	}
-	return nil
+	return engine.setActivationTop(act, uint32(a+wanted))
 }
 
 func (engine *Engine) collectReturnValues(act *activation, a int, b int) ([]value.TValue, error) {
@@ -946,7 +963,9 @@ func (engine *Engine) storeVarargs(act *activation, a int, b int, varargs []valu
 				return err
 			}
 		}
-		act.top = uint32(a + len(varargs))
+		if err := engine.setActivationTop(act, uint32(a+len(varargs))); err != nil {
+			return err
+		}
 		return nil
 	}
 	wanted := b - 1
@@ -960,7 +979,9 @@ func (engine *Engine) storeVarargs(act *activation, a int, b int, varargs []valu
 		}
 	}
 	if uint32(a+wanted) > act.top {
-		act.top = uint32(a + wanted)
+		if err := engine.setActivationTop(act, uint32(a+wanted)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
