@@ -7,6 +7,7 @@ import (
 
 	"vexlua/internal/runtime/heap"
 	"vexlua/internal/runtime/state"
+	rtstring "vexlua/internal/runtime/string"
 	"vexlua/internal/runtime/value"
 )
 
@@ -165,6 +166,64 @@ func TestUpvalueUsesSingleCanonicalBytes(t *testing.T) {
 	}
 }
 
+func TestClosedUpvalueWritesTriggerWriteBarrierDuringMarkPhase(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	strings := rtstring.NewInternTable(runtimeHeap, 0x2468ACE0)
+	vm := state.NewVMState(runtimeHeap)
+	thread, err := vm.NewThread(16, 4)
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	manager := NewManager(runtimeHeap, vm)
+	slot, err := thread.SlotAddress(3)
+	if err != nil {
+		t.Fatalf("slot address: %v", err)
+	}
+	first, err := strings.Intern("close-barrier")
+	if err != nil {
+		t.Fatalf("intern first child: %v", err)
+	}
+	if err := thread.SetValueAtAddress(slot, first.Value); err != nil {
+		t.Fatalf("seed slot: %v", err)
+	}
+	handle, err := manager.FindOrCreateOpen(thread, slot)
+	if err != nil {
+		t.Fatalf("create open upvalue: %v", err)
+	}
+	markRef(t, runtimeHeap, handle.Ref, value.MarkBlack)
+	markRef(t, runtimeHeap, first.Ref, value.MarkWhite0)
+	if err := runtimeHeap.SetCurrentWhite(value.MarkWhite0); err != nil {
+		t.Fatalf("set current white: %v", err)
+	}
+	runtimeHeap.SetGCPhase(heap.GCPhaseMark)
+	closed, err := manager.CloseAtOrAbove(thread, slot)
+	if err != nil {
+		t.Fatalf("close upvalue: %v", err)
+	}
+	if len(closed) != 1 || closed[0].Ref != handle.Ref {
+		t.Fatalf("unexpected closed handles: %#v", closed)
+	}
+	queues := runtimeHeap.GCQueueLengths()
+	if queues.GrayAgain != 1 || queues.Remembered != 1 {
+		t.Fatalf("close barrier queues = %+v, want grayAgain=1 remembered=1", queues)
+	}
+	runtimeHeap.SetGCPhase(heap.GCPhasePause)
+	second, err := strings.Intern("set-barrier")
+	if err != nil {
+		t.Fatalf("intern second child: %v", err)
+	}
+	markRef(t, runtimeHeap, handle.Ref, value.MarkBlack)
+	markRef(t, runtimeHeap, second.Ref, value.MarkWhite0)
+	runtimeHeap.SetGCPhase(heap.GCPhaseMark)
+	if err := manager.Set(handle.Ref, second.Value); err != nil {
+		t.Fatalf("set closed upvalue: %v", err)
+	}
+	queues = runtimeHeap.GCQueueLengths()
+	if queues.GrayAgain != 1 || queues.Remembered != 1 {
+		t.Fatalf("set barrier queues = %+v, want grayAgain=1 remembered=1", queues)
+	}
+}
+
 func mustOffsetForRef(t *testing.T, runtimeHeap *heap.Heap, ref value.HeapRef44) value.HeapOff64 {
 	t.Helper()
 	address, err := runtimeHeap.DecodeHeapRef(ref)
@@ -176,4 +235,17 @@ func mustOffsetForRef(t *testing.T, runtimeHeap *heap.Heap, ref value.HeapRef44)
 		t.Fatalf("offset for heap ref %#x: %v", uint64(ref), err)
 	}
 	return offset
+}
+
+func markRef(t *testing.T, runtimeHeap *heap.Heap, ref value.HeapRef44, mark value.MarkBits) {
+	t.Helper()
+	offset := mustOffsetForRef(t, runtimeHeap, ref)
+	header, err := runtimeHeap.HeaderAtOffset(offset)
+	if err != nil {
+		t.Fatalf("read header for %#x: %v", uint64(ref), err)
+	}
+	header.Mark = mark
+	if err := runtimeHeap.WriteHeader(offset, header); err != nil {
+		t.Fatalf("write header for %#x: %v", uint64(ref), err)
+	}
 }

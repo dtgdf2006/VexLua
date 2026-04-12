@@ -65,7 +65,7 @@ func (manager *Manager) FindOrCreateOpen(thread *state.ThreadState, slotAddress 
 			return Handle{}, err
 		}
 		previousObject.NextOpen = handle.Ref
-		if err := manager.writeObject(previous, previousObject); err != nil {
+		if _, err := manager.writeObject(previous, previousObject); err != nil {
 			return Handle{}, err
 		}
 	}
@@ -75,7 +75,7 @@ func (manager *Manager) FindOrCreateOpen(thread *state.ThreadState, slotAddress 
 			return Handle{}, err
 		}
 		currentObject.PrevOpen = handle.Ref
-		if err := manager.writeObject(current, currentObject); err != nil {
+		if _, err := manager.writeObject(current, currentObject); err != nil {
 			return Handle{}, err
 		}
 	}
@@ -90,14 +90,22 @@ func (manager *Manager) OpenHead(thread *state.ThreadState) value.HeapRef44 {
 }
 
 func (manager *Manager) CloseAtOrAbove(thread *state.ThreadState, level uintptr) ([]Handle, error) {
+	return manager.CloseInRange(thread, level, ^uintptr(0))
+}
+
+func (manager *Manager) CloseInRange(thread *state.ThreadState, lower uintptr, upper uintptr) ([]Handle, error) {
 	if thread == nil {
 		return nil, fmt.Errorf("thread cannot be nil")
+	}
+	if lower >= upper {
+		return nil, nil
 	}
 	head := thread.OpenUpvalueHead()
 	if head == 0 {
 		return nil, nil
 	}
 	closed := make([]Handle, 0)
+	var previous value.HeapRef44
 	current := head
 	for current != 0 {
 		object, err := manager.Object(current)
@@ -107,11 +115,17 @@ func (manager *Manager) CloseAtOrAbove(thread *state.ThreadState, level uintptr)
 		if object.State != StateOpen {
 			return nil, fmt.Errorf("open upvalue list contains non-open state %d", object.State)
 		}
-		if object.SlotAddress < uint64(level) {
+		slotAddress := uintptr(object.SlotAddress)
+		if slotAddress >= upper {
+			previous = current
+			current = object.NextOpen
+			continue
+		}
+		if slotAddress < lower {
 			break
 		}
 		next := object.NextOpen
-		currentValue, err := thread.ValueAtAddress(uintptr(object.SlotAddress))
+		currentValue, err := thread.ValueAtAddress(slotAddress)
 		if err != nil {
 			return nil, err
 		}
@@ -119,22 +133,37 @@ func (manager *Manager) CloseAtOrAbove(thread *state.ThreadState, level uintptr)
 		object.ClosedValue = currentValue
 		object.NextOpen = 0
 		object.PrevOpen = 0
-		if err := manager.writeObject(current, object); err != nil {
-			return nil, err
-		}
-		closed = append(closed, Handle{Ref: current, Value: value.UpValueRefValue(current)})
-		current = next
-	}
-	thread.SetOpenUpvalueHead(current)
-	if current != 0 {
-		object, err := manager.Object(current)
+		offset, err := manager.writeObject(current, object)
 		if err != nil {
 			return nil, err
 		}
-		object.PrevOpen = 0
-		if err := manager.writeObject(current, object); err != nil {
+		if err := manager.heap.WriteBarrierValueByOffset(offset, currentValue); err != nil {
 			return nil, err
 		}
+		if previous == 0 {
+			thread.SetOpenUpvalueHead(next)
+		} else {
+			previousObject, err := manager.Object(previous)
+			if err != nil {
+				return nil, err
+			}
+			previousObject.NextOpen = next
+			if _, err := manager.writeObject(previous, previousObject); err != nil {
+				return nil, err
+			}
+		}
+		if next != 0 {
+			nextObject, err := manager.Object(next)
+			if err != nil {
+				return nil, err
+			}
+			nextObject.PrevOpen = previous
+			if _, err := manager.writeObject(next, nextObject); err != nil {
+				return nil, err
+			}
+		}
+		closed = append(closed, Handle{Ref: current, Value: value.UpValueRefValue(current)})
+		current = next
 	}
 	return closed, nil
 }
@@ -161,7 +190,11 @@ func (manager *Manager) Set(ref value.HeapRef44, slotValue value.TValue) error {
 	}
 	if object.State == StateClosed {
 		object.ClosedValue = slotValue
-		return manager.writeObject(ref, object)
+		offset, err := manager.writeObject(ref, object)
+		if err != nil {
+			return err
+		}
+		return manager.heap.WriteBarrierValueByOffset(offset, slotValue)
 	}
 	thread := manager.vm.ThreadByID(object.ThreadID)
 	if thread == nil {
@@ -193,12 +226,12 @@ func (manager *Manager) allocObject(object Object) (Handle, error) {
 	return Handle{Ref: ref, Value: value.UpValueRefValue(ref)}, nil
 }
 
-func (manager *Manager) writeObject(ref value.HeapRef44, object Object) error {
-	_, bytes, err := manager.objectBytes(ref)
+func (manager *Manager) writeObject(ref value.HeapRef44, object Object) (value.HeapOff64, error) {
+	offset, bytes, err := manager.objectBytes(ref)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return WriteObject(bytes, object)
+	return offset, WriteObject(bytes, object)
 }
 
 func (manager *Manager) objectBytes(ref value.HeapRef44) (value.HeapOff64, []byte, error) {

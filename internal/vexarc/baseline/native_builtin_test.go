@@ -237,6 +237,10 @@ func TestCompilerEmitsNativeBuiltinContinuationContracts(t *testing.T) {
 	for _, needle := range []string{
 		"recordContinuationSite(metadata.ContinuationCall, stubs.StubLuaCall",
 		"recordContinuationSite(metadata.ContinuationSetList, stubs.StubSetList",
+		"recordContinuationSite(metadata.ContinuationNewTable, stubs.StubNewTable",
+		"recordContinuationSite(metadata.ContinuationConcat, stubs.StubConcat",
+		"recordContinuationSite(metadata.ContinuationClose, stubs.StubClose",
+		"recordContinuationSite(metadata.ContinuationClosure, stubs.StubClosure",
 		"recordContinuationSite(metadata.ContinuationGetUpvalue, stubs.StubGetUpvalue",
 		"recordContinuationSite(metadata.ContinuationSetUpvalue, stubs.StubSetUpvalue",
 		"recordContinuationSite(metadata.ContinuationTailCall, stubs.StubTailCall",

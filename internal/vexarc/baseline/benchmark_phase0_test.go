@@ -75,7 +75,7 @@ func BenchmarkStage7OpenCallResults(b *testing.B) {
 
 func BenchmarkStage7NewTable(b *testing.B) {
 	b.Run("compiled", func(b *testing.B) {
-		benchmarkCompiledExpectedDeltas(b, newCompiledNewTableBenchmarkHarness(b), nil, 1)
+		benchmarkCompiledExpectedDeltas(b, newCompiledNewTableBenchmarkHarness(b), nil, 0)
 	})
 	b.Run("interpreter", func(b *testing.B) {
 		benchmarkInterpreterPath(b, newInterpreterNewTableBenchmarkHarness(b))
@@ -84,7 +84,7 @@ func BenchmarkStage7NewTable(b *testing.B) {
 
 func BenchmarkStage7Closure(b *testing.B) {
 	b.Run("compiled", func(b *testing.B) {
-		benchmarkCompiledExpectedDeltas(b, newCompiledClosureBenchmarkHarness(b), nil, 1)
+		benchmarkCompiledExpectedDeltas(b, newCompiledClosureBenchmarkHarness(b), nil, 0)
 	})
 	b.Run("interpreter", func(b *testing.B) {
 		benchmarkInterpreterPath(b, newInterpreterClosureBenchmarkHarness(b))

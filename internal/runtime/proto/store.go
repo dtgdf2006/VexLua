@@ -107,14 +107,15 @@ func (store *Store) Intern(proto *bytecode.Proto) (Handle, error) {
 	if proto == nil {
 		return Handle{}, fmt.Errorf("proto cannot be nil")
 	}
-	if ref, ok := store.byProto[proto]; ok {
-		return Handle{Ref: ref, Value: value.ProtoRefValue(ref)}, nil
+	if handle, ok := store.cachedHandle(proto); ok {
+		return handle, nil
 	}
-	object, err := store.buildObject(proto)
+	object := NewObject(proto)
+	allocation, err := store.heap.AllocObject(object.Common)
 	if err != nil {
 		return Handle{}, err
 	}
-	allocation, err := store.heap.AllocObject(object.Common)
+	object, err = store.buildObject(allocation.Offset, proto, object)
 	if err != nil {
 		return Handle{}, err
 	}
@@ -135,7 +136,64 @@ func (store *Store) Resolve(ref value.HeapRef44) (*bytecode.Proto, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown proto ref %#x", uint64(ref))
 	}
+	if !store.isLiveCachedRef(proto, ref) {
+		store.dropCachedRef(proto, ref)
+		return nil, fmt.Errorf("unknown proto ref %#x", uint64(ref))
+	}
 	return proto, nil
+}
+
+func (store *Store) WalkRefs(visit func(value.HeapRef44) error) error {
+	if store == nil || visit == nil {
+		return nil
+	}
+	for ref, proto := range store.byRef {
+		if ref == 0 {
+			continue
+		}
+		if !store.isLiveCachedRef(proto, ref) {
+			store.dropCachedRef(proto, ref)
+			continue
+		}
+		if err := visit(ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (store *Store) cachedHandle(proto *bytecode.Proto) (Handle, bool) {
+	ref, ok := store.byProto[proto]
+	if !ok || ref == 0 {
+		return Handle{}, false
+	}
+	if !store.isLiveCachedRef(proto, ref) {
+		store.dropCachedRef(proto, ref)
+		return Handle{}, false
+	}
+	return Handle{Ref: ref, Value: value.ProtoRefValue(ref)}, true
+}
+
+func (store *Store) isLiveCachedRef(proto *bytecode.Proto, ref value.HeapRef44) bool {
+	if proto == nil || ref == 0 {
+		return false
+	}
+	if current := store.byRef[ref]; current != proto {
+		return false
+	}
+	_, err := store.heap.DecodeHeapRef(ref)
+	return err == nil
+}
+
+func (store *Store) dropCachedRef(proto *bytecode.Proto, ref value.HeapRef44) {
+	if proto != nil {
+		if currentRef, ok := store.byProto[proto]; ok && currentRef == ref {
+			delete(store.byProto, proto)
+		}
+	}
+	if currentProto, ok := store.byRef[ref]; ok && (proto == nil || currentProto == proto) {
+		delete(store.byRef, ref)
+	}
 }
 
 func (store *Store) SetCompiledEntry(ref value.HeapRef44, entry uintptr) error {
@@ -143,7 +201,7 @@ func (store *Store) SetCompiledEntry(ref value.HeapRef44, entry uintptr) error {
 }
 
 func (store *Store) SyncCompiledMetadata(ref value.HeapRef44, entry uintptr, flags uint8) error {
-	object, bytes, err := store.objectBytes(ref)
+	_, object, bytes, err := store.objectBytes(ref)
 	if err != nil {
 		return err
 	}
@@ -274,6 +332,9 @@ func WriteObject(buffer []byte, object Object) error {
 	if len(buffer) < ObjectSize {
 		return fmt.Errorf("buffer too small for proto object: %d", len(buffer))
 	}
+	if current, err := value.ReadCommonHeader(buffer); err == nil && current.Kind == object.Common.Kind {
+		object.Common.Mark = current.Mark
+	}
 	if err := value.WriteCommonHeader(buffer, object.Common); err != nil {
 		return err
 	}
@@ -385,13 +446,12 @@ func (store *Store) ClosureSite(ref value.HeapRef44, pc int) (ClosureSite, []Cap
 	return ClosureSite{}, nil, false, nil
 }
 
-func (store *Store) buildObject(proto *bytecode.Proto) (Object, error) {
-	object := NewObject(proto)
-	codeData, err := store.allocInstructionData(proto.Code)
+func (store *Store) buildObject(owner value.HeapOff64, proto *bytecode.Proto, object Object) (Object, error) {
+	codeData, err := store.allocInstructionData(owner, proto.Code)
 	if err != nil {
 		return Object{}, err
 	}
-	childData, err := store.allocChildProtoData(proto.Protos)
+	childData, err := store.allocChildProtoData(owner, proto.Protos)
 	if err != nil {
 		return Object{}, err
 	}
@@ -399,11 +459,11 @@ func (store *Store) buildObject(proto *bytecode.Proto) (Object, error) {
 	if err != nil {
 		return Object{}, err
 	}
-	closureSiteData, err := store.allocClosureSiteData(closureSites)
+	closureSiteData, err := store.allocClosureSiteData(owner, closureSites)
 	if err != nil {
 		return Object{}, err
 	}
-	lineInfoData, err := store.allocLineInfoData(proto.LineInfo)
+	lineInfoData, err := store.allocLineInfoData(owner, proto.LineInfo)
 	if err != nil {
 		return Object{}, err
 	}
@@ -415,24 +475,24 @@ func (store *Store) buildObject(proto *bytecode.Proto) (Object, error) {
 	return object, nil
 }
 
-func (store *Store) objectBytes(ref value.HeapRef44) (Object, []byte, error) {
+func (store *Store) objectBytes(ref value.HeapRef44) (value.HeapOff64, Object, []byte, error) {
 	address, err := store.heap.DecodeHeapRef(ref)
 	if err != nil {
-		return Object{}, nil, err
+		return 0, Object{}, nil, err
 	}
 	offset, err := store.heap.OffsetForAddress(address)
 	if err != nil {
-		return Object{}, nil, err
+		return 0, Object{}, nil, err
 	}
 	bytes, err := store.heap.Resolve(offset, ObjectSize)
 	if err != nil {
-		return Object{}, nil, err
+		return 0, Object{}, nil, err
 	}
 	object, err := ReadObject(bytes)
 	if err != nil {
-		return Object{}, nil, err
+		return 0, Object{}, nil, err
 	}
-	return object, bytes, nil
+	return offset, object, bytes, nil
 }
 
 func (store *Store) ensureConstantData(proto *bytecode.Proto, strings *rtstring.InternTable) (Object, value.HeapOff64, error) {
@@ -443,7 +503,7 @@ func (store *Store) ensureConstantData(proto *bytecode.Proto, strings *rtstring.
 	if err != nil {
 		return Object{}, 0, err
 	}
-	object, bytes, err := store.objectBytes(handle.Ref)
+	offset, object, bytes, err := store.objectBytes(handle.Ref)
 	if err != nil {
 		return Object{}, 0, err
 	}
@@ -457,11 +517,11 @@ func (store *Store) ensureConstantData(proto *bytecode.Proto, strings *rtstring.
 		}
 		return object, offset, nil
 	}
-	offset, err := store.allocConstantData(proto.Constants, strings)
+	constantOffset, err := store.allocConstantData(offset, proto.Constants, strings)
 	if err != nil {
 		return Object{}, 0, err
 	}
-	base, err := store.heap.NativeAddressForOffset(offset)
+	base, err := store.heap.NativeAddressForOffset(constantOffset)
 	if err != nil {
 		return Object{}, 0, err
 	}
@@ -469,7 +529,7 @@ func (store *Store) ensureConstantData(proto *bytecode.Proto, strings *rtstring.
 	if err := WriteObject(bytes, object); err != nil {
 		return Object{}, 0, err
 	}
-	return object, offset, nil
+	return object, constantOffset, nil
 }
 
 func (store *Store) constantDataOffset(base uint64) (value.HeapOff64, error) {
@@ -487,11 +547,11 @@ func (store *Store) constantDataOffset(base uint64) (value.HeapOff64, error) {
 	return offset, nil
 }
 
-func (store *Store) allocInstructionData(code []bytecode.Instruction) (value.HeapOff64, error) {
+func (store *Store) allocInstructionData(owner value.HeapOff64, code []bytecode.Instruction) (value.HeapOff64, error) {
 	if len(code) == 0 {
 		return 0, nil
 	}
-	allocation, err := store.heap.Alloc(uint64(len(code)) * 4)
+	allocation, err := store.heap.AllocPayload(uint64(len(code))*4, heap.PayloadLayoutBytecode, owner)
 	if err != nil {
 		return 0, err
 	}
@@ -501,11 +561,11 @@ func (store *Store) allocInstructionData(code []bytecode.Instruction) (value.Hea
 	return allocation.Offset, nil
 }
 
-func (store *Store) allocChildProtoData(children []*bytecode.Proto) (value.HeapOff64, error) {
+func (store *Store) allocChildProtoData(owner value.HeapOff64, children []*bytecode.Proto) (value.HeapOff64, error) {
 	if len(children) == 0 {
 		return 0, nil
 	}
-	allocation, err := store.heap.Alloc(uint64(len(children)) * 8)
+	allocation, err := store.heap.AllocPayload(uint64(len(children))*8, heap.PayloadLayoutHeapRefArray, owner)
 	if err != nil {
 		return 0, err
 	}
@@ -519,11 +579,11 @@ func (store *Store) allocChildProtoData(children []*bytecode.Proto) (value.HeapO
 	return allocation.Offset, nil
 }
 
-func (store *Store) allocLineInfoData(lines []int) (value.HeapOff64, error) {
+func (store *Store) allocLineInfoData(owner value.HeapOff64, lines []int) (value.HeapOff64, error) {
 	if len(lines) == 0 {
 		return 0, nil
 	}
-	allocation, err := store.heap.Alloc(uint64(len(lines)) * 4)
+	allocation, err := store.heap.AllocPayload(uint64(len(lines))*4, heap.PayloadLayoutInt32Array, owner)
 	if err != nil {
 		return 0, err
 	}
@@ -533,16 +593,16 @@ func (store *Store) allocLineInfoData(lines []int) (value.HeapOff64, error) {
 	return allocation.Offset, nil
 }
 
-func (store *Store) allocClosureSiteData(sites []closureSiteRecord) (value.HeapOff64, error) {
+func (store *Store) allocClosureSiteData(owner value.HeapOff64, sites []closureSiteRecord) (value.HeapOff64, error) {
 	if len(sites) == 0 {
 		return 0, nil
 	}
-	allocation, err := store.heap.Alloc(uint64(len(sites)) * ClosureSiteSize)
+	allocation, err := store.heap.AllocPayload(uint64(len(sites))*ClosureSiteSize, heap.PayloadLayoutClosureSiteArray, owner)
 	if err != nil {
 		return 0, err
 	}
 	for index, site := range sites {
-		captureData, err := store.allocCaptureDescriptors(site.Captures)
+		captureData, err := store.allocCaptureDescriptors(owner, site.Captures)
 		if err != nil {
 			return 0, err
 		}
@@ -560,11 +620,11 @@ func (store *Store) allocClosureSiteData(sites []closureSiteRecord) (value.HeapO
 	return allocation.Offset, nil
 }
 
-func (store *Store) allocCaptureDescriptors(captures []CaptureDescriptor) (value.HeapOff64, error) {
+func (store *Store) allocCaptureDescriptors(owner value.HeapOff64, captures []CaptureDescriptor) (value.HeapOff64, error) {
 	if len(captures) == 0 {
 		return 0, nil
 	}
-	allocation, err := store.heap.Alloc(uint64(len(captures)) * CaptureDescriptorSize)
+	allocation, err := store.heap.AllocPayload(uint64(len(captures))*CaptureDescriptorSize, heap.PayloadLayoutCaptureDescriptorArray, owner)
 	if err != nil {
 		return 0, err
 	}
@@ -672,11 +732,11 @@ func writeCaptureDescriptor(buffer []byte, capture CaptureDescriptor) {
 	binary.LittleEndian.PutUint16(buffer[2:4], capture.Index)
 }
 
-func (store *Store) allocConstantData(constants []bytecode.Constant, strings *rtstring.InternTable) (value.HeapOff64, error) {
+func (store *Store) allocConstantData(owner value.HeapOff64, constants []bytecode.Constant, strings *rtstring.InternTable) (value.HeapOff64, error) {
 	if len(constants) == 0 {
 		return 0, nil
 	}
-	allocation, err := store.heap.Alloc(uint64(len(constants)) * value.TValueSize)
+	allocation, err := store.heap.AllocPayload(uint64(len(constants))*value.TValueSize, heap.PayloadLayoutTValueArray, owner)
 	if err != nil {
 		return 0, err
 	}

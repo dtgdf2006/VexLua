@@ -20,6 +20,10 @@ const (
 	StubLen
 	StubSetList
 	StubCompare
+	StubNewTable
+	StubConcat
+	StubClose
+	StubClosure
 )
 
 type Descriptor struct {
@@ -44,6 +48,10 @@ var Catalog = map[ID]Descriptor{
 	StubLen:        {ID: StubLen, Name: "len"},
 	StubSetList:    {ID: StubSetList, Name: "set-list"},
 	StubCompare:    {ID: StubCompare, Name: "compare"},
+	StubNewTable:   {ID: StubNewTable, Name: "new-table"},
+	StubConcat:     {ID: StubConcat, Name: "concat"},
+	StubClose:      {ID: StubClose, Name: "close"},
+	StubClosure:    {ID: StubClosure, Name: "closure"},
 }
 
 func Lookup(id ID) (Descriptor, bool) {

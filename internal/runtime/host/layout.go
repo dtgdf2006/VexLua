@@ -168,6 +168,9 @@ func writeWrapperHeader(buffer []byte, header WrapperHeader) error {
 	if len(buffer) < int(header.Common.SizeBytes) {
 		return fmt.Errorf("buffer too small for host wrapper: need %d got %d", header.Common.SizeBytes, len(buffer))
 	}
+	if current, err := value.ReadCommonHeader(buffer); err == nil && current.Kind == header.Common.Kind {
+		header.Common.Mark = current.Mark
+	}
 	if err := value.WriteCommonHeader(buffer, header.Common); err != nil {
 		return err
 	}
@@ -208,6 +211,9 @@ func readNativeDescriptor(buffer []byte) (NativeDescriptor, error) {
 func writeNativeDescriptor(buffer []byte, descriptor NativeDescriptor) error {
 	if len(buffer) < int(descriptor.Common.SizeBytes) {
 		return fmt.Errorf("buffer too small for host descriptor: need %d got %d", descriptor.Common.SizeBytes, len(buffer))
+	}
+	if current, err := value.ReadCommonHeader(buffer); err == nil && current.Kind == descriptor.Common.Kind {
+		descriptor.Common.Mark = current.Mark
 	}
 	if err := value.WriteCommonHeader(buffer, descriptor.Common); err != nil {
 		return err

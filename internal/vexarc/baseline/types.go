@@ -32,6 +32,8 @@ const (
 	execCtxFlagNestedCallPending
 	execCtxFlagNestedCallDeopt
 	execCtxFlagNestedCallError
+	execCtxFlagGCMarkingBoundary
+	execCtxFlagGCSafepointBoundary
 )
 
 const (
@@ -60,6 +62,19 @@ type CompiledCode struct {
 	Entry             uintptr
 	Supported         bool
 	UnsupportedReason string
+}
+
+func (code *CompiledCode) WalkRoots(visit func(value.HeapRef44) error) error {
+	if code == nil || visit == nil {
+		return nil
+	}
+	if code.ProtoRef == 0 {
+		return code.Metadata.WalkHeapRefs(visit)
+	}
+	if err := visit(code.ProtoRef); err != nil {
+		return err
+	}
+	return code.Metadata.WalkHeapRefs(visit)
 }
 
 func (code *CompiledCode) EntryAtBytecode(bytecodeOffset int) (uintptr, error) {

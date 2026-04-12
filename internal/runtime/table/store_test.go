@@ -308,6 +308,94 @@ func TestHashRehashAndDelete(t *testing.T) {
 	}
 }
 
+func TestSetReleasesDetachedPayloadSpansAfterGrowth(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	strings := rtstring.NewInternTable(runtimeHeap, 0x89ABCDEF)
+	tables := NewStore(runtimeHeap)
+
+	arrayHandle, err := tables.New(1, 0)
+	if err != nil {
+		t.Fatalf("create array table: %v", err)
+	}
+	arrayObject, err := tables.Object(arrayHandle.Ref)
+	if err != nil {
+		t.Fatalf("read initial array table: %v", err)
+	}
+	oldArray := arrayObject.ArrayData
+	if oldArray == 0 {
+		t.Fatalf("initial array payload should not be zero")
+	}
+	if err := tables.Set(arrayHandle.Ref, value.NumberValue(2), value.NumberValue(22)); err != nil {
+		t.Fatalf("grow array table: %v", err)
+	}
+	grownArrayObject, err := tables.Object(arrayHandle.Ref)
+	if err != nil {
+		t.Fatalf("read grown array table: %v", err)
+	}
+	if grownArrayObject.ArrayData == oldArray {
+		t.Fatalf("array payload offset %#x should change after growth", uint64(oldArray))
+	}
+	arrayMeta, err := runtimeHeap.SpanMetadata(oldArray)
+	if err != nil {
+		t.Fatalf("old array span metadata: %v", err)
+	}
+	if arrayMeta.State != heap.SpanStateFree {
+		t.Fatalf("old array span state = %d, want free", arrayMeta.State)
+	}
+
+	hashHandle, err := tables.New(0, 0)
+	if err != nil {
+		t.Fatalf("create hash table: %v", err)
+	}
+	firstKey, err := strings.Intern("grow-key-00")
+	if err != nil {
+		t.Fatalf("intern first hash key: %v", err)
+	}
+	if err := tables.Set(hashHandle.Ref, firstKey.Value, value.NumberValue(0)); err != nil {
+		t.Fatalf("seed initial hash entry: %v", err)
+	}
+	hashObject, err := tables.Object(hashHandle.Ref)
+	if err != nil {
+		t.Fatalf("read initial hash table: %v", err)
+	}
+	hashOwner := mustOffsetForRef(t, runtimeHeap, hashHandle.Ref)
+	oldCtrl := hashObject.CtrlData
+	oldEntries := hashObject.EntriesData
+	for index := 1; index < 20; index++ {
+		key, err := strings.Intern(fmt.Sprintf("grow-key-%02d", index))
+		if err != nil {
+			t.Fatalf("intern hash key %d: %v", index, err)
+		}
+		if err := tables.Set(hashHandle.Ref, key.Value, value.NumberValue(float64(index))); err != nil {
+			t.Fatalf("insert hash key %d: %v", index, err)
+		}
+	}
+	rehashedObject, err := tables.Object(hashHandle.Ref)
+	if err != nil {
+		t.Fatalf("read rehashed table: %v", err)
+	}
+	if rehashedObject.HashCapacity <= hashObject.HashCapacity {
+		t.Fatalf("hash capacity = %d, want growth beyond %d", rehashedObject.HashCapacity, hashObject.HashCapacity)
+	}
+	if rehashedObject.CtrlData == oldCtrl || rehashedObject.EntriesData == oldEntries {
+		t.Fatalf("rehash should install new hash payload offsets")
+	}
+	ctrlMeta, err := runtimeHeap.SpanMetadata(oldCtrl)
+	if err != nil {
+		t.Fatalf("old ctrl span metadata: %v", err)
+	}
+	if ctrlMeta.State == heap.SpanStateLive && ctrlMeta.Kind == heap.SpanKindPayload && ctrlMeta.Owner == hashOwner {
+		t.Fatalf("old ctrl span %#x should have been released or reused away from owner %#x", uint64(oldCtrl), uint64(hashOwner))
+	}
+	entriesMeta, err := runtimeHeap.SpanMetadata(oldEntries)
+	if err != nil {
+		t.Fatalf("old entries span metadata: %v", err)
+	}
+	if entriesMeta.State == heap.SpanStateLive && entriesMeta.Kind == heap.SpanKindPayload && entriesMeta.Owner == hashOwner {
+		t.Fatalf("old entries span %#x should have been released or reused away from owner %#x", uint64(oldEntries), uint64(hashOwner))
+	}
+}
+
 func TestTableObjectExposesNativeArrayAndHashRegions(t *testing.T) {
 	runtimeHeap := heap.MustNew(0, 0)
 	strings := rtstring.NewInternTable(runtimeHeap, 0x2468ACE0)
@@ -614,6 +702,55 @@ func TestTableNativeAddressesStayStableAcrossHeapGrowthAndGC(t *testing.T) {
 	}
 }
 
+func TestTableSetTriggersWriteBarrierDuringMarkPhase(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	tables := NewStore(runtimeHeap)
+	strings := rtstring.NewInternTable(runtimeHeap, 0x13579BDF)
+	handle, err := tables.New(0, 0)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	child, err := strings.Intern("barrier-child")
+	if err != nil {
+		t.Fatalf("intern child: %v", err)
+	}
+	markRef(t, runtimeHeap, handle.Ref, value.MarkBlack)
+	markRef(t, runtimeHeap, child.Ref, value.MarkWhite0)
+	if err := runtimeHeap.SetCurrentWhite(value.MarkWhite0); err != nil {
+		t.Fatalf("set current white: %v", err)
+	}
+	runtimeHeap.SetGCPhase(heap.GCPhaseMark)
+	if err := tables.Set(handle.Ref, value.NumberValue(1), child.Value); err != nil {
+		t.Fatalf("table set: %v", err)
+	}
+	header, err := runtimeHeap.HeaderAtOffset(mustOffsetForRef(t, runtimeHeap, handle.Ref))
+	if err != nil {
+		t.Fatalf("read table header: %v", err)
+	}
+	if !header.Mark.Has(value.MarkGray) || !header.Mark.Has(value.MarkRemembered) || header.Mark.Has(value.MarkBlack) {
+		t.Fatalf("table mark after barrier = %#x, want gray+remembered without black", uint8(header.Mark))
+	}
+	queues := runtimeHeap.GCQueueLengths()
+	if queues.GrayAgain != 1 || queues.Remembered != 1 {
+		t.Fatalf("table barrier queues = %+v, want grayAgain=1 remembered=1", queues)
+	}
+	runtimeHeap.SetGCPhase(heap.GCPhasePause)
+	metatable, err := tables.New(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable: %v", err)
+	}
+	markRef(t, runtimeHeap, handle.Ref, value.MarkBlack)
+	markRef(t, runtimeHeap, metatable.Ref, value.MarkWhite0)
+	runtimeHeap.SetGCPhase(heap.GCPhaseMark)
+	if err := tables.SetMetatable(handle.Ref, metatable.Value); err != nil {
+		t.Fatalf("set metatable: %v", err)
+	}
+	queues = runtimeHeap.GCQueueLengths()
+	if queues.GrayAgain != 1 || queues.Remembered != 1 {
+		t.Fatalf("metatable barrier queues = %+v, want grayAgain=1 remembered=1", queues)
+	}
+}
+
 func mustOffsetForRef(t *testing.T, runtimeHeap *heap.Heap, ref value.HeapRef44) value.HeapOff64 {
 	t.Helper()
 	address, err := runtimeHeap.DecodeHeapRef(ref)
@@ -625,6 +762,19 @@ func mustOffsetForRef(t *testing.T, runtimeHeap *heap.Heap, ref value.HeapRef44)
 		t.Fatalf("offset for heap ref %#x: %v", uint64(ref), err)
 	}
 	return offset
+}
+
+func markRef(t *testing.T, runtimeHeap *heap.Heap, ref value.HeapRef44, mark value.MarkBits) {
+	t.Helper()
+	offset := mustOffsetForRef(t, runtimeHeap, ref)
+	header, err := runtimeHeap.HeaderAtOffset(offset)
+	if err != nil {
+		t.Fatalf("read header for %#x: %v", uint64(ref), err)
+	}
+	header.Mark = mark
+	if err := runtimeHeap.WriteHeader(offset, header); err != nil {
+		t.Fatalf("write header for %#x: %v", uint64(ref), err)
+	}
 }
 
 func nativeHashContains(t *testing.T, entries []byte, ctrl []byte, capacity uint32, key value.TValue, want value.TValue) bool {

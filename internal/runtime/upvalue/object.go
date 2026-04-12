@@ -83,6 +83,9 @@ func WriteObject(buffer []byte, object Object) error {
 	if len(buffer) < ObjectSize {
 		return fmt.Errorf("buffer too small for upvalue object: %d", len(buffer))
 	}
+	if current, err := value.ReadCommonHeader(buffer); err == nil && current.Kind == object.Common.Kind {
+		object.Common.Mark = current.Mark
+	}
 	if err := value.WriteCommonHeader(buffer, object.Common); err != nil {
 		return err
 	}

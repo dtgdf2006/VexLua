@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"vexlua/internal/runtime/heap"
+	"vexlua/internal/runtime/value"
 )
 
 func TestInternDeduplicatesIdentity(t *testing.T) {
@@ -114,5 +115,40 @@ func TestStringObjectLivesInContiguousNativeHeapBytes(t *testing.T) {
 	}
 	if objectBytes[DataOffset+len(text)] != 0 {
 		t.Fatalf("string object is missing trailing terminator")
+	}
+}
+
+func TestSweepDeadRemovesEntriesAndUpdatesCount(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	strings := NewInternTable(runtimeHeap, 0xBADC0DE)
+	live, err := strings.Intern("live")
+	if err != nil {
+		t.Fatalf("intern live string: %v", err)
+	}
+	dead, err := strings.Intern("dead")
+	if err != nil {
+		t.Fatalf("intern dead string: %v", err)
+	}
+	removed, err := strings.SweepDead(func(ref value.HeapRef44) (bool, error) {
+		return ref == dead.Ref, nil
+	})
+	if err != nil {
+		t.Fatalf("sweep dead strings: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed strings = %d, want 1", removed)
+	}
+	if strings.Count() != 1 {
+		t.Fatalf("string count after sweep = %d, want 1", strings.Count())
+	}
+	if _, found, err := strings.Lookup("dead"); err != nil {
+		t.Fatalf("lookup dead string: %v", err)
+	} else if found {
+		t.Fatalf("dead string should have been removed from intern table")
+	}
+	if handle, found, err := strings.Lookup("live"); err != nil {
+		t.Fatalf("lookup live string: %v", err)
+	} else if !found || handle.Ref != live.Ref {
+		t.Fatalf("live string lookup mismatch: found=%v ref=%#x want %#x", found, uint64(handle.Ref), uint64(live.Ref))
 	}
 }

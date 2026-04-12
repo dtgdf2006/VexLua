@@ -85,6 +85,9 @@ func WriteObject(buffer []byte, header Header, text string) error {
 	if len(buffer) < int(header.Common.SizeBytes) {
 		return fmt.Errorf("buffer too small for string object: need %d, got %d", header.Common.SizeBytes, len(buffer))
 	}
+	if current, err := value.ReadCommonHeader(buffer); err == nil && current.Kind == header.Common.Kind {
+		header.Common.Mark = current.Mark
+	}
 	if err := value.WriteCommonHeader(buffer, header.Common); err != nil {
 		return err
 	}

@@ -58,13 +58,13 @@ func (store *Store) New(arrayCap uint32, hashCap uint32) (Handle, error) {
 	}
 	object := NewObject(mix64To32(uint64(ref) ^ 0xA511E9B3))
 	if arrayCap > 0 {
-		object, err = store.ensureArrayCapacity(object, arrayCap)
+		object, err = store.ensureArrayCapacity(allocation.Offset, object, arrayCap)
 		if err != nil {
 			return Handle{}, err
 		}
 	}
 	if hashCap > 0 {
-		object, err = store.ensureHashCapacity(object, hashCap)
+		object, err = store.ensureHashCapacity(allocation.Offset, object, hashCap)
 		if err != nil {
 			return Handle{}, err
 		}
@@ -122,11 +122,15 @@ func (store *Store) Set(tableRef value.HeapRef44, key value.TValue, newValue val
 	if err != nil {
 		return err
 	}
-	updated, err := store.setValue(object, key, newValue)
+	previous := object
+	updated, err := store.setValue(offset, object, key, newValue)
 	if err != nil {
 		return err
 	}
-	return store.writeObject(offset, objectBytes, updated)
+	if err := store.writeObject(offset, objectBytes, updated); err != nil {
+		return err
+	}
+	return store.releaseDetachedPayloads(previous, updated)
 }
 
 func (store *Store) SetListArray(tableRef value.HeapRef44, startIndex uint32, values []value.TValue) (bool, error) {
@@ -145,10 +149,11 @@ func (store *Store) SetListArray(tableRef value.HeapRef44, startIndex uint32, va
 	if err != nil {
 		return false, err
 	}
+	previous := object
 	if object.Flags&(FlagNewIndexFastPathBlocked|FlagWeakKeys|FlagWeakValues|FlagRehashing|FlagFrozen|FlagReadOnly) != 0 {
 		return false, nil
 	}
-	object, err = store.ensureArrayCapacity(object, lastIndex)
+	object, err = store.ensureArrayCapacity(offset, object, lastIndex)
 	if err != nil {
 		return false, err
 	}
@@ -165,6 +170,13 @@ func (store *Store) SetListArray(tableRef value.HeapRef44, startIndex uint32, va
 		if err := store.writeArraySlot(object, arrayIndex, slotValue); err != nil {
 			return false, err
 		}
+		if object.Flags&FlagWeakValues == 0 {
+			if err := store.heap.WriteBarrierValueByOffset(offset, slotValue); err != nil {
+				return false, err
+			}
+		} else if err := store.heap.RememberWeakOwnerByOffset(offset); err != nil {
+			return false, err
+		}
 	}
 	if structuralChange {
 		object.BumpVersion()
@@ -174,6 +186,9 @@ func (store *Store) SetListArray(tableRef value.HeapRef44, startIndex uint32, va
 	}
 	object.SyncLayoutFlags()
 	if err := store.writeObject(offset, objectBytes, object); err != nil {
+		return false, err
+	}
+	if err := store.releaseDetachedPayloads(previous, object); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -194,7 +209,10 @@ func (store *Store) SetMetatable(tableRef value.HeapRef44, metatable value.TValu
 		object.Flags = object.Flags.With(FlagHasMetatable | FlagIndexFastPathBlocked | FlagNewIndexFastPathBlocked)
 	}
 	object.BumpVersion()
-	return store.writeObject(offset, objectBytes, object)
+	if err := store.writeObject(offset, objectBytes, object); err != nil {
+		return err
+	}
+	return store.heap.WriteBarrierValueByOffset(offset, metatable)
 }
 
 func (store *Store) DescribeFastGet(tableRef value.HeapRef44, key value.TValue) (FastAccess, bool, error) {
@@ -280,17 +298,17 @@ func (store *Store) DescribeFastSet(tableRef value.HeapRef44, key value.TValue, 
 	return FastAccess{Kind: FastAccessHash, TableRef: tableRef, TableVersion: object.TableVersion, SlotIndex: slot, KeyBits: key.Bits()}, true, nil
 }
 
-func (store *Store) setValue(object Object, key value.TValue, newValue value.TValue) (Object, error) {
+func (store *Store) setValue(owner value.HeapOff64, object Object, key value.TValue, newValue value.TValue) (Object, error) {
 	if index, ok := arrayIndex(key); ok && shouldUseArrayPath(object.ArrayCap, index, newValue) {
-		return store.setArrayValue(object, index, newValue)
+		return store.setArrayValue(owner, object, index, newValue)
 	}
-	return store.setHashValue(object, key, newValue)
+	return store.setHashValue(owner, object, key, newValue)
 }
 
-func (store *Store) setArrayValue(object Object, index uint32, newValue value.TValue) (Object, error) {
+func (store *Store) setArrayValue(owner value.HeapOff64, object Object, index uint32, newValue value.TValue) (Object, error) {
 	var err error
 	if index > object.ArrayCap {
-		object, err = store.ensureArrayCapacity(object, index)
+		object, err = store.ensureArrayCapacity(owner, object, index)
 		if err != nil {
 			return Object{}, err
 		}
@@ -305,6 +323,13 @@ func (store *Store) setArrayValue(object Object, index uint32, newValue value.TV
 	if err := store.writeArraySlot(object, index, newValue); err != nil {
 		return Object{}, err
 	}
+	if object.Flags&FlagWeakValues == 0 {
+		if err := store.heap.WriteBarrierValueByOffset(owner, newValue); err != nil {
+			return Object{}, err
+		}
+	} else if err := store.heap.RememberWeakOwnerByOffset(owner); err != nil {
+		return Object{}, err
+	}
 	if err := store.refreshArrayLenHint(&object); err != nil {
 		return Object{}, err
 	}
@@ -312,10 +337,10 @@ func (store *Store) setArrayValue(object Object, index uint32, newValue value.TV
 	return object, nil
 }
 
-func (store *Store) setHashValue(object Object, key value.TValue, newValue value.TValue) (Object, error) {
+func (store *Store) setHashValue(owner value.HeapOff64, object Object, key value.TValue, newValue value.TValue) (Object, error) {
 	if object.HashCapacity == 0 && !isNilValue(newValue) {
 		var err error
-		object, err = store.ensureHashCapacity(object, MinHashCapacity)
+		object, err = store.ensureHashCapacity(owner, object, MinHashCapacity)
 		if err != nil {
 			return Object{}, err
 		}
@@ -325,7 +350,7 @@ func (store *Store) setHashValue(object Object, key value.TValue, newValue value
 	}
 	if !isNilValue(newValue) && object.HashCount+1 > maxLoad(object.HashCapacity) {
 		var err error
-		object, err = store.rehash(object, object.HashCapacity*2)
+		object, err = store.rehash(owner, object, object.HashCapacity*2)
 		if err != nil {
 			return Object{}, err
 		}
@@ -354,11 +379,26 @@ func (store *Store) setHashValue(object Object, key value.TValue, newValue value
 			object.GrowthLeft = remainingGrowth(object.HashCapacity, object.HashCount)
 			object.BumpVersion()
 			object.SyncLayoutFlags()
+			if object.Flags&(FlagWeakKeys|FlagWeakValues) != 0 {
+				if err := store.heap.RememberWeakOwnerByOffset(owner); err != nil {
+					return Object{}, err
+				}
+			}
 			return object, nil
 		}
 		entry.Value = newValue
 		if err := store.writeEntryAt(entries, slot, entry); err != nil {
 			return Object{}, err
+		}
+		if object.Flags&FlagWeakValues == 0 {
+			if err := store.heap.WriteBarrierValueByOffset(owner, newValue); err != nil {
+				return Object{}, err
+			}
+		}
+		if object.Flags&(FlagWeakKeys|FlagWeakValues) != 0 {
+			if err := store.heap.RememberWeakOwnerByOffset(owner); err != nil {
+				return Object{}, err
+			}
 		}
 		return object, nil
 	}
@@ -375,6 +415,21 @@ func (store *Store) setHashValue(object Object, key value.TValue, newValue value
 	}); err != nil {
 		return Object{}, err
 	}
+	if object.Flags&FlagWeakKeys == 0 {
+		if err := store.heap.WriteBarrierValueByOffset(owner, key); err != nil {
+			return Object{}, err
+		}
+	}
+	if object.Flags&FlagWeakValues == 0 {
+		if err := store.heap.WriteBarrierValueByOffset(owner, newValue); err != nil {
+			return Object{}, err
+		}
+	}
+	if object.Flags&(FlagWeakKeys|FlagWeakValues) != 0 {
+		if err := store.heap.RememberWeakOwnerByOffset(owner); err != nil {
+			return Object{}, err
+		}
+	}
 	object.HashCount++
 	object.GrowthLeft = remainingGrowth(object.HashCapacity, object.HashCount)
 	object.BumpVersion()
@@ -382,12 +437,12 @@ func (store *Store) setHashValue(object Object, key value.TValue, newValue value
 	return object, nil
 }
 
-func (store *Store) ensureArrayCapacity(object Object, minimum uint32) (Object, error) {
+func (store *Store) ensureArrayCapacity(owner value.HeapOff64, object Object, minimum uint32) (Object, error) {
 	target := nextPowerOfTwo(minimum)
 	if target < object.ArrayCap {
 		target = object.ArrayCap
 	}
-	arrayAllocation, err := store.heap.Alloc(uint64(target) * value.TValueSize)
+	arrayAllocation, err := store.heap.AllocPayload(uint64(target)*value.TValueSize, heap.PayloadLayoutTValueArray, owner)
 	if err != nil {
 		return Object{}, err
 	}
@@ -408,12 +463,12 @@ func (store *Store) ensureArrayCapacity(object Object, minimum uint32) (Object, 
 	return object, nil
 }
 
-func (store *Store) ensureHashCapacity(object Object, minimum uint32) (Object, error) {
+func (store *Store) ensureHashCapacity(owner value.HeapOff64, object Object, minimum uint32) (Object, error) {
 	target := normalizeHashCapacity(minimum)
 	if target < object.HashCapacity {
 		target = object.HashCapacity
 	}
-	ctrlAllocation, err := store.heap.Alloc(uint64(target) + 1)
+	ctrlAllocation, err := store.heap.AllocPayload(uint64(target)+1, heap.PayloadLayoutHashControl, owner)
 	if err != nil {
 		return Object{}, err
 	}
@@ -421,7 +476,7 @@ func (store *Store) ensureHashCapacity(object Object, minimum uint32) (Object, e
 		ctrlAllocation.Bytes[index] = CtrlEmpty
 	}
 	ctrlAllocation.Bytes[target] = CtrlSentinel
-	entriesAllocation, err := store.heap.Alloc(uint64(target) * EntrySize)
+	entriesAllocation, err := store.heap.AllocPayload(uint64(target)*EntrySize, heap.PayloadLayoutHashEntryArray, owner)
 	if err != nil {
 		return Object{}, err
 	}
@@ -442,14 +497,14 @@ func (store *Store) ensureHashCapacity(object Object, minimum uint32) (Object, e
 	return object, nil
 }
 
-func (store *Store) rehash(object Object, minimum uint32) (Object, error) {
+func (store *Store) rehash(owner value.HeapOff64, object Object, minimum uint32) (Object, error) {
 	oldCtrl, oldEntries, err := store.hashRegions(object)
 	if err != nil {
 		return Object{}, err
 	}
 	oldCapacity := object.HashCapacity
 	oldObject := object
-	object, err = store.ensureHashCapacity(object, minimum)
+	object, err = store.ensureHashCapacity(owner, object, minimum)
 	if err != nil {
 		return Object{}, err
 	}
@@ -658,7 +713,31 @@ func (store *Store) loadObject(ref value.HeapRef44) (value.HeapOff64, []byte, Ob
 }
 
 func (store *Store) writeObject(offset value.HeapOff64, objectBytes []byte, object Object) error {
+	header, err := store.heap.HeaderAtOffset(offset)
+	if err != nil {
+		return err
+	}
+	object.Common.Mark = header.Mark
 	return WriteObject(objectBytes, object)
+}
+
+func (store *Store) releaseDetachedPayloads(previous Object, current Object) error {
+	for _, pair := range []struct {
+		old value.HeapOff64
+		new value.HeapOff64
+	}{
+		{old: previous.ArrayData, new: current.ArrayData},
+		{old: previous.CtrlData, new: current.CtrlData},
+		{old: previous.EntriesData, new: current.EntriesData},
+	} {
+		if pair.old == 0 || pair.old == pair.new {
+			continue
+		}
+		if err := store.heap.FreeSpan(pair.old); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func shouldUseArrayPath(currentCap uint32, index uint32, newValue value.TValue) bool {

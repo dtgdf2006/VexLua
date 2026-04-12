@@ -10,6 +10,7 @@ import (
 	"vexlua/internal/runtime/value"
 	"vexlua/internal/vexarc/abi"
 	"vexlua/internal/vexarc/codecache"
+	"vexlua/internal/vexarc/metadata"
 	"vexlua/internal/vexarc/stubs"
 )
 
@@ -199,6 +200,7 @@ func (runtime *Runtime) callCompiled(thread *state.ThreadState, closureRef value
 		VarargBase:    varargBase,
 		ResultBase:    resultBase,
 		SavedBCOff:    0,
+		Flags:         state.FrameFlagCompiled,
 		NResults:      normalizeRequestedResults(nresults),
 		VarargCount:   uint32(varargCount),
 		RegisterCount: uint16(registerCount),
@@ -226,17 +228,19 @@ func (runtime *Runtime) callCompiled(thread *state.ThreadState, closureRef value
 			}
 		}
 	}
+	regsBase := uintptr(frame.RegsBase)
 	cleaned := false
 	cleanup := func() {
 		if cleaned {
 			return
 		}
 		cleaned = true
+		closeLimit := regsBase + uintptr(frame.RegisterCount)*value.TValueSize
+		_, _ = runtime.Engine.Upvalues.CloseInRange(thread, regsBase, closeLimit)
 		_, _ = thread.PopFrame()
 		clearThreadSlots(thread, registerBase, totalSlots)
 	}
 	defer cleanup()
-	regsBase := uintptr(frame.RegsBase)
 	ctx := executionContext{}
 	entry := compiled.Entry
 	for {
@@ -253,6 +257,28 @@ func (runtime *Runtime) callCompiled(thread *state.ThreadState, closureRef value
 			}
 			return normalizeResults(results, nresults), nil
 		case compiledStatusStub:
+			if ctx.Flags&execCtxFlagGCMarkingBoundary != 0 {
+				nextEntry, finished, finalResults, err := runtime.handleGCMarkingBoundary(thread, frame, closureRef, compiled, &ctx, stubs.ID(aux), nresults)
+				if err != nil {
+					return nil, err
+				}
+				if finished {
+					return finalResults, nil
+				}
+				entry = nextEntry
+				continue
+			}
+			if ctx.Flags&execCtxFlagGCSafepointBoundary != 0 {
+				nextEntry, finished, finalResults, err := runtime.handleGCSafepointBoundary(thread, frame, closureRef, compiled, &ctx, stubs.ID(aux), nresults)
+				if err != nil {
+					return nil, err
+				}
+				if finished {
+					return finalResults, nil
+				}
+				entry = nextEntry
+				continue
+			}
 			nextEntry, finished, finalResults, err := runtime.handleStub(thread, frame, closureRef, compiled, &ctx, stubs.ID(aux), nresults)
 			if err != nil {
 				return nil, err
@@ -305,6 +331,28 @@ func (runtime *Runtime) resumeCompiledFrame(thread *state.ThreadState, frame *st
 			}
 			return normalizeResults(results, nresults), nil
 		case compiledStatusStub:
+			if ctx.Flags&execCtxFlagGCMarkingBoundary != 0 {
+				nextEntry, finished, finalResults, err := runtime.handleGCMarkingBoundary(thread, frame, closureRef, compiled, &ctx, stubs.ID(aux), nresults)
+				if err != nil {
+					return nil, err
+				}
+				if finished {
+					return normalizeResults(finalResults, nresults), nil
+				}
+				entry = nextEntry
+				continue
+			}
+			if ctx.Flags&execCtxFlagGCSafepointBoundary != 0 {
+				nextEntry, finished, finalResults, err := runtime.handleGCSafepointBoundary(thread, frame, closureRef, compiled, &ctx, stubs.ID(aux), nresults)
+				if err != nil {
+					return nil, err
+				}
+				if finished {
+					return normalizeResults(finalResults, nresults), nil
+				}
+				entry = nextEntry
+				continue
+			}
 			nextEntry, finished, finalResults, err := runtime.handleStub(thread, frame, closureRef, compiled, &ctx, stubs.ID(aux), nresults)
 			if err != nil {
 				return nil, err
@@ -326,6 +374,77 @@ func (runtime *Runtime) resumeCompiledFrame(thread *state.ThreadState, frame *st
 			return nil, fmt.Errorf("unexpected compiled status %d", status)
 		}
 	}
+}
+
+func (runtime *Runtime) handleGCMarkingBoundary(thread *state.ThreadState, frame *state.CallFrameHeader, closureRef value.HeapRef44, compiled *CompiledCode, ctx *executionContext, stubID stubs.ID, _ int) (uintptr, bool, []value.TValue, error) {
+	if ctx == nil || ctx.Flags&execCtxFlagGCMarkingBoundary == 0 {
+		return 0, false, nil, fmt.Errorf("gc marking boundary is not pending")
+	}
+	ctx.Flags &^= execCtxFlagGCMarkingBoundary
+	runtime.stubCounts[stubID]++
+	site, err := compiled.ContinuationSite(ctx.SiteID)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if site.StubID != uint32(stubID) {
+		return 0, false, nil, fmt.Errorf("stub/site mismatch: exit=%d metadata=%d", stubID, site.StubID)
+	}
+	switch stubID {
+	case stubs.StubSetUpvalue:
+		newValue, err := thread.Register(frame, uint16(site.Operand0))
+		if err != nil {
+			return 0, false, nil, err
+		}
+		upvalueRef, err := runtime.Engine.Closures.UpvalueRefAt(closureRef, int(site.Operand1))
+		if err != nil {
+			return 0, false, nil, err
+		}
+		if err := runtime.Engine.Upvalues.Set(upvalueRef, newValue); err != nil {
+			return 0, false, nil, err
+		}
+		entry, err := compiled.EntryAtSite(site, false)
+		return entry, false, nil, err
+	default:
+		return 0, false, nil, fmt.Errorf("unknown gc marking boundary stub %d", stubID)
+	}
+}
+
+func (runtime *Runtime) handleGCSafepointBoundary(thread *state.ThreadState, frame *state.CallFrameHeader, _ value.HeapRef44, compiled *CompiledCode, ctx *executionContext, stubID stubs.ID, _ int) (uintptr, bool, []value.TValue, error) {
+	if ctx == nil || ctx.Flags&execCtxFlagGCSafepointBoundary == 0 {
+		return 0, false, nil, fmt.Errorf("gc safepoint boundary is not pending")
+	}
+	alternateResume := ctx.Flags&execCtxFlagAlternateResume != 0
+	ctx.Flags &^= execCtxFlagGCSafepointBoundary
+	site, err := compiled.ContinuationSite(ctx.SiteID)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if site.StubID != uint32(stubID) {
+		return 0, false, nil, fmt.Errorf("stub/site mismatch: exit=%d metadata=%d", stubID, site.StubID)
+	}
+	var (
+		entry    uintptr
+		resumePC uint32
+	)
+	switch stubID {
+	case stubs.StubLuaCall:
+		entry, resumePC, err = runtime.callContinuationEntry(thread, frame, compiled, site)
+	case stubs.StubForLoop:
+		entry, resumePC, err = runtime.loopContinuationEntry(compiled, site, alternateResume)
+	default:
+		return 0, false, nil, fmt.Errorf("unknown gc safepoint boundary stub %d", stubID)
+	}
+	if err != nil {
+		return 0, false, nil, err
+	}
+	ctx.Flags = 0
+	if resumePC != metadata.UnmappedOffset {
+		frame.SavedBCOff = resumePC
+	}
+	if err := runtime.Engine.AdvanceGCSafepoint(); err != nil {
+		return 0, false, nil, err
+	}
+	return entry, false, nil, nil
 }
 
 func registerNumber(thread *state.ThreadState, frame *state.CallFrameHeader, index int) (float64, error) {

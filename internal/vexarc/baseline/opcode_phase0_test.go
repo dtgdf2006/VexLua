@@ -14,7 +14,7 @@ func TestPhase0CompiledDispositionSnapshot(t *testing.T) {
 
 	state := &compileState{}
 	compiledCount := 0
-	var deoptOpcodes []string
+	deoptOpcodes := make([]string, 0)
 	for opcodeIndex := 0; opcodeIndex < bytecode.NumOpcodes; opcodeIndex++ {
 		opcode := bytecode.Opcode(opcodeIndex)
 		instruction := bytecode.CreateABC(opcode, 0, 0, 0)
@@ -30,11 +30,11 @@ func TestPhase0CompiledDispositionSnapshot(t *testing.T) {
 		}
 	}
 
-	if compiledCount != 34 {
-		t.Fatalf("phase-0 compiled disposition = %d / %d, want 34 / 38", compiledCount, bytecode.NumOpcodes)
+	if compiledCount != 38 {
+		t.Fatalf("phase-0 compiled disposition = %d / %d, want 38 / 38", compiledCount, bytecode.NumOpcodes)
 	}
 
-	wantDeoptOpcodes := []string{"NEWTABLE", "CONCAT", "CLOSE", "CLOSURE"}
+	wantDeoptOpcodes := []string{}
 	if !reflect.DeepEqual(deoptOpcodes, wantDeoptOpcodes) {
 		t.Fatalf("phase-0 uncovered opcode set = %v, want %v", deoptOpcodes, wantDeoptOpcodes)
 	}

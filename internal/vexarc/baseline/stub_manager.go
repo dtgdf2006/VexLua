@@ -45,6 +45,10 @@ func newStubManager(cache *codecache.Cache) (*stubManager, error) {
 		stubs.StubSelf,
 		stubs.StubLen,
 		stubs.StubSetList,
+		stubs.StubNewTable,
+		stubs.StubConcat,
+		stubs.StubClose,
+		stubs.StubClosure,
 	} {
 		var block *codecache.Block
 		switch id {
@@ -146,6 +150,38 @@ func newStubManager(cache *codecache.Cache) (*stubManager, error) {
 			block = entryBlock
 		case stubs.StubSetList:
 			bodyBlock, entryBlock, err := manager.installManagedNativeBuiltin(buildSetListBuiltinBody())
+			if err != nil {
+				_ = manager.Release()
+				return nil, err
+			}
+			manager.stubBodies[id] = bodyBlock
+			block = entryBlock
+		case stubs.StubNewTable:
+			bodyBlock, entryBlock, err := manager.installManagedNativeBuiltin(buildNewTableBuiltinBody())
+			if err != nil {
+				_ = manager.Release()
+				return nil, err
+			}
+			manager.stubBodies[id] = bodyBlock
+			block = entryBlock
+		case stubs.StubConcat:
+			bodyBlock, entryBlock, err := manager.installManagedNativeBuiltin(buildConcatBuiltinBody())
+			if err != nil {
+				_ = manager.Release()
+				return nil, err
+			}
+			manager.stubBodies[id] = bodyBlock
+			block = entryBlock
+		case stubs.StubClose:
+			bodyBlock, entryBlock, err := manager.installManagedNativeBuiltin(buildCloseBuiltinBody())
+			if err != nil {
+				_ = manager.Release()
+				return nil, err
+			}
+			manager.stubBodies[id] = bodyBlock
+			block = entryBlock
+		case stubs.StubClosure:
+			bodyBlock, entryBlock, err := manager.installManagedNativeBuiltin(buildClosureBuiltinBody())
 			if err != nil {
 				_ = manager.Release()
 				return nil, err

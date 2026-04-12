@@ -176,6 +176,9 @@ func WriteObject(buffer []byte, object Object) error {
 		return fmt.Errorf("buffer too small for table object: %d", len(buffer))
 	}
 	object.SyncLayoutFlags()
+	if current, err := value.ReadCommonHeader(buffer); err == nil && current.Kind == object.Common.Kind {
+		object.Common.Mark = current.Mark
+	}
 	if err := value.WriteCommonHeader(buffer, object.Common); err != nil {
 		return err
 	}

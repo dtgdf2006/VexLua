@@ -241,6 +241,7 @@ func (state *compileState) emitLoadHashValueFromCachedCell(tableObjReg amd64.Reg
 }
 
 func (state *compileState) emitStoreArrayValueFromCachedCell(tableObjReg amd64.Register, cellBaseReg amd64.Register, addrReg amd64.Register, indexReg amd64.Register, valueReg amd64.Register, deopt *amd64.Label) {
+	emitJumpIfGCMarking(state.assembler, addrReg, deopt)
 	state.assembler.MoveRegMem64(addrReg, tableObjReg, rttable.ArrayDataOffset)
 	state.assembler.CmpRegImm32(addrReg, 0)
 	state.assembler.Jcc(amd64.CondEqual, deopt)
@@ -252,6 +253,7 @@ func (state *compileState) emitStoreArrayValueFromCachedCell(tableObjReg amd64.R
 }
 
 func (state *compileState) emitStoreHashValueFromCachedCell(tableObjReg amd64.Register, cellBaseReg amd64.Register, addrReg amd64.Register, indexReg amd64.Register, valueReg amd64.Register, deopt *amd64.Label) {
+	emitJumpIfGCMarking(state.assembler, addrReg, deopt)
 	state.assembler.MoveRegMem64(addrReg, tableObjReg, rttable.EntriesDataOffset)
 	state.assembler.CmpRegImm32(addrReg, 0)
 	state.assembler.Jcc(amd64.CondEqual, deopt)

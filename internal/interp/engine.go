@@ -57,8 +57,14 @@ type Engine struct {
 	Closures *closure.Store
 	Upvalues *upvalue.Manager
 	State    *state.VMState
+	assist   AllocationAssistant
 
 	threads map[uint64]*threadContext
+}
+
+type AllocationAssistant interface {
+	AssistAllocation(bytes uint64) error
+	AssistSafepoint() error
 }
 
 type threadContext struct {
@@ -80,17 +86,33 @@ func New() *Engine {
 	runtimeHeap := heap.MustNew(0, 0)
 	protos := rproto.NewStore(runtimeHeap)
 	vmState := state.NewVMState(runtimeHeap)
+	strings := rtstring.NewInternTable(runtimeHeap, 0x9E3779B9)
+	hosts := host.NewRegistry(runtimeHeap)
 	return &Engine{
 		Heap:     runtimeHeap,
-		Strings:  rtstring.NewInternTable(runtimeHeap, 0x9E3779B9),
+		Strings:  strings,
 		Tables:   rttable.NewStore(runtimeHeap),
-		Hosts:    host.NewRegistry(runtimeHeap),
+		Hosts:    hosts,
 		Protos:   protos,
 		Closures: closure.NewStore(runtimeHeap, protos),
 		Upvalues: upvalue.NewManager(runtimeHeap, vmState),
 		State:    vmState,
 		threads:  make(map[uint64]*threadContext),
 	}
+}
+
+func (engine *Engine) SetAllocationAssistant(assist AllocationAssistant) {
+	if engine == nil {
+		return
+	}
+	engine.assist = assist
+}
+
+func (engine *Engine) AdvanceGCSafepoint() error {
+	if engine == nil || engine.assist == nil {
+		return nil
+	}
+	return engine.assist.AssistSafepoint()
 }
 
 func (engine *Engine) Close() error {
@@ -110,18 +132,46 @@ func (engine *Engine) NewThread(stackSlots uint32, frameCapacity uint32) (*state
 }
 
 func (engine *Engine) InternString(text string) (rtstring.Handle, error) {
-	return engine.Strings.Intern(text)
+	before := engine.liveBytes()
+	handle, err := engine.Strings.Intern(text)
+	if err != nil {
+		return rtstring.Handle{}, err
+	}
+	engine.retainRef(handle.Ref)
+	if err := engine.advanceGCAfterBoundary(before); err != nil {
+		return rtstring.Handle{}, err
+	}
+	return handle, nil
 }
 
 func (engine *Engine) NewTable(arrayCap uint32, hashCap uint32) (rttable.Handle, error) {
-	return engine.Tables.New(arrayCap, hashCap)
+	before := engine.liveBytes()
+	handle, err := engine.Tables.New(arrayCap, hashCap)
+	if err != nil {
+		return rttable.Handle{}, err
+	}
+	engine.retainRef(handle.Ref)
+	if err := engine.advanceGCAfterBoundary(before); err != nil {
+		return rttable.Handle{}, err
+	}
+	return handle, nil
 }
 
 func (engine *Engine) NewClosure(proto *bytecode.Proto, env value.TValue, upvalues []value.HeapRef44) (closure.Handle, error) {
-	return engine.Closures.NewLuaClosure(proto, env, upvalues)
+	before := engine.liveBytes()
+	handle, err := engine.Closures.NewLuaClosure(proto, env, upvalues)
+	if err != nil {
+		return closure.Handle{}, err
+	}
+	engine.retainRef(handle.Ref)
+	if err := engine.advanceGCAfterBoundary(before); err != nil {
+		return closure.Handle{}, err
+	}
+	return handle, nil
 }
 
 func (engine *Engine) RegisterHostObject(name string, target any, env value.TValue) (host.HostObject, error) {
+	before := engine.liveBytes()
 	handle, err := engine.Hosts.RegisterObject(name, target)
 	if err != nil {
 		return host.HostObject{}, err
@@ -134,10 +184,15 @@ func (engine *Engine) RegisterHostObject(name string, target any, env value.TVal
 	if err := engine.Hosts.Release(handle); err != nil {
 		return host.HostObject{}, err
 	}
+	engine.retainRef(wrapped.Ref)
+	if err := engine.advanceGCAfterBoundary(before); err != nil {
+		return host.HostObject{}, err
+	}
 	return wrapped, nil
 }
 
 func (engine *Engine) RegisterHostFunction(name string, function any, env value.TValue) (host.HostFunction, error) {
+	before := engine.liveBytes()
 	handle, err := engine.Hosts.RegisterFunction(name, function)
 	if err != nil {
 		return host.HostFunction{}, err
@@ -150,33 +205,57 @@ func (engine *Engine) RegisterHostFunction(name string, function any, env value.
 	if err := engine.Hosts.Release(handle); err != nil {
 		return host.HostFunction{}, err
 	}
+	engine.retainRef(wrapped.Ref)
+	if err := engine.advanceGCAfterBoundary(before); err != nil {
+		return host.HostFunction{}, err
+	}
 	return wrapped, nil
 }
 
 func (engine *Engine) SetGlobal(env value.TValue, name string, slotValue value.TValue) error {
-	key, err := engine.InternString(name)
+	before := engine.liveBytes()
+	key, err := engine.Strings.Intern(name)
 	if err != nil {
 		return err
 	}
-	return engine.WriteIndexBoundary(env, key.Value, slotValue)
+	if err := engine.WriteIndexBoundary(env, key.Value, slotValue); err != nil {
+		return err
+	}
+	return engine.advanceGCAfterBoundary(before)
 }
 
 func (engine *Engine) GetGlobal(env value.TValue, name string) (value.TValue, bool, error) {
-	key, err := engine.InternString(name)
+	before := engine.liveBytes()
+	key, err := engine.Strings.Intern(name)
 	if err != nil {
 		return value.NilValue(), false, err
 	}
-	return engine.ReadIndexBoundary(env, key.Value)
+	result, found, err := engine.ReadIndexBoundary(env, key.Value)
+	if err != nil {
+		return value.NilValue(), false, err
+	}
+	if found {
+		engine.retainValue(result)
+	}
+	if err := engine.advanceGCAfterBoundary(before); err != nil {
+		return value.NilValue(), false, err
+	}
+	return result, found, nil
 }
 
 func (engine *Engine) Call(thread *state.ThreadState, callee value.TValue, args []value.TValue, nresults int) ([]value.TValue, error) {
 	if thread == nil {
 		return nil, fmt.Errorf("thread cannot be nil")
 	}
+	before := engine.liveBytes()
 	snapshot := engine.snapshot(thread)
 	results, err := engine.callValue(thread, callee, args, nresults)
 	if err != nil {
 		engine.restoreSnapshot(thread, snapshot)
+		return nil, err
+	}
+	engine.retainValues(results)
+	if err := engine.advanceGCAfterBoundary(before); err != nil {
 		return nil, err
 	}
 	return results, nil
@@ -186,6 +265,7 @@ func (engine *Engine) ProtectedCall(thread *state.ThreadState, callee value.TVal
 	if thread == nil {
 		return Outcome{Status: StatusError, Err: fmt.Errorf("thread cannot be nil")}
 	}
+	before := engine.liveBytes()
 	snapshot := engine.snapshot(thread)
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -201,7 +281,38 @@ func (engine *Engine) ProtectedCall(thread *state.ThreadState, callee value.TVal
 		engine.restoreSnapshot(thread, snapshot)
 		return Outcome{Status: StatusError, Err: err}
 	}
+	engine.retainValues(values)
+	if err := engine.advanceGCAfterBoundary(before); err != nil {
+		return Outcome{Status: StatusError, Err: err}
+	}
 	return Outcome{Status: StatusOK, Values: values}
+}
+
+func (engine *Engine) RetainValue(slotValue value.TValue) {
+	engine.retainValue(slotValue)
+}
+
+func (engine *Engine) ReleaseValue(slotValue value.TValue) error {
+	if engine == nil || engine.State == nil || engine.State.ExternalRoots() == nil {
+		return nil
+	}
+	return engine.State.ExternalRoots().ReleaseValue(slotValue)
+}
+
+func (engine *Engine) ReleaseValues(values []value.TValue) error {
+	for _, slotValue := range values {
+		if err := engine.ReleaseValue(slotValue); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (engine *Engine) ReleaseRef(ref value.HeapRef44) error {
+	if engine == nil || engine.State == nil || engine.State.ExternalRoots() == nil {
+		return nil
+	}
+	return engine.State.ExternalRoots().ReleaseRef(ref)
 }
 
 func (engine *Engine) callValue(thread *state.ThreadState, callee value.TValue, args []value.TValue, nresults int) ([]value.TValue, error) {
@@ -229,7 +340,10 @@ func (engine *Engine) restoreSnapshot(thread *state.ThreadState, snapshot thread
 	ctx := engine.threadState(thread)
 	for len(ctx.activations) > snapshot.activations {
 		act := ctx.activations[len(ctx.activations)-1]
-		_, _ = engine.Upvalues.CloseAtOrAbove(thread, activationBaseAddress(act))
+		if act != nil && act.frame != nil {
+			closeLimit := activationBaseAddress(act) + uintptr(act.frame.RegisterCount)*value.TValueSize
+			_, _ = engine.Upvalues.CloseInRange(thread, activationBaseAddress(act), closeLimit)
+		}
 		_, _ = thread.PopFrame()
 		ctx.activations = ctx.activations[:len(ctx.activations)-1]
 		if registerBase, err := thread.SlotIndexForAddress(activationBaseAddress(act)); err == nil {
@@ -260,6 +374,44 @@ func (engine *Engine) clearSlots(thread *state.ThreadState, start uint32, count 
 		}
 		_ = thread.SetValueAtAddress(address, value.NilValue())
 	}
+}
+
+func (engine *Engine) retainRef(ref value.HeapRef44) {
+	if engine == nil || engine.State == nil || engine.State.ExternalRoots() == nil {
+		return
+	}
+	engine.State.ExternalRoots().RetainRef(ref)
+}
+
+func (engine *Engine) retainValue(slotValue value.TValue) {
+	if engine == nil || engine.State == nil || engine.State.ExternalRoots() == nil {
+		return
+	}
+	engine.State.ExternalRoots().RetainValue(slotValue)
+}
+
+func (engine *Engine) retainValues(values []value.TValue) {
+	for _, slotValue := range values {
+		engine.retainValue(slotValue)
+	}
+}
+
+func (engine *Engine) liveBytes() uint64 {
+	if engine == nil || engine.Heap == nil {
+		return 0
+	}
+	return engine.Heap.LiveBytes()
+}
+
+func (engine *Engine) advanceGCAfterBoundary(before uint64) error {
+	if engine == nil || engine.assist == nil || engine.Heap == nil {
+		return nil
+	}
+	after := engine.Heap.LiveBytes()
+	if after <= before {
+		return nil
+	}
+	return engine.assist.AssistAllocation(after - before)
 }
 
 func runtimeError(proto *bytecode.Proto, pc int, opcode bytecode.Opcode, reason string) error {

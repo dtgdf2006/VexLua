@@ -105,7 +105,8 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 	}
 
 	results, execErr := engine.executeActivation(activation, varargs)
-	_, closeErr := engine.Upvalues.CloseAtOrAbove(thread, uintptr(frame.RegsBase))
+	closeLimit := uintptr(frame.RegsBase) + uintptr(frame.RegisterCount)*value.TValueSize
+	_, closeErr := engine.Upvalues.CloseInRange(thread, uintptr(frame.RegsBase), closeLimit)
 	_, popErr := thread.PopFrame()
 	ctx.activations = ctx.activations[:len(ctx.activations)-1]
 	engine.clearSlots(thread, registerBase, reservedSlots)
@@ -296,11 +297,9 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			}
 			engine.recordSetFeedback(act, pc, feedback.SlotSetTable, tableValue, key, slotValue)
 		case bytecode.OP_NEWTABLE:
-			handle, err := engine.Tables.New(uint32(fb2int(instruction.B())), uint32(fb2int(instruction.C())))
-			if err != nil {
-				return nil, err
-			}
-			if err := engine.setRegister(act, instruction.A(), handle.Value); err != nil {
+			if err := engine.NewTableBoundary(uint32(fb2int(instruction.B())), uint32(fb2int(instruction.C())), func(tableValue value.TValue) error {
+				return engine.setRegister(act, instruction.A(), tableValue)
+			}); err != nil {
 				return nil, err
 			}
 		case bytecode.OP_SELF:
@@ -378,12 +377,18 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 				return nil, err
 			}
 		case bytecode.OP_CONCAT:
-			result, err := engine.concatRegisters(act, instruction.B(), instruction.C())
-			if err != nil {
-				return nil, runtimeError(proto, pc, opcode, err.Error())
+			values := make([]value.TValue, 0, instruction.C()-instruction.B()+1)
+			for index := instruction.B(); index <= instruction.C(); index++ {
+				slotValue, err := engine.registerValue(act, index)
+				if err != nil {
+					return nil, err
+				}
+				values = append(values, slotValue)
 			}
-			if err := engine.setRegister(act, instruction.A(), result); err != nil {
-				return nil, err
+			if err := engine.ConcatValuesBoundary(values, func(result value.TValue) error {
+				return engine.setRegister(act, instruction.A(), result)
+			}); err != nil {
+				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
 		case bytecode.OP_JMP:
 			act.pc += instruction.SBx()
@@ -452,39 +457,35 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
-			if isFalse(registerValue) != (instruction.C() != 0) {
+			if isFalse(registerValue) == (instruction.C() != 0) {
+				act.pc++
+			} else {
 				if err := engine.takeTestJump(act, pc, opcode); err != nil {
 					return nil, err
 				}
-			} else {
-				act.pc++
 			}
 		case bytecode.OP_TESTSET:
 			registerValue, err := engine.registerValue(act, instruction.B())
 			if err != nil {
 				return nil, err
 			}
-			if isFalse(registerValue) != (instruction.C() != 0) {
+			if isFalse(registerValue) == (instruction.C() != 0) {
+				act.pc++
+			} else {
 				if err := engine.setRegister(act, instruction.A(), registerValue); err != nil {
 					return nil, err
 				}
 				if err := engine.takeTestJump(act, pc, opcode); err != nil {
 					return nil, err
 				}
-			} else {
-				act.pc++
 			}
 		case bytecode.OP_CALL:
 			callee, callArgs, err := engine.collectCallArguments(act, instruction.A(), instruction.B())
 			if err != nil {
 				return nil, err
 			}
-			wantedResults := -1
-			if instruction.C() > 0 {
-				wantedResults = instruction.C() - 1
-			}
 			engine.recordCallFeedback(act, pc, feedback.SlotCall, callee)
-			results, err := engine.callValue(act.thread, callee, callArgs, wantedResults)
+			results, err := engine.callValue(act.thread, callee, callArgs, instruction.C()-1)
 			if err != nil {
 				return nil, err
 			}
@@ -492,7 +493,6 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 				return nil, err
 			}
 		case bytecode.OP_TAILCALL:
-			act.frame.SetFlag(state.FrameFlagIsTailcall, true)
 			callee, callArgs, err := engine.collectCallArguments(act, instruction.A(), instruction.B())
 			if err != nil {
 				return nil, err
@@ -594,7 +594,8 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
-			if _, err := engine.Upvalues.CloseAtOrAbove(act.thread, address); err != nil {
+			limit := uintptr(act.frame.RegsBase) + uintptr(act.frame.RegisterCount)*value.TValueSize
+			if _, err := engine.CloseUpvaluesInRangeBoundary(act.thread, address, limit); err != nil {
 				return nil, err
 			}
 		case bytecode.OP_CLOSURE:
@@ -611,11 +612,9 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
-			closureHandle, err := engine.Closures.NewLuaClosure(childProto, env, capturedRefs)
-			if err != nil {
-				return nil, err
-			}
-			if err := engine.setRegister(act, instruction.A(), closureHandle.Value); err != nil {
+			if err := engine.NewClosureBoundary(childProto, env, capturedRefs, func(closureValue value.TValue) error {
+				return engine.setRegister(act, instruction.A(), closureValue)
+			}); err != nil {
 				return nil, err
 			}
 		case bytecode.OP_VARARG:
@@ -756,29 +755,6 @@ func (engine *Engine) lengthValue(slotValue value.TValue) (value.TValue, error) 
 		return value.NumberValue(float64(object.ArrayLenHint)), nil
 	}
 	return value.NilValue(), fmt.Errorf("length requires table or string, got %s", slotValue)
-}
-
-func (engine *Engine) concatRegisters(act *activation, start int, end int) (value.TValue, error) {
-	if start > end {
-		return value.NilValue(), fmt.Errorf("concat range %d..%d is invalid", start, end)
-	}
-	text := ""
-	for index := start; index <= end; index++ {
-		slotValue, err := engine.registerValue(act, index)
-		if err != nil {
-			return value.NilValue(), err
-		}
-		part, err := engine.concatOperandText(slotValue)
-		if err != nil {
-			return value.NilValue(), err
-		}
-		text += part
-	}
-	handle, err := engine.Strings.Intern(text)
-	if err != nil {
-		return value.NilValue(), err
-	}
-	return handle.Value, nil
 }
 
 func (engine *Engine) concatOperandText(slotValue value.TValue) (string, error) {

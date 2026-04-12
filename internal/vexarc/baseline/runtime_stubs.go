@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"vexlua/internal/bytecode"
+	rtproto "vexlua/internal/runtime/proto"
 	"vexlua/internal/runtime/state"
 	"vexlua/internal/runtime/value"
 	"vexlua/internal/vexarc/metadata"
@@ -36,6 +37,14 @@ func (runtime *Runtime) handleStub(thread *state.ThreadState, frame *state.CallF
 		return runtime.handleSetTableStub(thread, frame, closureRef, compiled, site, nresults)
 	case stubs.StubSetList:
 		return runtime.handleSetListStub(thread, frame, compiled, site, nresults)
+	case stubs.StubNewTable:
+		return runtime.handleNewTableStub(thread, frame, compiled, site, nresults)
+	case stubs.StubConcat:
+		return runtime.handleConcatStub(thread, frame, compiled, site, nresults)
+	case stubs.StubClose:
+		return runtime.handleCloseStub(thread, frame, compiled, site, nresults)
+	case stubs.StubClosure:
+		return runtime.handleClosureStub(thread, frame, closureRef, compiled, site, nresults)
 	case stubs.StubLuaCall:
 		return runtime.handleCallStub(thread, frame, compiled, site, ctx)
 	case stubs.StubTailCall:
@@ -139,12 +148,8 @@ func (runtime *Runtime) handleSetGlobalStub(thread *state.ThreadState, frame *st
 	if err != nil {
 		return 0, false, nil, err
 	}
-	if env.IsBoxedTag(value.TagHostObjectRef) {
-		if err := runtime.Engine.WriteIndexBoundary(env, key, newValue); err != nil {
-			return 0, false, nil, err
-		}
-	} else {
-		return runtime.deoptThroughSite(thread, frame, site, nresults)
+	if err := runtime.Engine.WriteIndexBoundary(env, key, newValue); err != nil {
+		return 0, false, nil, err
 	}
 	entry, err := compiled.EntryAtSite(site, false)
 	return entry, false, nil, err
@@ -163,12 +168,8 @@ func (runtime *Runtime) handleSetTableStub(thread *state.ThreadState, frame *sta
 	if err != nil {
 		return 0, false, nil, err
 	}
-	if tableValue.IsBoxedTag(value.TagHostObjectRef) {
-		if err := runtime.Engine.WriteIndexBoundary(tableValue, key, newValue); err != nil {
-			return 0, false, nil, err
-		}
-	} else {
-		return runtime.deoptThroughSite(thread, frame, site, nresults)
+	if err := runtime.Engine.WriteIndexBoundary(tableValue, key, newValue); err != nil {
+		return 0, false, nil, err
 	}
 	entry, err := compiled.EntryAtSite(site, false)
 	return entry, false, nil, err
@@ -211,6 +212,124 @@ func (runtime *Runtime) handleSetListStub(thread *state.ThreadState, frame *stat
 	}
 	if !handled {
 		return runtime.deoptThroughSite(thread, frame, site, -1)
+	}
+	entry, err := compiled.EntryAtSite(site, false)
+	return entry, false, nil, err
+}
+
+func (runtime *Runtime) handleNewTableStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, _ int) (uintptr, bool, []value.TValue, error) {
+	frame.SavedBCOff = site.ResumePC
+	if err := runtime.Engine.NewTableBoundary(site.Operand1, site.Operand2, func(tableValue value.TValue) error {
+		if err := thread.SetRegister(frame, uint16(site.Operand0), tableValue); err != nil {
+			return err
+		}
+		return advanceFrameTopForSlot(frame, int(site.Operand0))
+	}); err != nil {
+		return 0, false, nil, err
+	}
+	entry, err := compiled.EntryAtSite(site, false)
+	return entry, false, nil, err
+}
+
+func (runtime *Runtime) handleConcatStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, _ int) (uintptr, bool, []value.TValue, error) {
+	count := int(site.Operand2) - int(site.Operand1) + 1
+	values := make([]value.TValue, 0, count)
+	for index := int(site.Operand1); index <= int(site.Operand2); index++ {
+		slotValue, err := thread.Register(frame, uint16(index))
+		if err != nil {
+			return 0, false, nil, err
+		}
+		values = append(values, slotValue)
+	}
+	frame.SavedBCOff = site.ResumePC
+	if err := runtime.Engine.ConcatValuesBoundary(values, func(result value.TValue) error {
+		if err := thread.SetRegister(frame, uint16(site.Operand0), result); err != nil {
+			return err
+		}
+		return advanceFrameTopForSlot(frame, int(site.Operand0))
+	}); err != nil {
+		return 0, false, nil, err
+	}
+	entry, err := compiled.EntryAtSite(site, false)
+	return entry, false, nil, err
+}
+
+func (runtime *Runtime) handleCloseStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, _ int) (uintptr, bool, []value.TValue, error) {
+	registerBase, err := thread.SlotIndexForAddress(uintptr(frame.RegsBase))
+	if err != nil {
+		return 0, false, nil, err
+	}
+	address, err := thread.SlotAddress(registerBase + site.Operand0)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	limit := uintptr(frame.RegsBase) + uintptr(frame.RegisterCount)*value.TValueSize
+	frame.SavedBCOff = site.ResumePC
+	if _, err := runtime.Engine.CloseUpvaluesInRangeBoundary(thread, address, limit); err != nil {
+		return 0, false, nil, err
+	}
+	entry, err := compiled.EntryAtSite(site, false)
+	return entry, false, nil, err
+}
+
+func (runtime *Runtime) handleClosureStub(thread *state.ThreadState, frame *state.CallFrameHeader, closureRef value.HeapRef44, compiled *CompiledCode, site metadata.ContinuationSite, _ int) (uintptr, bool, []value.TValue, error) {
+	if compiled.ProtoRef == 0 {
+		return 0, false, nil, fmt.Errorf("closure continuation missing proto ref")
+	}
+	closureSite, captures, found, err := runtime.Engine.Protos.ClosureSite(compiled.ProtoRef, int(site.BytecodePC))
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if !found {
+		return 0, false, nil, fmt.Errorf("closure site pc %d is missing proto metadata", site.BytecodePC)
+	}
+	childIndex := int(site.Operand1)
+	if int(closureSite.ChildProtoIndex) != childIndex {
+		return 0, false, nil, fmt.Errorf("closure site child proto mismatch: metadata=%d site=%d", closureSite.ChildProtoIndex, childIndex)
+	}
+	if childIndex < 0 || childIndex >= len(compiled.Proto.Protos) {
+		return 0, false, nil, fmt.Errorf("closure child proto %d is out of range", childIndex)
+	}
+	registerBase, err := thread.SlotIndexForAddress(uintptr(frame.RegsBase))
+	if err != nil {
+		return 0, false, nil, err
+	}
+	upvalueRefs := make([]value.HeapRef44, len(captures))
+	for index, capture := range captures {
+		switch capture.Kind {
+		case rtproto.CaptureLocal:
+			address, err := thread.SlotAddress(registerBase + uint32(capture.Index))
+			if err != nil {
+				return 0, false, nil, err
+			}
+			handle, err := runtime.Engine.Upvalues.FindOrCreateOpen(thread, address)
+			if err != nil {
+				return 0, false, nil, err
+			}
+			upvalueRefs[index] = handle.Ref
+		case rtproto.CaptureUpvalue:
+			upvalueRef, err := runtime.Engine.Closures.UpvalueRefAt(closureRef, int(capture.Index))
+			if err != nil {
+				return 0, false, nil, err
+			}
+			upvalueRefs[index] = upvalueRef
+		default:
+			return 0, false, nil, fmt.Errorf("unsupported closure capture kind %d", capture.Kind)
+		}
+	}
+	env, err := runtime.Engine.Closures.Env(closureRef)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	childProto := compiled.Proto.Protos[childIndex]
+	frame.SavedBCOff = site.ResumePC
+	if err := runtime.Engine.NewClosureBoundary(childProto, env, upvalueRefs, func(closureValue value.TValue) error {
+		if err := thread.SetRegister(frame, uint16(site.Operand0), closureValue); err != nil {
+			return err
+		}
+		return advanceFrameTopForSlot(frame, int(site.Operand0))
+	}); err != nil {
+		return 0, false, nil, err
 	}
 	entry, err := compiled.EntryAtSite(site, false)
 	return entry, false, nil, err
@@ -260,7 +379,7 @@ func (runtime *Runtime) handleCallStub(thread *state.ThreadState, frame *state.C
 			return 0, false, nil, err
 		}
 	}
-	return runtime.resumeCallContinuation(thread, frame, compiled, site)
+	return runtime.resumeCallContinuationAtSafepoint(thread, frame, compiled, site)
 }
 
 func (runtime *Runtime) resumeCallContinuation(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite) (uintptr, bool, []value.TValue, error) {
@@ -279,6 +398,20 @@ func (runtime *Runtime) resumeCallContinuation(thread *state.ThreadState, frame 
 	}
 	entry, err := compiled.EntryAtSite(site, false)
 	return entry, false, nil, err
+}
+
+func (runtime *Runtime) resumeCallContinuationAtSafepoint(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite) (uintptr, bool, []value.TValue, error) {
+	entry, resumePC, err := runtime.callContinuationEntry(thread, frame, compiled, site)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if resumePC != metadata.UnmappedOffset {
+		frame.SavedBCOff = resumePC
+	}
+	if err := runtime.Engine.AdvanceGCSafepoint(); err != nil {
+		return 0, false, nil, err
+	}
+	return entry, false, nil, nil
 }
 
 func (runtime *Runtime) handleTailCallStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, ctx *executionContext, nresults int) (uintptr, bool, []value.TValue, error) {
@@ -310,6 +443,41 @@ func (runtime *Runtime) callValueBoundary(thread *state.ThreadState, callee valu
 	return runtime.Engine.CallValueBoundary(thread, callee, args, nresults)
 }
 
+func (runtime *Runtime) callContinuationEntry(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite) (uintptr, uint32, error) {
+	alternateResume := false
+	resumePC := site.ResumePC
+	if site.HasAlternateResume() && site.Operand3 != 0 {
+		firstResult, err := thread.Register(frame, uint16(site.Operand0+3))
+		if err != nil {
+			return 0, metadata.UnmappedOffset, err
+		}
+		if !firstResult.IsBoxedTag(value.TagNil) {
+			if err := thread.SetRegister(frame, uint16(site.Operand3), firstResult); err != nil {
+				return 0, metadata.UnmappedOffset, err
+			}
+			alternateResume = true
+			resumePC = site.AltResumePC
+		}
+	}
+	entry, err := compiled.EntryAtSite(site, alternateResume)
+	if err != nil {
+		return 0, metadata.UnmappedOffset, err
+	}
+	return entry, resumePC, nil
+}
+
+func (runtime *Runtime) loopContinuationEntry(compiled *CompiledCode, site metadata.ContinuationSite, alternateResume bool) (uintptr, uint32, error) {
+	resumePC := site.ResumePC
+	if alternateResume {
+		resumePC = site.AltResumePC
+	}
+	entry, err := compiled.EntryAtSite(site, alternateResume)
+	if err != nil {
+		return 0, metadata.UnmappedOffset, err
+	}
+	return entry, resumePC, nil
+}
+
 func (runtime *Runtime) finishNestedCompiledCall(thread *state.ThreadState, callerFrame *state.CallFrameHeader, ctx *executionContext) ([]value.TValue, error) {
 	if thread == nil {
 		return nil, fmt.Errorf("thread cannot be nil")
@@ -326,8 +494,13 @@ func (runtime *Runtime) finishNestedCompiledCall(thread *state.ThreadState, call
 	}
 	frameCopy := *activeFrame
 	cleanup := func() error {
+		closeLimit := uintptr(frameCopy.RegsBase) + uintptr(frameCopy.RegisterCount)*value.TValueSize
+		_, closeErr := runtime.Engine.Upvalues.CloseInRange(thread, uintptr(frameCopy.RegsBase), closeLimit)
 		_, popErr := thread.PopFrame()
 		clearFrameSlots(thread, &frameCopy)
+		if closeErr != nil {
+			return closeErr
+		}
 		return popErr
 	}
 	closureRef, activeCompiled, err := runtime.compiledFrameState(activeFrame)

@@ -20,8 +20,9 @@ type Allocation struct {
 }
 
 type allocationSpan struct {
-	start uint64
-	size  uint64
+	start    uint64
+	size     uint64
+	metadata SpanMetadata
 }
 
 type page struct {
@@ -35,8 +36,10 @@ type Heap struct {
 	pageSize    uint64
 	pages       []*page
 	allocations map[value.HeapOff64]allocationSpan
+	spanOrder   []value.HeapOff64
 	nextPage    uint64
 	native      nativeArena
+	gc          *GCController
 }
 
 func New(base uintptr, pageSize uint64) (*Heap, error) {
@@ -55,6 +58,7 @@ func New(base uintptr, pageSize uint64) (*Heap, error) {
 		allocations: make(map[value.HeapOff64]allocationSpan),
 		nextPage:    value.ObjectAlignment,
 	}
+	h.gc = newGCController(h.pageSize)
 	reserveSize := DefaultNativeReserveSize
 	if reserveSize < h.pageSize {
 		reserveSize = h.pageSize
@@ -91,10 +95,22 @@ func (heap *Heap) PageSize() uint64 {
 }
 
 func (heap *Heap) Alloc(size uint64) (Allocation, error) {
+	return heap.allocSpan(size, SpanMetadata{Kind: SpanKindPayload, State: SpanStateLive, Layout: PayloadLayoutOpaque})
+}
+
+func (heap *Heap) allocSpan(size uint64, metadata SpanMetadata) (Allocation, error) {
 	if size == 0 {
 		return Allocation{}, fmt.Errorf("allocation size cannot be zero")
 	}
+	if err := heap.validateSpanMetadata(metadata); err != nil {
+		return Allocation{}, err
+	}
 	alignedSize := alignUp(size, value.ObjectAlignment)
+	if allocation, ok, err := heap.reuseFreeSpan(alignedSize, metadata); err != nil {
+		return Allocation{}, err
+	} else if ok {
+		return allocation, nil
+	}
 	page := heap.currentPage(alignedSize)
 	if page == nil || page.remaining() < alignedSize {
 		page = heap.newPage(alignedSize)
@@ -114,8 +130,55 @@ func (heap *Heap) Alloc(size uint64) (Allocation, error) {
 		Size:    alignedSize,
 		Bytes:   bytes,
 	}
-	heap.allocations[allocation.Offset] = allocationSpan{start: off, size: alignedSize}
+	metadata.Size = alignedSize
+	metadata.Address = allocation.Address
+	heap.allocations[allocation.Offset] = allocationSpan{start: off, size: alignedSize, metadata: metadata}
+	heap.spanOrder = append(heap.spanOrder, allocation.Offset)
+	if heap.gc != nil {
+		heap.gc.liveBytes += alignedSize
+	}
 	return allocation, nil
+}
+
+func (heap *Heap) reuseFreeSpan(size uint64, metadata SpanMetadata) (Allocation, bool, error) {
+	var bestOffset value.HeapOff64
+	var bestSpan allocationSpan
+	found := false
+	for offset, span := range heap.allocations {
+		if span.metadata.State != SpanStateFree || span.size < size {
+			continue
+		}
+		if !found || span.size < bestSpan.size {
+			bestOffset = offset
+			bestSpan = span
+			found = true
+		}
+	}
+	if !found {
+		return Allocation{}, false, nil
+	}
+	if err := heap.native.EnsureCommitted(bestSpan.start + bestSpan.size); err != nil {
+		return Allocation{}, false, err
+	}
+	bytes, err := heap.native.Bytes(bestSpan.start, bestSpan.size)
+	if err != nil {
+		return Allocation{}, false, err
+	}
+	clear(bytes)
+	metadata.State = SpanStateLive
+	metadata.Size = bestSpan.size
+	metadata.Address = heap.base + uintptr(bestSpan.start)
+	bestSpan.metadata = metadata
+	heap.allocations[bestOffset] = bestSpan
+	if heap.gc != nil {
+		heap.gc.liveBytes += bestSpan.size
+	}
+	return Allocation{
+		Offset:  bestOffset,
+		Address: metadata.Address,
+		Size:    bestSpan.size,
+		Bytes:   bytes,
+	}, true, nil
 }
 
 func (heap *Heap) AllocObject(header value.CommonHeader) (Allocation, error) {
@@ -123,7 +186,10 @@ func (heap *Heap) AllocObject(header value.CommonHeader) (Allocation, error) {
 		header.SizeBytes = value.CommonHeaderSize
 	}
 	header.SizeBytes = uint32(alignUp(uint64(header.SizeBytes), value.ObjectAlignment))
-	allocation, err := heap.Alloc(uint64(header.SizeBytes))
+	if header.Mark == 0 {
+		header.Mark = heap.CurrentWhite()
+	}
+	allocation, err := heap.allocSpan(uint64(header.SizeBytes), SpanMetadata{Kind: SpanKindObject, State: SpanStateLive})
 	if err != nil {
 		return Allocation{}, err
 	}
@@ -204,8 +270,15 @@ func (heap *Heap) ValidateObjectAddress(address uintptr) error {
 	if err != nil {
 		return err
 	}
-	if _, ok := heap.allocations[offset]; !ok {
+	span, ok := heap.allocations[offset]
+	if !ok {
 		return fmt.Errorf("address %#x is not an object start", address)
+	}
+	if span.metadata.State != SpanStateLive {
+		return fmt.Errorf("address %#x does not reference a live object", address)
+	}
+	if span.metadata.Kind != SpanKindObject {
+		return fmt.Errorf("address %#x does not reference an object span", address)
 	}
 	header, err := heap.HeaderAtOffset(offset)
 	if err != nil {

@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"vexlua/internal/bytecode"
-	rclosure "vexlua/internal/runtime/closure"
 	"vexlua/internal/runtime/host"
 	"vexlua/internal/runtime/value"
 )
@@ -167,25 +166,8 @@ func TestActivationReadsEnvFromNativeClosureObject(t *testing.T) {
 	}
 	var closureRef value.HeapRef44
 	swap, err := engine.RegisterHostFunction("swap", func() {
-		object, err := engine.Closures.Object(closureRef)
-		if err != nil {
-			t.Fatalf("read closure object: %v", err)
-		}
-		object.Env = env2.Value
-		address, err := engine.Heap.DecodeHeapRef(closureRef)
-		if err != nil {
-			t.Fatalf("decode closure ref: %v", err)
-		}
-		offset, err := engine.Heap.OffsetForAddress(address)
-		if err != nil {
-			t.Fatalf("closure offset: %v", err)
-		}
-		bytes, err := engine.Heap.Resolve(offset, rclosure.ObjectSize)
-		if err != nil {
-			t.Fatalf("resolve closure bytes: %v", err)
-		}
-		if err := rclosure.WriteObject(bytes, object); err != nil {
-			t.Fatalf("write closure bytes: %v", err)
+		if err := engine.Closures.SetEnv(closureRef, env2.Value); err != nil {
+			t.Fatalf("set closure env: %v", err)
 		}
 	}, env1.Value)
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"unsafe"
 
+	"vexlua/internal/runtime/heap"
 	"vexlua/internal/runtime/value"
 )
 
@@ -17,6 +18,11 @@ const (
 	VMStateThreadCountOffset       = 0x28
 	VMStateFlagsOffset             = 0x2C
 	VMStateActiveThreadStateOffset = 0x30
+)
+
+const (
+	VMFlagGCMarking uint32 = 1 << iota
+	VMFlagGCSafepoint
 )
 
 type VMStateHeader struct {
@@ -50,6 +56,13 @@ func (vm *VMState) syncHeader(thread *ThreadState) {
 	}
 	vm.nativeHeader.HeapBase = uint64(vm.HeapBase)
 	vm.nativeHeader.ThreadCount = uint32(len(vm.threads))
+	vm.nativeHeader.Flags = 0
+	if vm.Heap != nil && vm.Heap.GCPhase() == heap.GCPhaseMark {
+		vm.nativeHeader.Flags |= VMFlagGCMarking
+	}
+	if vm.Heap != nil && (vm.Heap.GCPhase() != heap.GCPhasePause || vm.Heap.GCTargetReached()) {
+		vm.nativeHeader.Flags |= VMFlagGCSafepoint
+	}
 	if thread == nil {
 		vm.nativeHeader.ActiveThreadStackBase = 0
 		vm.nativeHeader.ActiveThreadFrameBase = 0

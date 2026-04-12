@@ -93,6 +93,7 @@ func buildSetUpvalueBuiltinBody() []byte {
 	assembler := amd64.NewAssembler(160)
 	storeClosed := assembler.NewLabel()
 	storeOpen := assembler.NewLabel()
+	runtimeDispatch := assembler.NewLabel()
 	errorPath := assembler.NewLabel()
 	done := assembler.NewLabel()
 
@@ -123,6 +124,7 @@ func buildSetUpvalueBuiltinBody() []byte {
 	assembler.Jmp(errorPath)
 
 	_ = assembler.Bind(storeOpen)
+	emitJumpIfGCMarking(assembler, amd64.RegR8, runtimeDispatch)
 	assembler.MoveRegMem64(amd64.RegRDX, amd64.RegR10, rtupvalue.SlotAddrOffset)
 	assembler.CmpRegImm32(amd64.RegRDX, 0)
 	assembler.Jcc(amd64.CondEqual, errorPath)
@@ -131,11 +133,16 @@ func buildSetUpvalueBuiltinBody() []byte {
 	assembler.Jmp(done)
 
 	_ = assembler.Bind(storeClosed)
+	emitJumpIfGCMarking(assembler, amd64.RegR8, runtimeDispatch)
 	assembler.MoveMemReg64(amd64.RegR10, rtupvalue.ClosedValueOffset, amd64.RegRAX)
 	emitUpdateUpvalueFeedbackEligible(assembler, feedback.SlotSetUpvalue, feedback.AccessUpvalueClosed, amd64.RegRBX, amd64.RegRAX)
 
 	_ = assembler.Bind(done)
 	emitReturnBuiltinContinuation(assembler, true)
+
+	_ = assembler.Bind(runtimeDispatch)
+	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, execCtxFlagGCMarkingBoundary)
+	emitExitCurrentBuiltinToRuntime(assembler, false)
 
 	_ = assembler.Bind(errorPath)
 	emitUpdateUpvalueFeedbackIneligible(assembler, feedback.SlotSetUpvalue)
@@ -167,6 +174,7 @@ func buildForLoopBuiltinBody() []byte {
 	positiveStep := assembler.NewLabel()
 	continueLoop := assembler.NewLabel()
 	exitLoop := assembler.NewLabel()
+	safepointDispatch := assembler.NewLabel()
 
 	emitLoadLoopSlotAddress(assembler, amd64.RegR9, amd64.RegR8)
 	emitLoadNumberFromSlotAddress(assembler, amd64.RegR9, amd64.RegRAX, amd64.RegRCX, amd64.XMM0, errorPath)
@@ -198,11 +206,16 @@ func buildForLoopBuiltinBody() []byte {
 	assembler.AddRegImm32(amd64.RegR10, int32(value.TValueSize*3))
 	assembler.MoveMemXmm64(amd64.RegR10, 0, amd64.XMM0)
 	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, execCtxFlagAlternateResume)
+	emitJumpIfGCSafepointRequested(assembler, amd64.RegRAX, safepointDispatch)
 	emitReturnBuiltinContinuation(assembler, false)
 
 	_ = assembler.Bind(exitLoop)
 	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, 0)
 	emitReturnBuiltinContinuation(assembler, false)
+
+	_ = assembler.Bind(safepointDispatch)
+	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, execCtxFlagAlternateResume|execCtxFlagGCSafepointBoundary)
+	emitExitCurrentBuiltinToRuntime(assembler, false)
 
 	_ = assembler.Bind(errorPath)
 	emitExitBuiltinStatus(assembler, compiledStatusError, true)
@@ -210,6 +223,18 @@ func buildForLoopBuiltinBody() []byte {
 }
 
 func buildNewTableBuiltinBody() []byte {
+	assembler := amd64.NewAssembler(32)
+	emitExitCurrentBuiltinToRuntime(assembler, true)
+	return assembler.Buffer().Bytes()
+}
+
+func buildCloseBuiltinBody() []byte {
+	assembler := amd64.NewAssembler(32)
+	emitExitCurrentBuiltinToRuntime(assembler, true)
+	return assembler.Buffer().Bytes()
+}
+
+func buildClosureBuiltinBody() []byte {
 	assembler := amd64.NewAssembler(32)
 	emitExitCurrentBuiltinToRuntime(assembler, true)
 	return assembler.Buffer().Bytes()
@@ -390,6 +415,7 @@ func buildSetListBuiltinBody() []byte {
 	assembler.AddRegImm32(amd64.RegR8, 1)
 	assembler.MoveRegImm64(amd64.RegRSI, uint64(value.NilValue().Bits()))
 	assembler.XorRegReg(amd64.RegRDI, amd64.RegRDI)
+	emitJumpIfGCMarking(assembler, amd64.RegRAX, runtimeDispatch)
 
 	_ = assembler.Bind(writeLoop)
 	assembler.CmpRegImm32(amd64.RegRCX, 0)
@@ -560,6 +586,7 @@ func buildConcatBuiltinBody() []byte {
 func buildLuaCallBuiltinBody() []byte {
 	assembler := amd64.NewAssembler(4096)
 	runtimeDispatch := assembler.NewLabel()
+	safepointDispatch := assembler.NewLabel()
 	hostDispatch := assembler.NewLabel()
 	luaClosure := assembler.NewLabel()
 	openArgCount := assembler.NewLabel()
@@ -869,7 +896,12 @@ func buildLuaCallBuiltinBody() []byte {
 
 	_ = assembler.Bind(callDone)
 	emitRestoreCallerFrameFromScratch(assembler)
+	emitJumpIfGCSafepointRequested(assembler, amd64.RegRAX, safepointDispatch)
 	emitReturnBuiltinContinuation(assembler, true)
+
+	_ = assembler.Bind(safepointDispatch)
+	assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, execCtxFlagGCSafepointBoundary)
+	emitExitCurrentBuiltinToRuntime(assembler, false)
 
 	_ = assembler.Bind(callStub)
 	emitReturnNestedCallDispatch(assembler, execCtxFlagNestedCallPending, true, amd64.RegRDX)
@@ -1332,6 +1364,7 @@ func emitGenericStringKeySetFlow(assembler *amd64.Assembler, slotKind feedback.S
 	assembler.MoveRegMem64(amd64.RegR10, amd64.RegR9, rttable.EntryValueOffset)
 	assembler.CmpRegReg(amd64.RegR10, amd64.RegRDX)
 	assembler.Jcc(amd64.CondEqual, unsupportedDeopt)
+	emitJumpIfGCMarking(assembler, amd64.RegRAX, dispatchPath)
 	emitLoadBuiltinScratch64(assembler, amd64.RegR10, builtinScratchPayload0Offset)
 	assembler.MoveMemReg64(amd64.RegR9, rttable.EntryValueOffset, amd64.RegR10)
 	assembler.Jmp(foundEntry)
@@ -1866,6 +1899,20 @@ func emitStoreThreadCurrentFrame(assembler *amd64.Assembler, threadReg amd64.Reg
 func emitRestoreCallerSiteID(assembler *amd64.Assembler) {
 	emitLoadBuiltinScratch64(assembler, amd64.RegRAX, builtinScratchTableRefOffset)
 	assembler.MoveMemReg32(amd64.RegR11, execCtxSiteIDOffset, amd64.RegRAX)
+}
+
+func emitJumpIfGCMarking(assembler *amd64.Assembler, scratchReg amd64.Register, target *amd64.Label) {
+	assembler.MoveRegMem32(scratchReg, amd64.VMStateRegister, rtstate.VMStateFlagsOffset)
+	assembler.AndRegImm32(scratchReg, rtstate.VMFlagGCMarking)
+	assembler.CmpRegImm32(scratchReg, 0)
+	assembler.Jcc(amd64.CondNotEqual, target)
+}
+
+func emitJumpIfGCSafepointRequested(assembler *amd64.Assembler, scratchReg amd64.Register, target *amd64.Label) {
+	assembler.MoveRegMem32(scratchReg, amd64.VMStateRegister, rtstate.VMStateFlagsOffset)
+	assembler.AndRegImm32(scratchReg, rtstate.VMFlagGCSafepoint)
+	assembler.CmpRegImm32(scratchReg, 0)
+	assembler.Jcc(amd64.CondNotEqual, target)
 }
 
 func emitRestoreCallerFrameFromScratch(assembler *amd64.Assembler) {

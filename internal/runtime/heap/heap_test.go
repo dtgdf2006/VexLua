@@ -246,3 +246,127 @@ func TestHeapPublishedNativeAddressesSurviveGC(t *testing.T) {
 		t.Fatalf("published native address base mismatch after GC: address=%#x offset=%#x base=%#x", nativeAddress, uint64(alloc.Offset), base)
 	}
 }
+
+func TestHeapRecordsObjectAndPayloadSpanMetadata(t *testing.T) {
+	h := heap.MustNew(heap.DefaultHeapBase, 64)
+	objectAlloc, err := h.AllocObject(value.CommonHeader{Kind: value.KindTable, SizeBytes: value.CommonHeaderSize})
+	if err != nil {
+		t.Fatalf("alloc object: %v", err)
+	}
+	objectMeta, err := h.SpanMetadata(objectAlloc.Offset)
+	if err != nil {
+		t.Fatalf("object span metadata: %v", err)
+	}
+	if objectMeta.Kind != heap.SpanKindObject || objectMeta.State != heap.SpanStateLive || objectMeta.Layout != heap.PayloadLayoutNone {
+		t.Fatalf("unexpected object span metadata: %+v", objectMeta)
+	}
+	if objectMeta.Owner != 0 {
+		t.Fatalf("object span owner = %#x, want 0", uint64(objectMeta.Owner))
+	}
+	if objectMeta.Size != objectAlloc.Size || objectMeta.Address != objectAlloc.Address {
+		t.Fatalf("object span size/address mismatch: %+v alloc=%+v", objectMeta, objectAlloc)
+	}
+	payloadAlloc, err := h.AllocPayload(3*value.TValueSize, heap.PayloadLayoutTValueArray, objectAlloc.Offset)
+	if err != nil {
+		t.Fatalf("alloc payload: %v", err)
+	}
+	payloadMeta, err := h.SpanMetadata(payloadAlloc.Offset)
+	if err != nil {
+		t.Fatalf("payload span metadata: %v", err)
+	}
+	if payloadMeta.Kind != heap.SpanKindPayload || payloadMeta.State != heap.SpanStateLive || payloadMeta.Layout != heap.PayloadLayoutTValueArray {
+		t.Fatalf("unexpected payload span metadata: %+v", payloadMeta)
+	}
+	if payloadMeta.Owner != objectAlloc.Offset {
+		t.Fatalf("payload owner = %#x, want %#x", uint64(payloadMeta.Owner), uint64(objectAlloc.Offset))
+	}
+	if payloadMeta.Size != payloadAlloc.Size || payloadMeta.Address != payloadAlloc.Address {
+		t.Fatalf("payload span size/address mismatch: %+v alloc=%+v", payloadMeta, payloadAlloc)
+	}
+	targets := 0
+	if err := h.WalkSpans(func(offset value.HeapOff64, metadata heap.SpanMetadata) error {
+		if offset == objectAlloc.Offset || offset == payloadAlloc.Offset {
+			targets++
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk spans: %v", err)
+	}
+	if targets != 2 {
+		t.Fatalf("walk spans saw %d target spans, want 2", targets)
+	}
+}
+
+func TestHeapSetSpanOwnerRejectsNonObjectOwner(t *testing.T) {
+	h := heap.MustNew(heap.DefaultHeapBase, 64)
+	opaqueAlloc, err := h.Alloc(16)
+	if err != nil {
+		t.Fatalf("alloc opaque payload: %v", err)
+	}
+	typedPayload, err := h.AllocPayload(16, heap.PayloadLayoutHeapRefArray, 0)
+	if err != nil {
+		t.Fatalf("alloc typed payload: %v", err)
+	}
+	if err := h.SetSpanOwner(typedPayload.Offset, opaqueAlloc.Offset); err == nil {
+		t.Fatalf("expected non-object owner rejection")
+	}
+	objectAlloc, err := h.AllocObject(value.CommonHeader{Kind: value.KindProto, SizeBytes: value.CommonHeaderSize})
+	if err != nil {
+		t.Fatalf("alloc object owner: %v", err)
+	}
+	if err := h.SetSpanOwner(typedPayload.Offset, objectAlloc.Offset); err != nil {
+		t.Fatalf("set valid payload owner: %v", err)
+	}
+	meta, err := h.SpanMetadata(typedPayload.Offset)
+	if err != nil {
+		t.Fatalf("payload metadata after owner set: %v", err)
+	}
+	if meta.Owner != objectAlloc.Offset {
+		t.Fatalf("payload owner after set = %#x, want %#x", uint64(meta.Owner), uint64(objectAlloc.Offset))
+	}
+}
+
+func TestHeapTracksLiveBytesAndRearmsThreshold(t *testing.T) {
+	h := heap.MustNew(heap.DefaultHeapBase, 64)
+	if h.LiveBytes() != 0 {
+		t.Fatalf("initial live bytes = %d, want 0", h.LiveBytes())
+	}
+	first, err := h.AllocObject(value.CommonHeader{Kind: value.KindProto, SizeBytes: 0x20})
+	if err != nil {
+		t.Fatalf("alloc first object: %v", err)
+	}
+	if h.LiveBytes() != first.Size {
+		t.Fatalf("live bytes after first alloc = %d, want %d", h.LiveBytes(), first.Size)
+	}
+	payload, err := h.AllocPayload(24, heap.PayloadLayoutHeapRefArray, first.Offset)
+	if err != nil {
+		t.Fatalf("alloc payload: %v", err)
+	}
+	if h.LiveBytes() != first.Size+payload.Size {
+		t.Fatalf("live bytes after payload alloc = %d, want %d", h.LiveBytes(), first.Size+payload.Size)
+	}
+	if err := h.FreeSpan(payload.Offset); err != nil {
+		t.Fatalf("free payload: %v", err)
+	}
+	if h.LiveBytes() != first.Size {
+		t.Fatalf("live bytes after free = %d, want %d", h.LiveBytes(), first.Size)
+	}
+	h.SetGCThreshold(96)
+	h.RearmGCThreshold()
+	if h.NextGCTrigger() != h.LiveBytes()+96 {
+		t.Fatalf("next gc trigger = %d, want %d", h.NextGCTrigger(), h.LiveBytes()+96)
+	}
+	if h.GCTargetReached() {
+		t.Fatalf("gc target should not be reached below rearmed threshold")
+	}
+	second, err := h.Alloc(128)
+	if err != nil {
+		t.Fatalf("alloc second payload: %v", err)
+	}
+	if h.LiveBytes() != first.Size+second.Size {
+		t.Fatalf("live bytes after second alloc = %d, want %d", h.LiveBytes(), first.Size+second.Size)
+	}
+	if !h.GCTargetReached() {
+		t.Fatalf("gc target should be reached after crossing threshold")
+	}
+}

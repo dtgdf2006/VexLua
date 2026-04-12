@@ -103,6 +103,10 @@ func TestStubManagerInstallsNativeUpvalueAndLoopBodies(t *testing.T) {
 		"buildSetGlobalBuiltinBody()",
 		"buildSetTableBuiltinBody()",
 		"buildSetListBuiltinBody()",
+		"buildNewTableBuiltinBody()",
+		"buildConcatBuiltinBody()",
+		"buildCloseBuiltinBody()",
+		"buildClosureBuiltinBody()",
 		"buildGetUpvalueBuiltinBody()",
 		"buildSetUpvalueBuiltinBody()",
 		"buildForPrepBuiltinBody()",
@@ -111,6 +115,19 @@ func TestStubManagerInstallsNativeUpvalueAndLoopBodies(t *testing.T) {
 	for _, needle := range required {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("stub manager should install native builtin body %q", needle)
+		}
+	}
+}
+
+func TestCompilerRegistersAllocationBoundaryStubs(t *testing.T) {
+	source, err := os.ReadFile("compiler.go")
+	if err != nil {
+		t.Fatalf("read compiler.go: %v", err)
+	}
+	text := string(source)
+	for _, needle := range []string{"StubNewTable", "StubConcat", "StubClose", "StubClosure"} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("compiler should register allocation/builder stub %q", needle)
 		}
 	}
 }

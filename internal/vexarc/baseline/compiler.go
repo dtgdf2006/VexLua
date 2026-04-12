@@ -57,6 +57,10 @@ func NewCompiler(engine *interp.Engine, cache *codecache.Cache, manager *stubMan
 		stubs.StubSelf,
 		stubs.StubLen,
 		stubs.StubSetList,
+		stubs.StubNewTable,
+		stubs.StubConcat,
+		stubs.StubClose,
+		stubs.StubClosure,
 	} {
 		entry, err := manager.StubEntry(id)
 		if err != nil {
@@ -86,6 +90,15 @@ func (compiler *Compiler) Compile(proto *bytecode.Proto) (*CompiledCode, error) 
 		compiled.Supported = false
 		compiled.UnsupportedReason = err.Error()
 		return compiled, nil
+	}
+	liveSlots, err := analyzeLiveSlotSets(proto)
+	if err != nil {
+		return nil, err
+	}
+	for bytecodePC, liveSet := range liveSlots {
+		if err := state.metadata.RecordBytecodeLiveSlots(bytecodePC, liveSet); err != nil {
+			return nil, err
+		}
 	}
 	if err := state.previsit(); err != nil {
 		compiled.Supported = false
@@ -137,6 +150,9 @@ func (state *compileState) dispositionForInstruction(offset int, instruction byt
 	if state.isSetListExtraArgument(offset) {
 		return instructionDispositionPayload
 	}
+	if state.isClosureCapturePayload(offset) {
+		return instructionDispositionPayload
+	}
 	switch instruction.Opcode() {
 	case bytecode.OP_MOVE,
 		bytecode.OP_LOADK,
@@ -157,6 +173,10 @@ func (state *compileState) dispositionForInstruction(offset int, instruction byt
 		bytecode.OP_UNM,
 		bytecode.OP_NOT,
 		bytecode.OP_LEN,
+		bytecode.OP_NEWTABLE,
+		bytecode.OP_CONCAT,
+		bytecode.OP_CLOSE,
+		bytecode.OP_CLOSURE,
 		bytecode.OP_SETTABLE,
 		bytecode.OP_JMP,
 		bytecode.OP_EQ,
@@ -230,6 +250,9 @@ func (state *compileState) previsitInstruction(offset int, instruction bytecode.
 			return err
 		}
 		state.labelFor(target)
+	case bytecode.OP_CLOSURE:
+		_, err := state.closureResumePC(offset, instruction)
+		return err
 	case bytecode.OP_EQ, bytecode.OP_LT, bytecode.OP_LE, bytecode.OP_TEST, bytecode.OP_TESTSET, bytecode.OP_TFORLOOP:
 		target, err := state.testJumpTarget(offset, instruction.Opcode())
 		if err != nil {
@@ -343,6 +366,12 @@ func (state *compileState) emitInstruction(offset int, instruction bytecode.Inst
 		return state.emitNotInstruction(offset, instruction)
 	case bytecode.OP_LEN:
 		return state.emitLengthInstruction(offset, instruction)
+	case bytecode.OP_NEWTABLE:
+		return state.emitNewTableInstruction(offset, instruction)
+	case bytecode.OP_CONCAT:
+		return state.emitConcatInstruction(offset, instruction)
+	case bytecode.OP_CLOSURE:
+		return state.emitClosureInstruction(offset, instruction)
 	case bytecode.OP_SETTABLE:
 		slotIndex, err := state.feedbackSlotIndex(offset, feedback.SlotSetTable)
 		if err != nil {
@@ -365,6 +394,8 @@ func (state *compileState) emitInstruction(offset int, instruction bytecode.Inst
 		return state.emitReturnInstruction(offset, instruction)
 	case bytecode.OP_SETLIST:
 		return state.emitSetListInstruction(offset, instruction)
+	case bytecode.OP_CLOSE:
+		return state.emitCloseInstruction(offset, instruction)
 	case bytecode.OP_VARARG:
 		return state.emitVarargInstruction(offset, instruction)
 	case bytecode.OP_FORPREP:
@@ -409,6 +440,16 @@ func (state *compileState) emitNotInstruction(offset int, instruction bytecode.I
 
 func (state *compileState) emitLengthInstruction(offset int, instruction bytecode.Instruction) error {
 	state.emitLength(offset, instruction.A(), instruction.B())
+	return nil
+}
+
+func (state *compileState) emitNewTableInstruction(offset int, instruction bytecode.Instruction) error {
+	state.emitNewTable(offset, instruction.A(), floatByteToInt(instruction.B()), floatByteToInt(instruction.C()))
+	return nil
+}
+
+func (state *compileState) emitConcatInstruction(offset int, instruction bytecode.Instruction) error {
+	state.emitConcat(offset, instruction.A(), instruction.B(), instruction.C())
 	return nil
 }
 
@@ -570,12 +611,36 @@ func (state *compileState) emitForLoopInstruction(offset int, instruction byteco
 	return nil
 }
 
+func (state *compileState) emitCloseInstruction(offset int, instruction bytecode.Instruction) error {
+	state.emitClose(offset, instruction.A())
+	return nil
+}
+
+func (state *compileState) emitClosureInstruction(offset int, instruction bytecode.Instruction) error {
+	resumePC, err := state.closureResumePC(offset, instruction)
+	if err != nil {
+		return err
+	}
+	state.emitClosure(offset, instruction.A(), instruction.Bx(), resumePC)
+	return nil
+}
+
 func (state *compileState) emitUncoveredInstructionDeopt(bytecodePC int) {
 	siteID := state.recordContinuationSite(metadata.ContinuationDeopt, stubs.StubInvalid, bytecodePC, bytecodePC, -1, -1, 0, 0, 0, 0, metadata.ContinuationFlagDeoptOnUncovered)
 	state.emitDeoptExit(siteID)
 }
 
 func (state *compileState) recordContinuationSite(kind metadata.ContinuationKind, stubID stubs.ID, bytecodePC int, deoptPC int, resumePC int, altResumePC int, operand0 uint32, operand1 uint32, operand2 uint32, operand3 uint32, flags uint32) uint32 {
+	var liveSetID uint32 = metadata.NoLiveSlotSet
+	liveSlots := uint32(0)
+	if bytecodePC >= 0 {
+		if id, ok := state.metadata.LiveSlotSetID(bytecodePC); ok {
+			liveSetID = id
+		}
+		if liveSet, ok := state.metadata.LiveSlotSetAtBytecode(bytecodePC); ok {
+			liveSlots = liveSet.UpperBound(int(state.proto.MaxStackSize))
+		}
+	}
 	return state.metadata.AddContinuationSite(metadata.ContinuationSite{
 		Kind:        kind,
 		Flags:       flags,
@@ -588,7 +653,8 @@ func (state *compileState) recordContinuationSite(kind metadata.ContinuationKind
 		Operand1:    operand1,
 		Operand2:    operand2,
 		Operand3:    operand3,
-		LiveSlots:   uint32(maxInt(1, int(state.proto.MaxStackSize))),
+		LiveSetID:   liveSetID,
+		LiveSlots:   liveSlots,
 	})
 }
 
@@ -630,6 +696,25 @@ func (state *compileState) isSetListExtraArgument(offset int) bool {
 	}
 	previous := state.proto.Code[offset-1]
 	return previous.Opcode() == bytecode.OP_SETLIST && previous.C() == 0
+}
+
+func (state *compileState) isClosureCapturePayload(offset int) bool {
+	if state == nil || state.proto == nil || offset <= 0 || offset >= len(state.proto.Code) {
+		return false
+	}
+	for pc := offset - 1; pc >= 0; pc-- {
+		instruction := state.proto.Code[pc]
+		if instruction.Opcode() != bytecode.OP_CLOSURE {
+			continue
+		}
+		childIndex := instruction.Bx()
+		if childIndex < 0 || childIndex >= len(state.proto.Protos) {
+			return false
+		}
+		captureEnd := pc + 1 + int(state.proto.Protos[childIndex].NumUpvalues)
+		return offset < captureEnd
+	}
+	return false
 }
 
 func (state *compileState) testJumpTarget(offset int, opcode bytecode.Opcode) (int, error) {
@@ -746,6 +831,26 @@ func (state *compileState) emitSetList(bytecodePC int, a int, b int, block int, 
 	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubSetList], siteID, stubs.StubSetList, uint64(a), uint64(b), uint64(block), 0, 0)
 }
 
+func (state *compileState) emitNewTable(bytecodePC int, a int, arrayCap int, hashCap int) {
+	siteID := state.recordContinuationSite(metadata.ContinuationNewTable, stubs.StubNewTable, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(a), uint32(arrayCap), uint32(hashCap), 0, metadata.ContinuationFlagNativeBuiltinABI)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubNewTable], siteID, stubs.StubNewTable, uint64(a), uint64(arrayCap), uint64(hashCap), 0, 0)
+}
+
+func (state *compileState) emitConcat(bytecodePC int, a int, b int, c int) {
+	siteID := state.recordContinuationSite(metadata.ContinuationConcat, stubs.StubConcat, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(a), uint32(b), uint32(c), 0, metadata.ContinuationFlagNativeBuiltinABI)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubConcat], siteID, stubs.StubConcat, uint64(a), uint64(b), uint64(c), 0, 0)
+}
+
+func (state *compileState) emitClose(bytecodePC int, a int) {
+	siteID := state.recordContinuationSite(metadata.ContinuationClose, stubs.StubClose, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(a), 0, 0, 0, metadata.ContinuationFlagNativeBuiltinABI)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubClose], siteID, stubs.StubClose, uint64(a), 0, 0, 0, 0)
+}
+
+func (state *compileState) emitClosure(bytecodePC int, a int, childIndex int, resumePC int) {
+	siteID := state.recordContinuationSite(metadata.ContinuationClosure, stubs.StubClosure, bytecodePC, bytecodePC, resumePC, -1, uint32(a), uint32(childIndex), 0, 0, metadata.ContinuationFlagNativeBuiltinABI)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubClosure], siteID, stubs.StubClosure, uint64(a), uint64(childIndex), 0, 0, 0)
+}
+
 func (state *compileState) emitForPrep(bytecodePC int, a int, target int) {
 	deopt := state.assembler.NewLabel()
 	siteID := state.recordContinuationSite(metadata.ContinuationForPrep, stubs.StubForPrep, bytecodePC, bytecodePC, target, -1, uint32(a), uint32(target), 0, 0, metadata.ContinuationFlagNativeBuiltinABI)
@@ -767,6 +872,7 @@ func (state *compileState) emitForLoop(bytecodePC int, a int, resumePC int, targ
 	deopt := state.assembler.NewLabel()
 	positiveStep := state.assembler.NewLabel()
 	continueLoop := state.assembler.NewLabel()
+	safepoint := state.assembler.NewLabel()
 	done := state.assembler.NewLabel()
 	siteID := state.recordContinuationSite(metadata.ContinuationForLoop, stubs.StubForLoop, bytecodePC, bytecodePC, resumePC, target, uint32(a), uint32(resumePC), uint32(target), 0, metadata.ContinuationFlagAlternateResume|metadata.ContinuationFlagNativeBuiltinABI)
 
@@ -794,7 +900,14 @@ func (state *compileState) emitForLoop(bytecodePC int, a int, resumePC int, targ
 	_ = state.assembler.Bind(continueLoop)
 	state.assembler.MoveMemXmm64(amd64.RegR12, slotDisp(a+3), amd64.XMM0)
 	state.emitAdvanceTopForSlot(a + 3)
+	state.assembler.MoveMemImm32(amd64.RegR11, execCtxSiteIDOffset, siteID)
+	state.assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, execCtxFlagAlternateResume)
+	emitJumpIfGCSafepointRequested(state.assembler, amd64.RegRAX, safepoint)
 	state.assembler.Jmp(state.labelFor(target))
+
+	_ = state.assembler.Bind(safepoint)
+	state.assembler.MoveMemImm32(amd64.RegR11, execCtxFlagsOffset, execCtxFlagAlternateResume|execCtxFlagGCSafepointBoundary)
+	state.emitStatus(compiledStatusStub, uint32(stubs.StubForLoop))
 
 	_ = state.assembler.Bind(done)
 	state.assembler.Jmp(state.labelFor(resumePC))
@@ -817,6 +930,15 @@ func (state *compileState) emitLoadNumericLoopSlot(slot int, dst amd64.XMMRegist
 	state.assembler.MoveXmmMem64(dst, amd64.RegR12, slotDisp(slot))
 	state.assembler.UcomisdXmmXmm(dst, dst)
 	state.assembler.Jcc(amd64.CondParity, deopt)
+}
+
+func floatByteToInt(value int) int {
+	if value < 8 {
+		return value
+	}
+	e := (value >> 3) & 0x1F
+	m := value & 7
+	return (m + 8) << (e - 1)
 }
 
 func (state *compileState) emitDecodeHeapRefFromTValue(dst amd64.Register, src amd64.Register) {

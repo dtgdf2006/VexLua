@@ -37,21 +37,20 @@ func (store *Store) NewLuaClosure(proto *bytecode.Proto, env value.TValue, upval
 	if err != nil {
 		return Handle{}, err
 	}
-	var upvaluesOffset value.HeapOff64
+	object := NewObject(protoHandle.Value, env, uint16(len(upvalues)), 0)
+	allocation, err := store.heap.AllocObject(object.Common)
+	if err != nil {
+		return Handle{}, err
+	}
 	if len(upvalues) > 0 {
-		allocation, err := store.heap.Alloc(uint64(len(upvalues)) * 8)
+		upvalueAllocation, err := store.heap.AllocPayload(uint64(len(upvalues))*8, heap.PayloadLayoutHeapRefArray, allocation.Offset)
 		if err != nil {
 			return Handle{}, err
 		}
 		for index, ref := range upvalues {
-			binary.LittleEndian.PutUint64(allocation.Bytes[index*8:(index+1)*8], uint64(ref))
+			binary.LittleEndian.PutUint64(upvalueAllocation.Bytes[index*8:(index+1)*8], uint64(ref))
 		}
-		upvaluesOffset = allocation.Offset
-	}
-	object := NewObject(protoHandle.Value, env, uint16(len(upvalues)), upvaluesOffset)
-	allocation, err := store.heap.AllocObject(object.Common)
-	if err != nil {
-		return Handle{}, err
+		object.UpvaluesData = upvalueAllocation.Offset
 	}
 	if err := WriteObject(allocation.Bytes, object); err != nil {
 		return Handle{}, err
@@ -97,6 +96,25 @@ func (store *Store) Env(ref value.HeapRef44) (value.TValue, error) {
 		return value.NilValue(), err
 	}
 	return object.Env, nil
+}
+
+func (store *Store) SetEnv(ref value.HeapRef44, env value.TValue) error {
+	offset, objectBytes, err := store.objectBytes(ref)
+	if err != nil {
+		return err
+	}
+	object, err := ReadObject(objectBytes)
+	if err != nil {
+		return err
+	}
+	if object.Env.Bits() == env.Bits() {
+		return nil
+	}
+	object.Env = env
+	if err := WriteObject(objectBytes, object); err != nil {
+		return err
+	}
+	return store.heap.WriteBarrierValueByOffset(offset, env)
 }
 
 func (store *Store) UpvalueBase(ref value.HeapRef44) (uintptr, error) {
@@ -151,7 +169,7 @@ func (store *Store) EnsureFeedbackVector(ref value.HeapRef44, layout *feedback.L
 	if layout == nil || layout.SlotCount() == 0 {
 		return 0, nil
 	}
-	_, objectBytes, err := store.objectBytes(ref)
+	offset, objectBytes, err := store.objectBytes(ref)
 	if err != nil {
 		return 0, err
 	}
@@ -165,7 +183,7 @@ func (store *Store) EnsureFeedbackVector(ref value.HeapRef44, layout *feedback.L
 		}
 		return store.heap.NativeAddressForOffset(object.FeedbackData)
 	}
-	vector, err := store.heap.Alloc(feedback.VectorSize(layout.SlotCount()))
+	vector, err := store.heap.AllocPayload(feedback.VectorSize(layout.SlotCount()), heap.PayloadLayoutFeedbackVector, offset)
 	if err != nil {
 		return 0, err
 	}
@@ -246,7 +264,11 @@ func (store *Store) ReadFeedbackCell(ref value.HeapRef44, slot uint32) (feedback
 }
 
 func (store *Store) WriteFeedbackCell(ref value.HeapRef44, slot uint32, cell feedback.Cell) error {
-	object, err := store.Object(ref)
+	offset, objectBytes, err := store.objectBytes(ref)
+	if err != nil {
+		return err
+	}
+	object, err := ReadObject(objectBytes)
 	if err != nil {
 		return err
 	}
@@ -264,7 +286,7 @@ func (store *Store) WriteFeedbackCell(ref value.HeapRef44, slot uint32, cell fee
 	if err := feedback.WriteCell(bytes, cell); err != nil {
 		return err
 	}
-	return nil
+	return store.heap.RememberWeakOwnerByOffset(offset)
 }
 
 func (store *Store) objectBytes(ref value.HeapRef44) (value.HeapOff64, []byte, error) {

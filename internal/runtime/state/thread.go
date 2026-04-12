@@ -32,15 +32,16 @@ type FrameSpec struct {
 }
 
 type VMState struct {
-	Heap         *heap.Heap
-	HeapBase     uintptr
-	nextThreadID uint64
-	threads      []*ThreadState
-	threadByID   map[uint64]*ThreadState
-	nativeArena  []byte
-	nativeHeader *VMStateHeader
-	pinner       runtime.Pinner
-	closed       bool
+	Heap          *heap.Heap
+	HeapBase      uintptr
+	nextThreadID  uint64
+	threads       []*ThreadState
+	threadByID    map[uint64]*ThreadState
+	externalRoots *ExternalRootTable
+	nativeArena   []byte
+	nativeHeader  *VMStateHeader
+	pinner        runtime.Pinner
+	closed        bool
 }
 
 type ThreadState struct {
@@ -67,12 +68,13 @@ func NewVMState(runtimeHeap *heap.Heap) *VMState {
 	header := (*VMStateHeader)(nativePtr)
 	*header = VMStateHeader{HeapBase: uint64(runtimeHeap.Base())}
 	vm := &VMState{
-		Heap:         runtimeHeap,
-		HeapBase:     runtimeHeap.Base(),
-		nextThreadID: 1,
-		threadByID:   make(map[uint64]*ThreadState),
-		nativeArena:  nativeArena,
-		nativeHeader: header,
+		Heap:          runtimeHeap,
+		HeapBase:      runtimeHeap.Base(),
+		nextThreadID:  1,
+		threadByID:    make(map[uint64]*ThreadState),
+		externalRoots: NewExternalRootTable(),
+		nativeArena:   nativeArena,
+		nativeHeader:  header,
 	}
 	vm.pinner.Pin(&vm.nativeArena[0])
 	runtime.SetFinalizer(vm, (*VMState).Close)
@@ -134,6 +136,10 @@ func (vm *VMState) Close() {
 	}
 	vm.threads = nil
 	vm.threadByID = nil
+	if vm.externalRoots != nil {
+		vm.externalRoots.Clear()
+	}
+	vm.externalRoots = nil
 	vm.nativeHeader = nil
 	vm.nativeArena = nil
 	vm.pinner.Unpin()
@@ -171,6 +177,20 @@ func (vm *VMState) ThreadByID(id uint64) *ThreadState {
 		return nil
 	}
 	return vm.threadByID[id]
+}
+
+func (vm *VMState) Threads() []*ThreadState {
+	if vm == nil {
+		return nil
+	}
+	return append([]*ThreadState(nil), vm.threads...)
+}
+
+func (vm *VMState) ExternalRoots() *ExternalRootTable {
+	if vm == nil {
+		return nil
+	}
+	return vm.externalRoots
 }
 
 func (thread *ThreadState) StackSlots() uint32 {

@@ -55,6 +55,7 @@ const (
 	FrameFlagPendingError
 	FrameFlagDeoptRequested
 	FrameFlagHostBoundary
+	FrameFlagCompiled
 )
 
 type CallFrameHeader struct {

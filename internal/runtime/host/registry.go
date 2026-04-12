@@ -296,6 +296,31 @@ func (registry *Registry) Release(handle Handle) error {
 	return nil
 }
 
+func (registry *Registry) WalkDescriptorRefs(visit func(value.HeapRef44) error) error {
+	if registry == nil || visit == nil {
+		return nil
+	}
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	for _, entry := range registry.entries {
+		if entry == nil || entry.nativeMeta == 0 {
+			continue
+		}
+		address, err := registry.heap.AddressForOffset(entry.nativeMeta)
+		if err != nil {
+			return err
+		}
+		ref, err := registry.heap.EncodeHeapRef(address)
+		if err != nil {
+			return err
+		}
+		if err := visit(ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (registry *Registry) allocEntryLocked(target any, descriptor *Descriptor, kind DescriptorKind, arity uint16, flags DescriptorFlags) (Handle, error) {
 	handle := registry.nextHandle
 	registry.nextHandle++
@@ -343,7 +368,7 @@ func (registry *Registry) ReadNativeDescriptor(offset value.HeapOff64) (NativeDe
 }
 
 func (registry *Registry) RefreshWrapper(ref value.HeapRef44) (WrapperHeader, error) {
-	header, bytes, err := registry.readAnyWrapperBytes(ref)
+	header, offset, bytes, err := registry.readAnyWrapperBytes(ref)
 	if err != nil {
 		return WrapperHeader{}, err
 	}
@@ -374,6 +399,25 @@ func (registry *Registry) RefreshWrapper(ref value.HeapRef44) (WrapperHeader, er
 	header.DescriptorVersion = native.DescriptorVersion
 	header.Flags = expectedFlags
 	if err := writeWrapperHeader(bytes, header); err != nil {
+		return WrapperHeader{}, err
+	}
+	_ = offset
+	return header, nil
+}
+
+func (registry *Registry) SetWrapperEnv(ref value.HeapRef44, env value.TValue) (WrapperHeader, error) {
+	header, offset, bytes, err := registry.readAnyWrapperBytes(ref)
+	if err != nil {
+		return WrapperHeader{}, err
+	}
+	if header.Env.Bits() == env.Bits() {
+		return header, nil
+	}
+	header.Env = env
+	if err := writeWrapperHeader(bytes, header); err != nil {
+		return WrapperHeader{}, err
+	}
+	if err := registry.heap.WriteBarrierValueByOffset(offset, env); err != nil {
 		return WrapperHeader{}, err
 	}
 	return header, nil
@@ -452,32 +496,32 @@ func (registry *Registry) readWrapper(ref value.HeapRef44, expectedKind value.Ob
 	return readWrapperHeader(bytes, expectedKind, expectedSize)
 }
 
-func (registry *Registry) readAnyWrapperBytes(ref value.HeapRef44) (WrapperHeader, []byte, error) {
+func (registry *Registry) readAnyWrapperBytes(ref value.HeapRef44) (WrapperHeader, value.HeapOff64, []byte, error) {
 	address, err := registry.heap.DecodeHeapRef(ref)
 	if err != nil {
-		return WrapperHeader{}, nil, err
+		return WrapperHeader{}, 0, nil, err
 	}
 	offset, err := registry.heap.OffsetForAddress(address)
 	if err != nil {
-		return WrapperHeader{}, nil, err
+		return WrapperHeader{}, 0, nil, err
 	}
 	bytes, err := registry.heap.Resolve(offset, hostObjectSize)
 	if err != nil {
-		return WrapperHeader{}, nil, err
+		return WrapperHeader{}, 0, nil, err
 	}
 	common, err := value.ReadCommonHeader(bytes)
 	if err != nil {
-		return WrapperHeader{}, nil, err
+		return WrapperHeader{}, 0, nil, err
 	}
 	switch common.Kind {
 	case value.KindHostObject:
 		header, err := readWrapperHeader(bytes, value.KindHostObject, hostObjectSize)
-		return header, bytes, err
+		return header, offset, bytes, err
 	case value.KindHostFunction:
 		header, err := readWrapperHeader(bytes, value.KindHostFunction, hostFunctionSize)
-		return header, bytes, err
+		return header, offset, bytes, err
 	default:
-		return WrapperHeader{}, nil, fmt.Errorf("expected host wrapper, got %s", common.Kind)
+		return WrapperHeader{}, 0, nil, fmt.Errorf("expected host wrapper, got %s", common.Kind)
 	}
 }
 

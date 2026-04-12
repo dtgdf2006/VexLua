@@ -82,6 +82,46 @@ func (table *InternTable) Lookup(text string) (Handle, bool, error) {
 	return handle, true, nil
 }
 
+func (table *InternTable) WalkRefs(visit func(value.HeapRef44) error) error {
+	if table == nil || visit == nil {
+		return nil
+	}
+	for _, ref := range table.refs {
+		if ref == 0 {
+			continue
+		}
+		if err := visit(ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (table *InternTable) SweepDead(isDead func(value.HeapRef44) (bool, error)) (int, error) {
+	if table == nil {
+		return 0, nil
+	}
+	if isDead == nil {
+		return 0, fmt.Errorf("dead predicate cannot be nil")
+	}
+	removed := 0
+	for text, ref := range table.refs {
+		dead, err := isDead(ref)
+		if err != nil {
+			return removed, err
+		}
+		if !dead {
+			continue
+		}
+		delete(table.refs, text)
+		if table.count > 0 {
+			table.count--
+		}
+		removed++
+	}
+	return removed, nil
+}
+
 func (table *InternTable) Header(ref value.HeapRef44) (Header, error) {
 	header, _, err := HeaderAt(table.heap, ref)
 	return header, err

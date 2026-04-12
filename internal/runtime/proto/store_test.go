@@ -471,3 +471,53 @@ func TestStoreBuildsNativeProtoPayload(t *testing.T) {
 		t.Fatalf("proto capture-descriptor bytes base %#x, want %#x", uintptr(unsafe.Pointer(&captureBytes[0])), nativeCaptureAddress)
 	}
 }
+
+func TestStoreRepairsStaleCachedProtoRefs(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	store := NewStore(runtimeHeap)
+	protoValue := &bytecode.Proto{
+		Source:       "stale-proto",
+		MaxStackSize: 1,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 1, 0),
+		},
+	}
+	handle, err := store.Intern(protoValue)
+	if err != nil {
+		t.Fatalf("intern proto: %v", err)
+	}
+	address, err := runtimeHeap.DecodeHeapRef(handle.Ref)
+	if err != nil {
+		t.Fatalf("decode proto ref: %v", err)
+	}
+	offset, err := runtimeHeap.OffsetForAddress(address)
+	if err != nil {
+		t.Fatalf("proto offset: %v", err)
+	}
+	if err := runtimeHeap.FreeSpan(offset); err != nil {
+		t.Fatalf("free proto span: %v", err)
+	}
+	if _, err := store.Resolve(handle.Ref); err == nil {
+		t.Fatalf("stale proto ref should not resolve after span free")
+	}
+	if _, ok := store.byProto[protoValue]; ok {
+		t.Fatalf("stale byProto entry should be pruned")
+	}
+	if _, ok := store.byRef[handle.Ref]; ok {
+		t.Fatalf("stale byRef entry should be pruned")
+	}
+	repaired, err := store.Intern(protoValue)
+	if err != nil {
+		t.Fatalf("re-intern proto after prune: %v", err)
+	}
+	resolved, err := store.Resolve(repaired.Ref)
+	if err != nil {
+		t.Fatalf("resolve repaired proto ref: %v", err)
+	}
+	if resolved != protoValue {
+		t.Fatalf("resolved proto pointer %p, want %p", resolved, protoValue)
+	}
+	if _, err := runtimeHeap.DecodeHeapRef(repaired.Ref); err != nil {
+		t.Fatalf("repaired proto ref should decode to a live object: %v", err)
+	}
+}
