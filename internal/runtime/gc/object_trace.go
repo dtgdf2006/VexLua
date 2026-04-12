@@ -224,7 +224,7 @@ func (tracer *Tracer) traceTable(tableRef value.HeapRef44, bytes []byte, visitSt
 		for index := uint32(0); index < object.ArrayCap; index++ {
 			slotValue := readTValue(arrayBytes[index*value.TValueSize : (index+1)*value.TValueSize])
 			if object.Flags.Has(rttable.FlagWeakValues) {
-				if err := visitWeakTValue(slotValue, WeakRef{Kind: WeakRefWeakTableValue, Owner: tableRef, Slot: index}, visitWeak); err != nil {
+				if err := visitWeakTableTValue(slotValue, WeakRef{Kind: WeakRefWeakTableValue, Owner: tableRef, Slot: index}, visitStrong, visitWeak); err != nil {
 					return err
 				}
 				continue
@@ -255,14 +255,14 @@ func (tracer *Tracer) traceTable(tableRef value.HeapRef44, bytes []byte, visitSt
 			return err
 		}
 		if object.Flags.Has(rttable.FlagWeakKeys) {
-			if err := visitWeakTValue(entry.Key, WeakRef{Kind: WeakRefWeakTableKey, Owner: tableRef, Slot: slot}, visitWeak); err != nil {
+			if err := visitWeakTableTValue(entry.Key, WeakRef{Kind: WeakRefWeakTableKey, Owner: tableRef, Slot: slot}, visitStrong, visitWeak); err != nil {
 				return err
 			}
 		} else if err := visitStrongTValue(entry.Key, visitStrong); err != nil {
 			return err
 		}
 		if object.Flags.Has(rttable.FlagWeakValues) {
-			if err := visitWeakTValue(entry.Value, WeakRef{Kind: WeakRefWeakTableValue, Owner: tableRef, Slot: slot}, visitWeak); err != nil {
+			if err := visitWeakTableTValue(entry.Value, WeakRef{Kind: WeakRefWeakTableValue, Owner: tableRef, Slot: slot}, visitStrong, visitWeak); err != nil {
 				return err
 			}
 		} else if err := visitStrongTValue(entry.Value, visitStrong); err != nil {
@@ -467,6 +467,13 @@ func visitWeakTValue(slotValue value.TValue, base WeakRef, visitWeak WeakVisitFu
 	}
 	base.Target = ref
 	return visitWeak(base)
+}
+
+func visitWeakTableTValue(slotValue value.TValue, base WeakRef, visitStrong VisitFunc, visitWeak WeakVisitFunc) error {
+	if slotValue.IsBoxedTag(value.TagStringRef) {
+		return visitStrongTValue(slotValue, visitStrong)
+	}
+	return visitWeakTValue(slotValue, base, visitWeak)
 }
 
 func tvalueDead(slotValue value.TValue, isDead func(value.HeapRef44) bool) (bool, error) {

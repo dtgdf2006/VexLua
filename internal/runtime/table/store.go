@@ -170,7 +170,7 @@ func (store *Store) SetListArray(tableRef value.HeapRef44, startIndex uint32, va
 		if err := store.writeArraySlot(object, arrayIndex, slotValue); err != nil {
 			return false, err
 		}
-		if object.Flags&FlagWeakValues == 0 {
+		if object.Flags&FlagWeakValues == 0 || weakTableStringUsesStrongBarrier(slotValue) {
 			if err := store.heap.WriteBarrierValueByOffset(offset, slotValue); err != nil {
 				return false, err
 			}
@@ -323,7 +323,7 @@ func (store *Store) setArrayValue(owner value.HeapOff64, object Object, index ui
 	if err := store.writeArraySlot(object, index, newValue); err != nil {
 		return Object{}, err
 	}
-	if object.Flags&FlagWeakValues == 0 {
+	if object.Flags&FlagWeakValues == 0 || weakTableStringUsesStrongBarrier(newValue) {
 		if err := store.heap.WriteBarrierValueByOffset(owner, newValue); err != nil {
 			return Object{}, err
 		}
@@ -390,7 +390,7 @@ func (store *Store) setHashValue(owner value.HeapOff64, object Object, key value
 		if err := store.writeEntryAt(entries, slot, entry); err != nil {
 			return Object{}, err
 		}
-		if object.Flags&FlagWeakValues == 0 {
+		if object.Flags&FlagWeakValues == 0 || weakTableStringUsesStrongBarrier(newValue) {
 			if err := store.heap.WriteBarrierValueByOffset(owner, newValue); err != nil {
 				return Object{}, err
 			}
@@ -415,12 +415,12 @@ func (store *Store) setHashValue(owner value.HeapOff64, object Object, key value
 	}); err != nil {
 		return Object{}, err
 	}
-	if object.Flags&FlagWeakKeys == 0 {
+	if object.Flags&FlagWeakKeys == 0 || weakTableStringUsesStrongBarrier(key) {
 		if err := store.heap.WriteBarrierValueByOffset(owner, key); err != nil {
 			return Object{}, err
 		}
 	}
-	if object.Flags&FlagWeakValues == 0 {
+	if object.Flags&FlagWeakValues == 0 || weakTableStringUsesStrongBarrier(newValue) {
 		if err := store.heap.WriteBarrierValueByOffset(owner, newValue); err != nil {
 			return Object{}, err
 		}
@@ -757,6 +757,10 @@ func shouldUseArrayPath(currentCap uint32, index uint32, newValue value.TValue) 
 		return true
 	}
 	return index <= currentCap*2
+}
+
+func weakTableStringUsesStrongBarrier(slotValue value.TValue) bool {
+	return slotValue.IsBoxedTag(value.TagStringRef)
 }
 
 func normalizeHashCapacity(capacity uint32) uint32 {

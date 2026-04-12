@@ -247,6 +247,10 @@ func (heap *Heap) WeakQueueSnapshot() []value.HeapRef44 {
 	return cloneRefs(heap, func(controller *GCController) []value.HeapRef44 { return controller.weak })
 }
 
+func (heap *Heap) DrainWeakQueue() []value.HeapRef44 {
+	return drainRefs(heap, func(controller *GCController) *[]value.HeapRef44 { return &controller.weak })
+}
+
 func (heap *Heap) FinalizeQueueSnapshot() []value.HeapRef44 {
 	return cloneRefs(heap, func(controller *GCController) []value.HeapRef44 { return controller.finalize })
 }
@@ -309,7 +313,7 @@ func (heap *Heap) RememberWeakOwnerByOffset(offset value.HeapOff64) error {
 }
 
 func (heap *Heap) writeBarrier(parentOffset value.HeapOff64, parentRef value.HeapRef44, childRef value.HeapRef44) error {
-	if heap == nil || heap.gc == nil || heap.gc.phase != GCPhaseMark {
+	if heap == nil || heap.gc == nil || (heap.gc.phase != GCPhaseMark && heap.gc.phase != GCPhaseAtomic) {
 		return nil
 	}
 	parentHeader, err := heap.HeaderAtOffset(parentOffset)

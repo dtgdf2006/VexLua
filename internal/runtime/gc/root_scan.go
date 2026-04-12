@@ -265,6 +265,13 @@ func (scanner *Scanner) walkOpenUpvalues(thread *state.ThreadState, visit VisitF
 		if object.State != upvalue.StateOpen {
 			return fmt.Errorf("thread open upvalue list contains state %d", object.State)
 		}
+		slotValue, err := thread.ValueAtAddress(uintptr(object.SlotAddress))
+		if err != nil {
+			return err
+		}
+		if err := visitTValue(slotValue, visit); err != nil {
+			return err
+		}
 		current = object.NextOpen
 	}
 	return nil

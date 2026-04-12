@@ -39,6 +39,8 @@ type Collector struct {
 	sweepCursor    int
 	sweepLimit     int
 	sweeping       bool
+	sweepPayloads  map[value.HeapOff64][]value.HeapOff64
+	sweepPending   map[value.HeapOff64]struct{}
 	sweepDeadWhite value.MarkBits
 	sweepNextWhite value.MarkBits
 	sweepStats     SweepStats
@@ -73,6 +75,7 @@ func NewCollector(runtimeHeap *heap.Heap, hosts *host.Registry, config Config) *
 	}
 	if config.CompiledRuntime != nil {
 		collector.scanner.BindCompiledRuntime(config.CompiledRuntime)
+		collector.defaultRoots = append(collector.defaultRoots, CompiledMetadataRoots(config.CompiledRuntime))
 	}
 	return collector
 }
@@ -388,9 +391,58 @@ func (collector *Collector) resetSweepState() {
 	collector.sweepCursor = 0
 	collector.sweepLimit = 0
 	collector.sweeping = false
+	collector.sweepPayloads = nil
+	collector.sweepPending = nil
 	collector.sweepDeadWhite = 0
 	collector.sweepNextWhite = 0
 	collector.sweepStats = SweepStats{}
+}
+
+func (collector *Collector) snapshotSweepPayloads() error {
+	collector.sweepPayloads = nil
+	collector.sweepPending = nil
+	return collector.heap.WalkSpans(func(offset value.HeapOff64, metadata heap.SpanMetadata) error {
+		if metadata.State != heap.SpanStateLive || metadata.Kind != heap.SpanKindPayload || metadata.Owner == 0 {
+			return nil
+		}
+		if collector.sweepPayloads == nil {
+			collector.sweepPayloads = make(map[value.HeapOff64][]value.HeapOff64)
+		}
+		collector.sweepPayloads[metadata.Owner] = append(collector.sweepPayloads[metadata.Owner], offset)
+		return nil
+	})
+}
+
+func (collector *Collector) markSweepPayloads(owner value.HeapOff64) {
+	if collector == nil || owner == 0 || collector.sweepPayloads == nil {
+		return
+	}
+	offsets := collector.sweepPayloads[owner]
+	if len(offsets) == 0 {
+		return
+	}
+	if collector.sweepPending == nil {
+		collector.sweepPending = make(map[value.HeapOff64]struct{}, len(offsets))
+	}
+	for _, offset := range offsets {
+		collector.sweepPending[offset] = struct{}{}
+	}
+	delete(collector.sweepPayloads, owner)
+}
+
+func (collector *Collector) sweepPayloadMarked(offset value.HeapOff64) bool {
+	if collector == nil || collector.sweepPending == nil {
+		return false
+	}
+	_, ok := collector.sweepPending[offset]
+	return ok
+}
+
+func (collector *Collector) clearSweepPayload(offset value.HeapOff64) {
+	if collector == nil || collector.sweepPending == nil {
+		return
+	}
+	delete(collector.sweepPending, offset)
 }
 
 func (collector *Collector) beginPreparePhase() {
@@ -511,6 +563,11 @@ func (collector *Collector) isDeadWithWhite(deadWhite value.MarkBits, ref value.
 	return header.Mark.Has(deadWhite), nil
 }
 
+func (collector *Collector) isDeadOrStale(deadWhite value.MarkBits, ref value.HeapRef44) bool {
+	dead, err := collector.isDeadWithWhite(deadWhite, ref)
+	return err != nil || dead
+}
+
 func normalizeCycleMark(mark value.MarkBits, currentWhite value.MarkBits) value.MarkBits {
 	return mark.Without(value.MarkWhite0 | value.MarkWhite1 | value.MarkGray | value.MarkBlack | value.MarkRemembered).With(currentWhite)
 }
@@ -526,7 +583,7 @@ func (collector *Collector) scrubWeakEdges(deadWhite value.MarkBits) (SweepStats
 	stats := SweepStats{}
 	feedbackOwners := make(map[value.HeapRef44]struct{})
 	weakTableOwners := make(map[value.HeapRef44]struct{})
-	for _, owner := range collector.heap.WeakQueueSnapshot() {
+	for _, owner := range collector.heap.DrainWeakQueue() {
 		if owner == 0 {
 			continue
 		}
@@ -555,8 +612,7 @@ func (collector *Collector) scrubWeakEdges(deadWhite value.MarkBits) (SweepStats
 	}
 	for tableRef := range weakTableOwners {
 		removed, err := collector.tracer.ScrubDeadWeakTableEntries(tableRef, func(ref value.HeapRef44) bool {
-			dead, _ := collector.isDeadWithWhite(deadWhite, ref)
-			return dead
+			return collector.isDeadOrStale(deadWhite, ref)
 		})
 		if err != nil {
 			return SweepStats{}, err
@@ -565,8 +621,7 @@ func (collector *Collector) scrubWeakEdges(deadWhite value.MarkBits) (SweepStats
 	}
 	for closureRef := range feedbackOwners {
 		scrubbed, err := collector.tracer.ScrubDeadFeedbackCells(closureRef, func(ref value.HeapRef44) bool {
-			dead, _ := collector.isDeadWithWhite(deadWhite, ref)
-			return dead
+			return collector.isDeadOrStale(deadWhite, ref)
 		})
 		if err != nil {
 			return SweepStats{}, err
@@ -582,6 +637,10 @@ func (collector *Collector) beginSweepPhase() error {
 	if err != nil {
 		return err
 	}
+	if err := collector.snapshotSweepPayloads(); err != nil {
+		return err
+	}
+	collector.clearWeakRefs()
 	collector.sweepCursor = 0
 	collector.sweepLimit = collector.heap.SpanCount()
 	collector.sweeping = true
@@ -606,6 +665,14 @@ func (collector *Collector) sweepSpansStep(budget uint64) (bool, error) {
 		}
 		switch metadata.Kind {
 		case heap.SpanKindPayload:
+			if collector.sweepPayloadMarked(offset) {
+				collector.clearSweepPayload(offset)
+				if err := collector.heap.FreeSpan(offset); err != nil {
+					return err
+				}
+				collector.sweepStats.FreedPayloads++
+				return nil
+			}
 			if metadata.Owner == 0 {
 				return nil
 			}
@@ -630,6 +697,7 @@ func (collector *Collector) sweepSpansStep(budget uint64) (bool, error) {
 				return collector.heap.WriteHeader(offset, header)
 			}
 			if header.Mark.Has(collector.sweepDeadWhite) {
+				collector.markSweepPayloads(offset)
 				if header.Kind == value.KindHostObject || header.Kind == value.KindHostFunction {
 					if err := collector.finalizeHostWrapper(offset); err != nil {
 						return err
@@ -649,6 +717,12 @@ func (collector *Collector) sweepSpansStep(budget uint64) (bool, error) {
 	})
 	collector.sweepCursor = next
 	if done {
+		lateStats, lateErr := collector.scrubWeakEdges(collector.sweepDeadWhite)
+		if lateErr != nil {
+			return false, lateErr
+		}
+		collector.sweepStats.ScrubbedFeedbackCells += lateStats.ScrubbedFeedbackCells
+		collector.sweepStats.ClearedWeakTableEdges += lateStats.ClearedWeakTableEdges
 		collector.sweeping = false
 	}
 	return done, err

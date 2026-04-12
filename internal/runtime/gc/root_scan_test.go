@@ -116,6 +116,69 @@ func TestScannerWalksThreadFrameAndOpenUpvalueRoots(t *testing.T) {
 	}
 }
 
+func TestScannerOpenUpvalueKeepsOutOfTopSlotAlive(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	strings := rtstring.NewInternTable(runtimeHeap, 0xCAFEBABE)
+	protos := rproto.NewStore(runtimeHeap)
+	vm := state.NewVMState(runtimeHeap)
+	thread, err := vm.NewThread(16, 4)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	upvalues := upvalue.NewManager(runtimeHeap, vm)
+	closures := closure.NewStore(runtimeHeap, protos)
+
+	protoObject := &bytecode.Proto{MaxStackSize: 2}
+	protoHandle, err := protos.Intern(protoObject)
+	if err != nil {
+		t.Fatalf("intern proto: %v", err)
+	}
+	closureHandle, err := closures.NewLuaClosure(protoObject, value.NilValue(), nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	capturedRoot := mustIntern(t, strings, "captured-out-of-top-root")
+	hiddenRegister := mustIntern(t, strings, "uncaptured-out-of-top-root")
+	frame, err := thread.PushFrame(state.FrameSpec{
+		Closure:       closureHandle.Value,
+		Proto:         protoHandle.Value,
+		RegisterBase:  0,
+		RegisterCount: 2,
+		Top:           0,
+	})
+	if err != nil {
+		t.Fatalf("push frame: %v", err)
+	}
+	if err := thread.SetRegister(frame, 0, hiddenRegister.Value); err != nil {
+		t.Fatalf("set hidden register: %v", err)
+	}
+	if err := thread.SetRegister(frame, 1, capturedRoot.Value); err != nil {
+		t.Fatalf("set captured register: %v", err)
+	}
+	upvalueAddress, err := frame.RegisterAddress(1)
+	if err != nil {
+		t.Fatalf("register address: %v", err)
+	}
+	openHandle, err := upvalues.FindOrCreateOpen(thread, upvalueAddress)
+	if err != nil {
+		t.Fatalf("open upvalue: %v", err)
+	}
+
+	scanner := NewScanner(runtimeHeap)
+	visited := collectRoots(t, func(visit VisitFunc) error {
+		return scanner.WalkVMState(vm, visit)
+	})
+
+	for _, ref := range []value.HeapRef44{closureHandle.Ref, protoHandle.Ref, openHandle.Ref, capturedRoot.Ref} {
+		if _, ok := visited[ref]; !ok {
+			t.Fatalf("missing root %#x", uint64(ref))
+		}
+	}
+	if _, ok := visited[hiddenRegister.Ref]; ok {
+		t.Fatalf("unexpected uncaptured root %#x", uint64(hiddenRegister.Ref))
+	}
+}
+
 func TestScannerWalksStoreAndExternalRoots(t *testing.T) {
 	runtimeHeap := heap.MustNew(0, 0)
 	strings := rtstring.NewInternTable(runtimeHeap, 0x87654321)
@@ -300,14 +363,74 @@ func TestScannerUsesCompiledSafepointLiveSlots(t *testing.T) {
 	visited := collectRoots(t, func(visit VisitFunc) error {
 		return scanner.WalkThread(thread, visit)
 	})
-	for _, ref := range []value.HeapRef44{closureHandle.Ref, protoHandle.Ref, liveRoot.Ref} {
+	for _, ref := range []value.HeapRef44{closureHandle.Ref, protoHandle.Ref, liveRoot.Ref, deadSpill.Ref} {
 		if _, ok := visited[ref]; !ok {
 			t.Fatalf("missing compiled safepoint root %#x", uint64(ref))
 		}
 	}
-	for _, ref := range []value.HeapRef44{deadRoot1.Ref, deadRoot2.Ref, deadRoot3.Ref, deadSpill.Ref} {
+	for _, ref := range []value.HeapRef44{deadRoot1.Ref, deadRoot2.Ref, deadRoot3.Ref} {
 		if _, ok := visited[ref]; ok {
 			t.Fatalf("unexpected compiled safepoint root %#x", uint64(ref))
+		}
+	}
+}
+
+func TestScannerUsesCompiledFrameSpillRoots(t *testing.T) {
+	engine := interp.New()
+	runtime := baseline.NewRuntime(engine)
+	thread, err := engine.NewThread(16, 4)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@compiled-spill-root.lua",
+		MaxStackSize: 1,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 1, 0),
+		},
+	}
+	protoHandle, err := engine.Protos.Intern(proto)
+	if err != nil {
+		t.Fatalf("intern proto: %v", err)
+	}
+	closureHandle, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	if _, err := runtime.CompileRef(protoHandle.Ref); err != nil {
+		t.Fatalf("compile proto: %v", err)
+	}
+	spillRoot := mustIntern(t, engine.Strings, "compiled-spill-root")
+	frame, err := thread.PushFrame(state.FrameSpec{
+		Closure:       closureHandle.Value,
+		Proto:         protoHandle.Value,
+		RegisterBase:  0,
+		RegisterCount: 1,
+		SpillCount:    1,
+		Top:           0,
+		SavedBCOff:    0,
+		Flags:         state.FrameFlagCompiled,
+	})
+	if err != nil {
+		t.Fatalf("push compiled frame: %v", err)
+	}
+	if err := thread.SetSpill(frame, 0, spillRoot.Value); err != nil {
+		t.Fatalf("set spill root: %v", err)
+	}
+
+	scanner := NewScanner(engine.Heap)
+	scanner.BindCompiledRuntime(runtime)
+	visited := collectRoots(t, func(visit VisitFunc) error {
+		return scanner.WalkThread(thread, visit)
+	})
+
+	for _, ref := range []value.HeapRef44{closureHandle.Ref, protoHandle.Ref, spillRoot.Ref} {
+		if _, ok := visited[ref]; !ok {
+			t.Fatalf("missing compiled spill root %#x", uint64(ref))
 		}
 	}
 }

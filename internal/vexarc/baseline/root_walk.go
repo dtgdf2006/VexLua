@@ -75,6 +75,15 @@ func (runtime *Runtime) WalkFrameRoots(thread *state.ThreadState, frame *state.C
 			}
 		}
 	}
+	for slot := uint16(0); slot < frame.SpillCount; slot++ {
+		slotValue, err := thread.Spill(frame, slot)
+		if err != nil {
+			return true, err
+		}
+		if err := visitFrameTValue(slotValue, visit); err != nil {
+			return true, err
+		}
+	}
 	if frame.VarargCount == 0 {
 		return true, nil
 	}
