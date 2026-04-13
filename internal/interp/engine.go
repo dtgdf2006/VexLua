@@ -83,8 +83,6 @@ type activation struct {
 	fn     *bytecode.Proto
 	code   []bytecode.Instruction
 	callee value.HeapRef44
-	global value.TValue
-	hasEnv bool
 	slots  []value.TValue
 }
 

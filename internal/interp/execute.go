@@ -25,7 +25,6 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 	if err != nil {
 		return nil, err
 	}
-	env := closureObject.Env
 
 	ctx := engine.threadState(thread)
 	registerCount := uint32(proto.MaxStackSize)
@@ -81,8 +80,6 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 		fn:     proto,
 		code:   proto.Code,
 		callee: closureRef,
-		global: env,
-		hasEnv: true,
 	}
 	activation.slots, err = thread.FrameWindow(frame)
 	if err != nil {
@@ -153,10 +150,6 @@ func (engine *Engine) ResumeLuaFrame(thread *state.ThreadState, frame *state.Cal
 	if !ok {
 		return nil, fmt.Errorf("frame closure is not a closure reference: %s", frame.Closure)
 	}
-	env, err := engine.Closures.Env(closureRef)
-	if err != nil {
-		return nil, err
-	}
 	varargs, err := engine.frameVarargs(thread, frame)
 	if err != nil {
 		return nil, err
@@ -169,8 +162,6 @@ func (engine *Engine) ResumeLuaFrame(thread *state.ThreadState, frame *state.Cal
 		fn:     proto,
 		code:   proto.Code,
 		callee: closureRef,
-		global: env,
-		hasEnv: true,
 	}
 	activation.slots, err = thread.FrameWindow(frame)
 	if err != nil {
@@ -708,13 +699,7 @@ func (engine *Engine) activationEnv(act *activation) (value.TValue, error) {
 	if err != nil {
 		return value.NilValue(), err
 	}
-	env, err := engine.Closures.Env(closureRef)
-	if err != nil {
-		return value.NilValue(), err
-	}
-	act.global = env
-	act.hasEnv = true
-	return env, nil
+	return engine.Closures.Env(closureRef)
 }
 
 func (engine *Engine) activationUpvalueRef(act *activation, index int) (value.HeapRef44, error) {

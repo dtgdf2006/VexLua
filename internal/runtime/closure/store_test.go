@@ -287,6 +287,10 @@ func TestClosureFeedbackVectorUsesNativeHeapLayout(t *testing.T) {
 	protos := rproto.NewStore(runtimeHeap)
 	closures := NewStore(runtimeHeap, protos)
 	proto := &bytecode.Proto{
+		MaxStackSize: 1,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("g"),
+		},
 		Code: []bytecode.Instruction{
 			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
 			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
@@ -366,6 +370,10 @@ func TestClosureFeedbackHeaderNativeStateStaysCanonical(t *testing.T) {
 	protos := rproto.NewStore(runtimeHeap)
 	closures := NewStore(runtimeHeap, protos)
 	proto := &bytecode.Proto{
+		MaxStackSize: 1,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("g"),
+		},
 		Code: []bytecode.Instruction{
 			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
 			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),

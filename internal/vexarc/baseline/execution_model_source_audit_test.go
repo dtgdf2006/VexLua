@@ -135,7 +135,7 @@ func TestExecutionModelSourceAudit(t *testing.T) {
 	t.Run("activation-struct-caches-hot-state-only", func(t *testing.T) {
 		text := readRepoFile(t, "internal", "interp", "engine.go")
 		block := sourceBlock(t, text, "type activation struct {", "type threadSnapshot struct {")
-		required := []string{"fn     *bytecode.Proto", "code   []bytecode.Instruction", "callee value.HeapRef44", "global value.TValue", "hasEnv bool"}
+		required := []string{"fn     *bytecode.Proto", "code   []bytecode.Instruction", "callee value.HeapRef44", "slots  []value.TValue"}
 		for _, needle := range required {
 			if !strings.Contains(block, needle) {
 				t.Fatalf("activation struct should cache hot state %q: %s", needle, block)
