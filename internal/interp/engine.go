@@ -80,6 +80,11 @@ type activation struct {
 	frame  *state.CallFrameHeader
 	top    uint32
 	pc     int
+	fn     *bytecode.Proto
+	code   []bytecode.Instruction
+	callee value.HeapRef44
+	global value.TValue
+	hasEnv bool
 }
 
 type threadSnapshot struct {

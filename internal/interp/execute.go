@@ -25,9 +25,7 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 	if err != nil {
 		return nil, err
 	}
-	if err := bytecode.ValidateProto(proto); err != nil {
-		return nil, err
-	}
+	env := closureObject.Env
 
 	ctx := engine.threadState(thread)
 	registerCount := uint32(proto.MaxStackSize)
@@ -80,6 +78,11 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 		frame:  frame,
 		top:    uint32(frame.LogicalTop()),
 		pc:     0,
+		fn:     proto,
+		code:   proto.Code,
+		callee: closureRef,
+		global: env,
+		hasEnv: true,
 	}
 	ctx.activations = append(ctx.activations, activation)
 
@@ -141,14 +144,29 @@ func (engine *Engine) ResumeLuaFrame(thread *state.ThreadState, frame *state.Cal
 	if err != nil {
 		return nil, err
 	}
-	if err := bytecode.ValidateProto(proto); err != nil {
+	closureRef, ok := frame.Closure.HeapRef()
+	if !ok {
+		return nil, fmt.Errorf("frame closure is not a closure reference: %s", frame.Closure)
+	}
+	env, err := engine.Closures.Env(closureRef)
+	if err != nil {
 		return nil, err
 	}
 	varargs, err := engine.frameVarargs(thread, frame)
 	if err != nil {
 		return nil, err
 	}
-	activation := &activation{thread: thread, frame: frame, top: uint32(frame.LogicalTop()), pc: startPC}
+	activation := &activation{
+		thread: thread,
+		frame:  frame,
+		top:    uint32(frame.LogicalTop()),
+		pc:     startPC,
+		fn:     proto,
+		code:   proto.Code,
+		callee: closureRef,
+		global: env,
+		hasEnv: true,
+	}
 	ctx := engine.threadState(thread)
 	ctx.activations = append(ctx.activations, activation)
 	defer func() {
@@ -158,16 +176,17 @@ func (engine *Engine) ResumeLuaFrame(thread *state.ThreadState, frame *state.Cal
 }
 
 func (engine *Engine) executeActivation(act *activation, varargs []value.TValue) ([]value.TValue, error) {
+	proto, err := engine.activationProto(act)
+	if err != nil {
+		return nil, err
+	}
+	code := act.code
 	for {
-		proto, err := engine.activationProto(act)
-		if err != nil {
-			return nil, err
-		}
-		if act.pc >= len(proto.Code) {
+		if act.pc >= len(code) {
 			break
 		}
 		pc := act.pc
-		instruction := proto.Code[pc]
+		instruction := code[pc]
 		opcode := instruction.Opcode()
 		act.frame.SavedBCOff = uint32(pc)
 		act.pc++
@@ -619,11 +638,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			return nil, runtimeError(proto, pc, opcode, "opcode not implemented in Stage 4 interpreter")
 		}
 	}
-	proto, err := engine.activationProto(act)
-	if err != nil {
-		return nil, err
-	}
-	return nil, runtimeError(proto, len(proto.Code), bytecode.OP_RETURN, "function fell off the end without RETURN")
+	return nil, runtimeError(proto, len(code), bytecode.OP_RETURN, "function fell off the end without RETURN")
 }
 
 func (engine *Engine) registerValue(act *activation, index int) (value.TValue, error) {
@@ -680,10 +695,14 @@ func (engine *Engine) activationClosureRef(act *activation) (value.HeapRef44, er
 	if act == nil || act.frame == nil {
 		return 0, fmt.Errorf("activation frame is not set")
 	}
+	if act.callee != 0 {
+		return act.callee, nil
+	}
 	ref, ok := act.frame.Closure.HeapRef()
 	if !ok {
 		return 0, fmt.Errorf("frame closure is not a closure reference: %s", act.frame.Closure)
 	}
+	act.callee = ref
 	return ref, nil
 }
 
@@ -692,7 +711,13 @@ func (engine *Engine) activationEnv(act *activation) (value.TValue, error) {
 	if err != nil {
 		return value.NilValue(), err
 	}
-	return engine.Closures.Env(closureRef)
+	env, err := engine.Closures.Env(closureRef)
+	if err != nil {
+		return value.NilValue(), err
+	}
+	act.global = env
+	act.hasEnv = true
+	return env, nil
 }
 
 func (engine *Engine) activationUpvalueRef(act *activation, index int) (value.HeapRef44, error) {
@@ -707,11 +732,23 @@ func (engine *Engine) activationProto(act *activation) (*bytecode.Proto, error) 
 	if act == nil || act.frame == nil {
 		return nil, fmt.Errorf("activation frame is not set")
 	}
+	if act.fn != nil {
+		if act.code == nil {
+			act.code = act.fn.Code
+		}
+		return act.fn, nil
+	}
 	protoRef, ok := act.frame.Proto.HeapRef()
 	if !ok {
 		return nil, fmt.Errorf("frame proto is not a proto reference: %s", act.frame.Proto)
 	}
-	return engine.Protos.Resolve(protoRef)
+	proto, err := engine.Protos.Resolve(protoRef)
+	if err != nil {
+		return nil, err
+	}
+	act.fn = proto
+	act.code = proto.Code
+	return proto, nil
 }
 
 func (engine *Engine) activationRegisterBase(act *activation) (uint32, error) {
@@ -968,10 +1005,10 @@ func (engine *Engine) captureUpvalues(act *activation, childProto *bytecode.Prot
 	}
 	captured := make([]value.HeapRef44, int(childProto.NumUpvalues))
 	for index := range captured {
-		if act.pc >= len(proto.Code) {
+		if act.pc >= len(act.code) {
 			return nil, runtimeError(proto, pc, opcode, "missing capture instruction after CLOSURE")
 		}
-		capture := proto.Code[act.pc]
+		capture := act.code[act.pc]
 		act.pc++
 		switch capture.Opcode() {
 		case bytecode.OP_MOVE:
@@ -1030,10 +1067,10 @@ func (engine *Engine) takeTestJump(act *activation, pc int, opcode bytecode.Opco
 	if err != nil {
 		return err
 	}
-	if act.pc >= len(proto.Code) {
+	if act.pc >= len(act.code) {
 		return runtimeError(proto, pc, opcode, "test opcode is missing trailing JMP")
 	}
-	jump := proto.Code[act.pc]
+	jump := act.code[act.pc]
 	if jump.Opcode() != bytecode.OP_JMP {
 		return runtimeError(proto, pc, opcode, fmt.Sprintf("expected trailing JMP after test, got %s", jump.Opcode()))
 	}

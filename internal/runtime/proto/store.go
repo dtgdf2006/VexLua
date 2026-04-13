@@ -120,6 +120,9 @@ func (store *Store) Intern(proto *bytecode.Proto) (Handle, error) {
 	if handle, ok := store.cachedHandle(proto); ok {
 		return handle, nil
 	}
+	if err := bytecode.ValidateProto(proto); err != nil {
+		return Handle{}, err
+	}
 	object := NewObject(proto)
 	allocation, err := store.heap.AllocObject(object.Common)
 	if err != nil {
