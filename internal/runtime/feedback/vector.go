@@ -11,6 +11,8 @@ type State uint8
 
 type AccessKind uint8
 
+type CallShapeKind uint32
+
 const (
 	HeaderSize            = 0x20
 	HeaderSlotCountOffset = 0x00
@@ -31,9 +33,14 @@ const (
 )
 
 const (
+	CellFlagCallMegamorphicSidecar uint8 = 1 << iota
+)
+
+const (
 	StateGeneric State = iota
 	StateMonomorphic
 	StateMegamorphic
+	StatePolymorphic
 )
 
 const (
@@ -42,9 +49,45 @@ const (
 	AccessHash
 	AccessCallLuaClosure
 	AccessCallHostFunction
+	AccessCallResolvedLuaClosure
+	AccessCallResolvedHostFunction
 	AccessUpvalueOpen
 	AccessUpvalueClosed
 )
+
+const (
+	CallShapeDirect CallShapeKind = iota
+	CallShapeTableMetatable
+	CallShapeHostObjectMetatable
+	CallShapeTypeMetatable
+)
+
+type CallShape struct {
+	Kind     CallShapeKind
+	VersionA uint32
+	VersionB uint32
+}
+
+const (
+	CallPolymorphicEntryCount        = 2
+	CallMegamorphicEntryCount        = 4
+	CallPolymorphicEntrySize         = 0x20
+	CallPolymorphicDataSize          = CallPolymorphicEntryCount * CallPolymorphicEntrySize
+	CallMegamorphicDataSize          = CallMegamorphicEntryCount * CallPolymorphicEntrySize
+	CallPolyEntryAccessKindOffset    = 0x00
+	CallPolyEntryShapeVersionAOffset = 0x04
+	CallPolyEntryShapeVersionBOffset = 0x08
+	CallPolyEntryShapeKindOffset     = 0x0C
+	CallPolyEntryTargetRefOffset     = 0x10
+	CallPolyEntryValueBitsOffset     = 0x18
+)
+
+type CallPolymorphicEntry struct {
+	AccessKind AccessKind
+	Shape      CallShape
+	TargetRef  value.HeapRef44
+	ValueBits  value.Raw
+}
 
 type Header struct {
 	SlotCount       uint32
@@ -78,6 +121,16 @@ func NewMegamorphicCell(kind SlotKind) Cell {
 	return Cell{State: StateMegamorphic, SlotKind: kind}
 }
 
+func NewMegamorphicCallCell(kind SlotKind, accessKind AccessKind, targetRef value.HeapRef44, calleeBits value.Raw, shape CallShape) Cell {
+	cell := NewCallMonomorphicCell(kind, accessKind, targetRef, calleeBits, shape)
+	cell.State = StateMegamorphic
+	return cell
+}
+
+func NewMegamorphicCallSidecarCell(kind SlotKind, dataOffset value.HeapOff64) Cell {
+	return Cell{State: StateMegamorphic, SlotKind: kind, Flags: CellFlagCallMegamorphicSidecar, HeapRef: value.HeapRef44(dataOffset)}
+}
+
 func NewMonomorphicCell(kind SlotKind, accessKind AccessKind, payload32A uint32, payload32B uint32, payload32C uint32, heapRef value.HeapRef44, valueBits value.Raw) Cell {
 	return Cell{
 		State:      StateMonomorphic,
@@ -95,8 +148,16 @@ func NewTableMonomorphicCell(kind SlotKind, accessKind AccessKind, tableRef valu
 	return NewMonomorphicCell(kind, accessKind, tableVersion, cachedIndex, 0, tableRef, keyBits)
 }
 
-func NewCallMonomorphicCell(kind SlotKind, accessKind AccessKind, targetRef value.HeapRef44, calleeBits value.Raw) Cell {
-	return NewMonomorphicCell(kind, accessKind, 0, 0, 0, targetRef, calleeBits)
+func NewCallMonomorphicCell(kind SlotKind, accessKind AccessKind, targetRef value.HeapRef44, calleeBits value.Raw, shape CallShape) Cell {
+	return NewMonomorphicCell(kind, accessKind, shape.VersionA, shape.VersionB, uint32(shape.Kind), targetRef, calleeBits)
+}
+
+func NewCallPolymorphicCell(kind SlotKind, dataOffset value.HeapOff64) Cell {
+	return Cell{State: StatePolymorphic, SlotKind: kind, HeapRef: value.HeapRef44(dataOffset)}
+}
+
+func NewCallPolymorphicEntry(accessKind AccessKind, targetRef value.HeapRef44, calleeBits value.Raw, shape CallShape) CallPolymorphicEntry {
+	return CallPolymorphicEntry{AccessKind: accessKind, Shape: shape, TargetRef: targetRef, ValueBits: calleeBits}
 }
 
 func NewUpvalueMonomorphicCell(kind SlotKind, accessKind AccessKind, upvalueRef value.HeapRef44, observedBits value.Raw) Cell {
@@ -123,8 +184,140 @@ func (cell Cell) TargetRef() value.HeapRef44 {
 	return cell.HeapRef
 }
 
+func (cell Cell) CallShapeVersionA() uint32 {
+	return cell.Payload32A
+}
+
+func (cell Cell) CallShapeVersionB() uint32 {
+	return cell.Payload32B
+}
+
+func (cell Cell) CallShapeKind() CallShapeKind {
+	return CallShapeKind(cell.Payload32C)
+}
+
+func (cell Cell) HasMegamorphicCallSidecar() bool {
+	return cell.State == StateMegamorphic && cell.Flags&CellFlagCallMegamorphicSidecar != 0
+}
+
+func (cell Cell) HasCallSidecar() bool {
+	return cell.State == StatePolymorphic || cell.HasMegamorphicCallSidecar()
+}
+
+func (cell Cell) CallSidecarDataOffset() value.HeapOff64 {
+	if !cell.HasCallSidecar() {
+		return 0
+	}
+	return value.HeapOff64(cell.HeapRef)
+}
+
+func (cell Cell) CallPolymorphicDataOffset() value.HeapOff64 {
+	if cell.State != StatePolymorphic {
+		return 0
+	}
+	return cell.CallSidecarDataOffset()
+}
+
+func (cell Cell) CallMegamorphicDataOffset() value.HeapOff64 {
+	if !cell.HasMegamorphicCallSidecar() {
+		return 0
+	}
+	return cell.CallSidecarDataOffset()
+}
+
 func (cell Cell) ObservedValueBits() value.Raw {
 	return cell.ValueBits
+}
+
+func IsResolvedCallAccessKind(kind AccessKind) bool {
+	return kind == AccessCallResolvedLuaClosure || kind == AccessCallResolvedHostFunction
+}
+
+func (entry CallPolymorphicEntry) MonomorphicCell(kind SlotKind) Cell {
+	return NewCallMonomorphicCell(kind, entry.AccessKind, entry.TargetRef, entry.ValueBits, entry.Shape)
+}
+
+func ReadCallPolymorphicEntry(buffer []byte) (CallPolymorphicEntry, error) {
+	if len(buffer) < CallPolymorphicEntrySize {
+		return CallPolymorphicEntry{}, fmt.Errorf("buffer too small for call polymorphic entry: %d", len(buffer))
+	}
+	return CallPolymorphicEntry{
+		AccessKind: AccessKind(binary.LittleEndian.Uint32(buffer[CallPolyEntryAccessKindOffset : CallPolyEntryAccessKindOffset+4])),
+		Shape: CallShape{
+			VersionA: binary.LittleEndian.Uint32(buffer[CallPolyEntryShapeVersionAOffset : CallPolyEntryShapeVersionAOffset+4]),
+			VersionB: binary.LittleEndian.Uint32(buffer[CallPolyEntryShapeVersionBOffset : CallPolyEntryShapeVersionBOffset+4]),
+			Kind:     CallShapeKind(binary.LittleEndian.Uint32(buffer[CallPolyEntryShapeKindOffset : CallPolyEntryShapeKindOffset+4])),
+		},
+		TargetRef: value.HeapRef44(binary.LittleEndian.Uint64(buffer[CallPolyEntryTargetRefOffset : CallPolyEntryTargetRefOffset+8])),
+		ValueBits: value.Raw(binary.LittleEndian.Uint64(buffer[CallPolyEntryValueBitsOffset : CallPolyEntryValueBitsOffset+8])),
+	}, nil
+}
+
+func WriteCallPolymorphicEntry(buffer []byte, entry CallPolymorphicEntry) error {
+	if len(buffer) < CallPolymorphicEntrySize {
+		return fmt.Errorf("buffer too small for call polymorphic entry: %d", len(buffer))
+	}
+	binary.LittleEndian.PutUint32(buffer[CallPolyEntryAccessKindOffset:CallPolyEntryAccessKindOffset+4], uint32(entry.AccessKind))
+	binary.LittleEndian.PutUint32(buffer[CallPolyEntryShapeVersionAOffset:CallPolyEntryShapeVersionAOffset+4], entry.Shape.VersionA)
+	binary.LittleEndian.PutUint32(buffer[CallPolyEntryShapeVersionBOffset:CallPolyEntryShapeVersionBOffset+4], entry.Shape.VersionB)
+	binary.LittleEndian.PutUint32(buffer[CallPolyEntryShapeKindOffset:CallPolyEntryShapeKindOffset+4], uint32(entry.Shape.Kind))
+	binary.LittleEndian.PutUint64(buffer[CallPolyEntryTargetRefOffset:CallPolyEntryTargetRefOffset+8], uint64(entry.TargetRef))
+	binary.LittleEndian.PutUint64(buffer[CallPolyEntryValueBitsOffset:CallPolyEntryValueBitsOffset+8], uint64(entry.ValueBits))
+	return nil
+}
+
+func ReadCallPolymorphicEntries(buffer []byte) ([CallPolymorphicEntryCount]CallPolymorphicEntry, error) {
+	if len(buffer) < CallPolymorphicDataSize {
+		return [CallPolymorphicEntryCount]CallPolymorphicEntry{}, fmt.Errorf("buffer too small for call polymorphic data: %d", len(buffer))
+	}
+	var entries [CallPolymorphicEntryCount]CallPolymorphicEntry
+	for index := 0; index < CallPolymorphicEntryCount; index++ {
+		entry, err := ReadCallPolymorphicEntry(buffer[index*CallPolymorphicEntrySize : (index+1)*CallPolymorphicEntrySize])
+		if err != nil {
+			return [CallPolymorphicEntryCount]CallPolymorphicEntry{}, err
+		}
+		entries[index] = entry
+	}
+	return entries, nil
+}
+
+func ReadCallMegamorphicEntries(buffer []byte) ([CallMegamorphicEntryCount]CallPolymorphicEntry, error) {
+	if len(buffer) < CallMegamorphicDataSize {
+		return [CallMegamorphicEntryCount]CallPolymorphicEntry{}, fmt.Errorf("buffer too small for call megamorphic data: %d", len(buffer))
+	}
+	var entries [CallMegamorphicEntryCount]CallPolymorphicEntry
+	for index := 0; index < CallMegamorphicEntryCount; index++ {
+		entry, err := ReadCallPolymorphicEntry(buffer[index*CallPolymorphicEntrySize : (index+1)*CallPolymorphicEntrySize])
+		if err != nil {
+			return [CallMegamorphicEntryCount]CallPolymorphicEntry{}, err
+		}
+		entries[index] = entry
+	}
+	return entries, nil
+}
+
+func WriteCallPolymorphicEntries(buffer []byte, entries [CallPolymorphicEntryCount]CallPolymorphicEntry) error {
+	if len(buffer) < CallPolymorphicDataSize {
+		return fmt.Errorf("buffer too small for call polymorphic data: %d", len(buffer))
+	}
+	for index, entry := range entries {
+		if err := WriteCallPolymorphicEntry(buffer[index*CallPolymorphicEntrySize:(index+1)*CallPolymorphicEntrySize], entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func WriteCallMegamorphicEntries(buffer []byte, entries [CallMegamorphicEntryCount]CallPolymorphicEntry) error {
+	if len(buffer) < CallMegamorphicDataSize {
+		return fmt.Errorf("buffer too small for call megamorphic data: %d", len(buffer))
+	}
+	for index, entry := range entries {
+		if err := WriteCallPolymorphicEntry(buffer[index*CallPolymorphicEntrySize:(index+1)*CallPolymorphicEntrySize], entry); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func VectorSize(slotCount uint32) uint64 {

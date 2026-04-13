@@ -95,6 +95,80 @@ func (tracer *Tracer) ScrubDeadFeedbackCells(closureRef value.HeapRef44, isDead 
 		if err != nil {
 			return scrubbed, err
 		}
+		if cell.State == feedback.StatePolymorphic {
+			entries, err := tracer.readCallPolymorphicEntries(cell.CallPolymorphicDataOffset())
+			if err != nil {
+				return scrubbed, err
+			}
+			live := make([]feedback.CallPolymorphicEntry, 0, feedback.CallPolymorphicEntryCount)
+			for _, entry := range entries {
+				if callPolymorphicEntryDead(entry, isDead) {
+					continue
+				}
+				live = append(live, entry)
+			}
+			if len(live) == feedback.CallPolymorphicEntryCount {
+				continue
+			}
+			if len(live) == 1 {
+				if err := feedback.WriteCell(cellBytes, live[0].MonomorphicCell(cell.SlotKind)); err != nil {
+					return scrubbed, err
+				}
+			} else {
+				if err := feedback.WriteCell(cellBytes, feedback.NewGenericCell(cell.SlotKind)); err != nil {
+					return scrubbed, err
+				}
+			}
+			if offset := cell.CallPolymorphicDataOffset(); offset != 0 {
+				if err := tracer.heap.FreeSpan(offset); err != nil {
+					return scrubbed, err
+				}
+			}
+			scrubbed++
+			continue
+		}
+		if cell.HasMegamorphicCallSidecar() {
+			entries, err := tracer.readCallMegamorphicEntries(cell.CallMegamorphicDataOffset())
+			if err != nil {
+				return scrubbed, err
+			}
+			live := make([]feedback.CallPolymorphicEntry, 0, feedback.CallMegamorphicEntryCount)
+			for _, entry := range entries {
+				if callPolymorphicEntryDead(entry, isDead) {
+					continue
+				}
+				live = append(live, entry)
+			}
+			if len(live) == len(entries) {
+				continue
+			}
+			switch len(live) {
+			case 0:
+				if err := feedback.WriteCell(cellBytes, feedback.NewGenericCell(cell.SlotKind)); err != nil {
+					return scrubbed, err
+				}
+				if offset := cell.CallMegamorphicDataOffset(); offset != 0 {
+					if err := tracer.heap.FreeSpan(offset); err != nil {
+						return scrubbed, err
+					}
+				}
+			case 1:
+				if err := feedback.WriteCell(cellBytes, live[0].MonomorphicCell(cell.SlotKind)); err != nil {
+					return scrubbed, err
+				}
+				if offset := cell.CallMegamorphicDataOffset(); offset != 0 {
+					if err := tracer.heap.FreeSpan(offset); err != nil {
+						return scrubbed, err
+					}
+				}
+			default:
+				if err := tracer.writeCallMegamorphicEntries(cell.CallMegamorphicDataOffset(), live); err != nil {
+					return scrubbed, err
+				}
+			}
+			scrubbed++
+			continue
+		}
 		if !feedbackCellDead(cell, isDead) {
 			continue
 		}
@@ -310,6 +384,40 @@ func (tracer *Tracer) traceClosure(closureRef value.HeapRef44, bytes []byte, vis
 		if err != nil {
 			return err
 		}
+		if cell.State == feedback.StatePolymorphic {
+			entries, err := tracer.readCallPolymorphicEntries(cell.CallPolymorphicDataOffset())
+			if err != nil {
+				return err
+			}
+			for _, entry := range entries {
+				if entry.TargetRef != 0 {
+					if err := visitWeak(WeakRef{Kind: WeakRefFeedbackCellHeapRef, Owner: closureRef, Target: entry.TargetRef, Slot: slot}); err != nil {
+						return err
+					}
+				}
+				if err := visitWeakTValue(value.FromRaw(entry.ValueBits), WeakRef{Kind: WeakRefFeedbackCellValueBits, Owner: closureRef, Slot: slot}, visitWeak); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if cell.HasMegamorphicCallSidecar() {
+			entries, err := tracer.readCallMegamorphicEntries(cell.CallMegamorphicDataOffset())
+			if err != nil {
+				return err
+			}
+			for _, entry := range entries {
+				if entry.TargetRef != 0 {
+					if err := visitWeak(WeakRef{Kind: WeakRefFeedbackCellHeapRef, Owner: closureRef, Target: entry.TargetRef, Slot: slot}); err != nil {
+						return err
+					}
+				}
+				if err := visitWeakTValue(value.FromRaw(entry.ValueBits), WeakRef{Kind: WeakRefFeedbackCellValueBits, Owner: closureRef, Slot: slot}, visitWeak); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		if cell.HeapRef != 0 {
 			if err := visitWeak(WeakRef{Kind: WeakRefFeedbackCellHeapRef, Owner: closureRef, Target: cell.HeapRef, Slot: slot}); err != nil {
 				return err
@@ -395,6 +503,9 @@ func (tracer *Tracer) traceHostWrapper(header host.WrapperHeader, visitStrong Vi
 	if err := visitStrongTValue(header.Env, visitStrong); err != nil {
 		return err
 	}
+	if err := visitStrongTValue(header.Metatable, visitStrong); err != nil {
+		return err
+	}
 	if header.NativeMeta == 0 || visitStrong == nil {
 		return nil
 	}
@@ -439,11 +550,75 @@ func (tracer *Tracer) resolveNativeTValues(base uint64, count uint32) ([]byte, e
 }
 
 func feedbackCellDead(cell feedback.Cell, isDead func(value.HeapRef44) bool) bool {
+	if cell.State == feedback.StatePolymorphic || cell.HasMegamorphicCallSidecar() {
+		return false
+	}
 	if cell.HeapRef != 0 && isDead(cell.HeapRef) {
 		return true
 	}
 	ref, ok := value.FromRaw(cell.ValueBits).HeapRef()
 	return ok && ref != 0 && isDead(ref)
+}
+
+func callPolymorphicEntryDead(entry feedback.CallPolymorphicEntry, isDead func(value.HeapRef44) bool) bool {
+	if entry.TargetRef != 0 && isDead(entry.TargetRef) {
+		return true
+	}
+	ref, ok := value.FromRaw(entry.ValueBits).HeapRef()
+	return ok && ref != 0 && isDead(ref)
+}
+
+func (tracer *Tracer) readCallPolymorphicEntries(offset value.HeapOff64) ([]feedback.CallPolymorphicEntry, error) {
+	if offset == 0 {
+		return nil, fmt.Errorf("call polymorphic offset cannot be zero")
+	}
+	bytes, err := tracer.heap.Resolve(offset, feedback.CallPolymorphicDataSize)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := feedback.ReadCallPolymorphicEntries(bytes)
+	if err != nil {
+		return nil, err
+	}
+	return entries[:], nil
+}
+
+func (tracer *Tracer) readCallMegamorphicEntries(offset value.HeapOff64) ([]feedback.CallPolymorphicEntry, error) {
+	if offset == 0 {
+		return nil, fmt.Errorf("call megamorphic offset cannot be zero")
+	}
+	bytes, err := tracer.heap.Resolve(offset, feedback.CallMegamorphicDataSize)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := feedback.ReadCallMegamorphicEntries(bytes)
+	if err != nil {
+		return nil, err
+	}
+	compact := make([]feedback.CallPolymorphicEntry, 0, feedback.CallMegamorphicEntryCount)
+	for _, entry := range entries {
+		if entry.AccessKind == feedback.AccessInvalid || entry.ValueBits == 0 {
+			continue
+		}
+		compact = append(compact, entry)
+	}
+	return compact, nil
+}
+
+func (tracer *Tracer) writeCallMegamorphicEntries(offset value.HeapOff64, entries []feedback.CallPolymorphicEntry) error {
+	if offset == 0 {
+		return fmt.Errorf("call megamorphic offset cannot be zero")
+	}
+	if len(entries) > feedback.CallMegamorphicEntryCount {
+		return fmt.Errorf("call megamorphic entry count = %d, want <= %d", len(entries), feedback.CallMegamorphicEntryCount)
+	}
+	bytes, err := tracer.heap.Resolve(offset, feedback.CallMegamorphicDataSize)
+	if err != nil {
+		return err
+	}
+	var fixed [feedback.CallMegamorphicEntryCount]feedback.CallPolymorphicEntry
+	copy(fixed[:], entries)
+	return feedback.WriteCallMegamorphicEntries(bytes, fixed)
 }
 
 func visitStrongTValue(slotValue value.TValue, visitStrong VisitFunc) error {

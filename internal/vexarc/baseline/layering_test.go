@@ -63,13 +63,71 @@ func TestRuntimeStubsUseSharedHostBoundary(t *testing.T) {
 		}
 	}
 	required := []string{
-		"ReadIndexBoundary",
-		"WriteIndexBoundary",
-		"CallValueBoundary",
+		"ReadIndexMetaBoundary",
+		"WriteIndexMetaBoundary",
+		"CallResolvedBoundary",
 	}
 	for _, needle := range required {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("runtime stubs should depend on shared host boundary %q", needle)
+		}
+	}
+}
+
+func TestNativeBuiltinStringKeyFlowsDoNotSpecialCaseHostObjects(t *testing.T) {
+	source, err := os.ReadFile("native_builtin.go")
+	if err != nil {
+		t.Fatalf("read native_builtin.go: %v", err)
+	}
+	text := string(source)
+	getFlowStart := strings.Index(text, "func emitGenericStringKeyGetFlow(")
+	setFlowStart := strings.Index(text, "func emitGenericStringKeySetFlow(")
+	updateFlowStart := strings.Index(text, "func emitUpdateTableFeedbackEligibleHash(")
+	if getFlowStart < 0 || setFlowStart < 0 || updateFlowStart < 0 {
+		t.Fatalf("could not locate generic string-key native builtin flow blocks")
+	}
+	getFlowText := text[getFlowStart:setFlowStart]
+	setFlowText := text[setFlowStart:updateFlowStart]
+	forbidden := []string{
+		"shiftedBoxedTag(value.TagHostObjectRef)",
+		"hostPath := assembler.NewLabel()",
+	}
+	for _, needle := range forbidden {
+		if strings.Contains(getFlowText, needle) || strings.Contains(setFlowText, needle) {
+			t.Fatalf("string-key get/set native builtins should route host objects through shared exact helper, found %q", needle)
+		}
+	}
+}
+
+func TestNativeBuiltinCallFlowsKeepHostTerminalBoundaryExplicit(t *testing.T) {
+	source, err := os.ReadFile("native_builtin.go")
+	if err != nil {
+		t.Fatalf("read native_builtin.go: %v", err)
+	}
+	text := string(source)
+	callStart := strings.Index(text, "func buildLuaCallBuiltinBody() []byte {")
+	tailStart := strings.Index(text, "func buildTailCallBuiltinBody() []byte {")
+	if callStart < 0 || tailStart < 0 || tailStart <= callStart {
+		t.Fatalf("failed to locate call/tailcall builtin bodies")
+	}
+	callFlow := text[callStart:tailStart]
+	tailHelperStart := strings.Index(text[tailStart:], "func emitBranchMegamorphicCallFeedback(")
+	if tailHelperStart < 0 {
+		t.Fatalf("failed to locate tailcall builtin end")
+	}
+	tailFlow := text[tailStart : tailStart+tailHelperStart]
+	for _, flow := range []string{callFlow, tailFlow} {
+		if !strings.Contains(flow, "emitReturnHostCallDispatch(") {
+			t.Fatalf("call/tailcall native builtins should keep explicit host terminal dispatch helper")
+		}
+	}
+	forbidden := []string{
+		"shiftedBoxedTag(value.TagHostObjectRef)",
+		"emitRefreshHostObjectWrapper(",
+	}
+	for _, needle := range forbidden {
+		if strings.Contains(callFlow, needle) || strings.Contains(tailFlow, needle) {
+			t.Fatalf("call/tailcall native builtins should not special-case host objects, found %q", needle)
 		}
 	}
 }
@@ -186,16 +244,19 @@ func TestRuntimeStubsDoNotOwnBatch2NativeBuiltins(t *testing.T) {
 	forbidden := []string{
 		"case stubs.StubGetUpvalue:",
 		"case stubs.StubSetUpvalue:",
-		"case stubs.StubForPrep:",
 		"case stubs.StubForLoop:",
 		"handleGetUpvalueStub(",
 		"handleSetUpvalueStub(",
-		"handleForPrepStub(",
 		"handleForLoopStub(",
 	}
 	for _, needle := range forbidden {
 		if strings.Contains(text, needle) {
 			t.Fatalf("runtime stubs should not keep batch-2 native builtin ownership via %q", needle)
+		}
+	}
+	for _, needle := range []string{"case stubs.StubForPrep:", "handleForPrepStub("} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("runtime stubs should own FORPREP string/slow coercion recovery via %q", needle)
 		}
 	}
 }

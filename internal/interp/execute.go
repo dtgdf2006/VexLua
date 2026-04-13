@@ -4,12 +4,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"strconv"
 
 	"vexlua/internal/bytecode"
 	"vexlua/internal/runtime/feedback"
+	rtlua "vexlua/internal/runtime/lua"
 	"vexlua/internal/runtime/state"
-	rtstring "vexlua/internal/runtime/string"
 	"vexlua/internal/runtime/value"
 )
 
@@ -224,7 +223,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
-			globalValue, _, err := engine.getTable(env, key)
+			globalValue, _, err := engine.getTable(act.thread, env, key)
 			if err != nil {
 				return nil, err
 			}
@@ -241,7 +240,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
-			result, _, err := engine.getTable(tableValue, key)
+			result, _, err := engine.getTable(act.thread, tableValue, key)
 			if err != nil {
 				return nil, err
 			}
@@ -262,7 +261,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
-			if err := engine.setTable(env, key, registerValue); err != nil {
+			if err := engine.setTable(act.thread, env, key, registerValue); err != nil {
 				return nil, err
 			}
 			engine.recordSetFeedback(act, pc, feedback.SlotSetGlobal, env, key, registerValue)
@@ -292,7 +291,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
-			if err := engine.setTable(tableValue, key, slotValue); err != nil {
+			if err := engine.setTable(act.thread, tableValue, key, slotValue); err != nil {
 				return nil, err
 			}
 			engine.recordSetFeedback(act, pc, feedback.SlotSetTable, tableValue, key, slotValue)
@@ -314,7 +313,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
-			result, _, err := engine.getTable(tableValue, key)
+			result, _, err := engine.getTable(act.thread, tableValue, key)
 			if err != nil {
 				return nil, err
 			}
@@ -322,38 +321,31 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 				return nil, err
 			}
 		case bytecode.OP_ADD, bytecode.OP_SUB, bytecode.OP_MUL, bytecode.OP_DIV, bytecode.OP_MOD, bytecode.OP_POW:
-			left, err := engine.rkNumber(act, instruction.B(), pc, opcode)
+			left, err := engine.rkValue(act, instruction.B())
 			if err != nil {
 				return nil, err
 			}
-			right, err := engine.rkNumber(act, instruction.C(), pc, opcode)
+			right, err := engine.rkValue(act, instruction.C())
 			if err != nil {
 				return nil, err
 			}
-			var result float64
-			switch opcode {
-			case bytecode.OP_ADD:
-				result = left + right
-			case bytecode.OP_SUB:
-				result = left - right
-			case bytecode.OP_MUL:
-				result = left * right
-			case bytecode.OP_DIV:
-				result = left / right
-			case bytecode.OP_MOD:
-				result = math.Mod(left, right)
-			case bytecode.OP_POW:
-				result = math.Pow(left, right)
+			result, err := engine.ArithmeticBoundary(act.thread, opcode, left, right)
+			if err != nil {
+				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
-			if err := engine.setRegister(act, instruction.A(), value.NumberValue(result)); err != nil {
+			if err := engine.setRegister(act, instruction.A(), result); err != nil {
 				return nil, err
 			}
 		case bytecode.OP_UNM:
-			number, err := engine.registerNumber(act, instruction.B(), pc, opcode)
+			operand, err := engine.registerValue(act, instruction.B())
 			if err != nil {
 				return nil, err
 			}
-			if err := engine.setRegister(act, instruction.A(), value.NumberValue(-number)); err != nil {
+			result, err := engine.ArithmeticBoundary(act.thread, opcode, operand, operand)
+			if err != nil {
+				return nil, runtimeError(proto, pc, opcode, err.Error())
+			}
+			if err := engine.setRegister(act, instruction.A(), result); err != nil {
 				return nil, err
 			}
 		case bytecode.OP_NOT:
@@ -369,7 +361,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
-			lengthValue, err := engine.lengthValue(registerValue)
+			lengthValue, err := engine.LengthBoundary(act.thread, registerValue)
 			if err != nil {
 				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
@@ -385,7 +377,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 				}
 				values = append(values, slotValue)
 			}
-			if err := engine.ConcatValuesBoundary(values, func(result value.TValue) error {
+			if err := engine.ConcatValuesBoundary(act.thread, values, func(result value.TValue) error {
 				return engine.setRegister(act, instruction.A(), result)
 			}); err != nil {
 				return nil, runtimeError(proto, pc, opcode, err.Error())
@@ -401,7 +393,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
-			equal, err := engine.valuesEqual(left, right)
+			equal, err := engine.CompareBoundary(act.thread, opcode, left, right)
 			if err != nil {
 				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
@@ -421,7 +413,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
-			less, err := engine.valuesLess(left, right)
+			less, err := engine.CompareBoundary(act.thread, opcode, left, right)
 			if err != nil {
 				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
@@ -441,7 +433,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
-			lessEqual, err := engine.valuesLessEqual(left, right)
+			lessEqual, err := engine.CompareBoundary(act.thread, opcode, left, right)
 			if err != nil {
 				return nil, runtimeError(proto, pc, opcode, err.Error())
 			}
@@ -554,6 +546,7 @@ func (engine *Engine) executeActivation(act *activation, varargs []value.TValue)
 			if err != nil {
 				return nil, err
 			}
+			engine.recordCallFeedback(act, pc, feedback.SlotCall, callee)
 			results, err := engine.callValue(act.thread, callee, callArgs, instruction.C())
 			if err != nil {
 				return nil, err
@@ -737,47 +730,20 @@ func (engine *Engine) constantValue(act *activation, index int) (value.TValue, e
 	return value.FromRaw(value.Raw(binary.LittleEndian.Uint64(bytes))), nil
 }
 
-func (engine *Engine) lengthValue(slotValue value.TValue) (value.TValue, error) {
-	if slotValue.IsBoxedTag(value.TagStringRef) {
-		ref, _ := slotValue.HeapRef()
-		header, err := engine.Strings.Header(ref)
-		if err != nil {
-			return value.NilValue(), err
-		}
-		return value.NumberValue(float64(header.Length)), nil
-	}
-	if slotValue.IsBoxedTag(value.TagTableRef) {
-		ref, _ := slotValue.HeapRef()
-		object, err := engine.Tables.Object(ref)
-		if err != nil {
-			return value.NilValue(), err
-		}
-		return value.NumberValue(float64(object.ArrayLenHint)), nil
-	}
-	return value.NilValue(), fmt.Errorf("length requires table or string, got %s", slotValue)
-}
-
-func (engine *Engine) concatOperandText(slotValue value.TValue) (string, error) {
-	if slotValue.IsBoxedTag(value.TagStringRef) {
-		ref, _ := slotValue.HeapRef()
-		return engine.Strings.Text(ref)
-	}
-	if number, ok := slotValue.Float64(); ok {
-		return strconv.FormatFloat(number, 'g', -1, 64), nil
-	}
-	return "", fmt.Errorf("concat requires strings or numbers, got %s", slotValue)
-}
-
 func (engine *Engine) loopNumberValue(act *activation, index int, pc int, opcode bytecode.Opcode, role string) (float64, error) {
 	slotValue, err := engine.registerValue(act, index)
 	if err != nil {
 		return 0, err
 	}
-	number, ok := slotValue.Float64()
+	numberValue, ok, err := rtlua.ToNumber(slotValue, engine.Strings.Text)
+	if err != nil {
+		return 0, err
+	}
 	if !ok {
 		return 0, engine.activationRuntimeError(act, pc, opcode, fmt.Sprintf("for %s must be a number", role))
 	}
-	if err := engine.setRegister(act, index, value.NumberValue(number)); err != nil {
+	number, _ := numberValue.Float64()
+	if err := engine.setRegister(act, index, numberValue); err != nil {
 		return 0, err
 	}
 	return number, nil
@@ -812,7 +778,7 @@ func (engine *Engine) executeSetList(act *activation, proto *bytecode.Proto, ins
 			return err
 		}
 		key := value.NumberValue(float64(baseIndex + index))
-		if err := engine.setTable(tableValue, key, slotValue); err != nil {
+		if err := engine.setTable(act.thread, tableValue, key, slotValue); err != nil {
 			return err
 		}
 	}
@@ -831,10 +797,14 @@ func (engine *Engine) registerNumber(act *activation, index int, pc int, opcode 
 	if err != nil {
 		return 0, err
 	}
-	number, ok := registerValue.Float64()
+	numberValue, ok, err := rtlua.ToNumber(registerValue, engine.Strings.Text)
+	if err != nil {
+		return 0, err
+	}
 	if !ok {
 		return 0, engine.activationRuntimeError(act, pc, opcode, fmt.Sprintf("register %d is not a number: %s", index, registerValue))
 	}
+	number, _ := numberValue.Float64()
 	return number, nil
 }
 
@@ -843,10 +813,14 @@ func (engine *Engine) rkNumber(act *activation, operand int, pc int, opcode byte
 	if err != nil {
 		return 0, err
 	}
-	number, ok := v.Float64()
+	numberValue, ok, err := rtlua.ToNumber(v, engine.Strings.Text)
+	if err != nil {
+		return 0, err
+	}
 	if !ok {
 		return 0, engine.activationRuntimeError(act, pc, opcode, fmt.Sprintf("operand %d is not a number: %s", operand, v))
 	}
+	number, _ := numberValue.Float64()
 	return number, nil
 }
 
@@ -1002,12 +976,12 @@ func (engine *Engine) captureUpvalues(act *activation, childProto *bytecode.Prot
 	return captured, nil
 }
 
-func (engine *Engine) getTable(tableValue value.TValue, key value.TValue) (value.TValue, bool, error) {
-	return engine.ReadIndexBoundary(tableValue, key)
+func (engine *Engine) getTable(thread *state.ThreadState, tableValue value.TValue, key value.TValue) (value.TValue, bool, error) {
+	return engine.ReadIndexMetaBoundary(thread, tableValue, key)
 }
 
-func (engine *Engine) setTable(tableValue value.TValue, key value.TValue, slotValue value.TValue) error {
-	return engine.WriteIndexBoundary(tableValue, key, slotValue)
+func (engine *Engine) setTable(thread *state.ThreadState, tableValue value.TValue, key value.TValue, slotValue value.TValue) error {
+	return engine.WriteIndexMetaBoundary(thread, tableValue, key, slotValue)
 }
 
 func (engine *Engine) hostKeyString(key value.TValue) (string, error) {
@@ -1018,60 +992,16 @@ func (engine *Engine) hostKeyString(key value.TValue) (string, error) {
 	return engine.Strings.Text(ref)
 }
 
-func (engine *Engine) valuesEqual(left value.TValue, right value.TValue) (bool, error) {
-	if left.IsNumber() && right.IsNumber() {
-		leftNumber, _ := left.Float64()
-		rightNumber, _ := right.Float64()
-		return leftNumber == rightNumber, nil
+func (engine *Engine) hostPropertyKey(key value.TValue) (string, bool) {
+	if !key.IsBoxedTag(value.TagStringRef) {
+		return "", false
 	}
-	if left.IsBoxedTag(value.TagStringRef) && right.IsBoxedTag(value.TagStringRef) {
-		return left.Payload() == right.Payload(), nil
+	ref, _ := key.HeapRef()
+	text, err := engine.Strings.Text(ref)
+	if err != nil {
+		return "", false
 	}
-	return left.Bits() == right.Bits(), nil
-}
-
-func (engine *Engine) valuesLess(left value.TValue, right value.TValue) (bool, error) {
-	if left.IsNumber() && right.IsNumber() {
-		leftNumber, _ := left.Float64()
-		rightNumber, _ := right.Float64()
-		return leftNumber < rightNumber, nil
-	}
-	if left.IsBoxedTag(value.TagStringRef) && right.IsBoxedTag(value.TagStringRef) {
-		leftRef, _ := left.HeapRef()
-		rightRef, _ := right.HeapRef()
-		_, leftText, err := rtstring.StringAt(engine.Heap, leftRef)
-		if err != nil {
-			return false, err
-		}
-		_, rightText, err := rtstring.StringAt(engine.Heap, rightRef)
-		if err != nil {
-			return false, err
-		}
-		return leftText < rightText, nil
-	}
-	return false, fmt.Errorf("comparison requires two numbers or two strings")
-}
-
-func (engine *Engine) valuesLessEqual(left value.TValue, right value.TValue) (bool, error) {
-	if left.IsNumber() && right.IsNumber() {
-		leftNumber, _ := left.Float64()
-		rightNumber, _ := right.Float64()
-		return leftNumber <= rightNumber, nil
-	}
-	if left.IsBoxedTag(value.TagStringRef) && right.IsBoxedTag(value.TagStringRef) {
-		leftRef, _ := left.HeapRef()
-		rightRef, _ := right.HeapRef()
-		_, leftText, err := rtstring.StringAt(engine.Heap, leftRef)
-		if err != nil {
-			return false, err
-		}
-		_, rightText, err := rtstring.StringAt(engine.Heap, rightRef)
-		if err != nil {
-			return false, err
-		}
-		return leftText <= rightText, nil
-	}
-	return false, fmt.Errorf("comparison requires two numbers or two strings")
+	return text, true
 }
 
 func (engine *Engine) takeTestJump(act *activation, pc int, opcode bytecode.Opcode) error {

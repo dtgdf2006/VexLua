@@ -34,6 +34,7 @@ type FrameSpec struct {
 type VMState struct {
 	Heap          *heap.Heap
 	HeapBase      uintptr
+	typeMetaBase  uintptr
 	nextThreadID  uint64
 	threads       []*ThreadState
 	threadByID    map[uint64]*ThreadState

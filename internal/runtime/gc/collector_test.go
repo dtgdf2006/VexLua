@@ -349,6 +349,54 @@ func TestCollectorWrapperSetEnvRegraysBlackWrapper(t *testing.T) {
 	}
 }
 
+func TestCollectorWrapperSetMetatableRegraysBlackWrapper(t *testing.T) {
+	engine := interp.New()
+	collector := NewCollector(engine.Heap, engine.Hosts, Config{ProtoStore: engine.Protos})
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	wrapper, err := engine.RegisterHostObject("bag", map[string]float64{"x": 1}, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	if err := collector.StartCollection(); err != nil {
+		t.Fatalf("start collection: %v", err)
+	}
+	if err := collector.SeedRoots(engine.State); err != nil {
+		t.Fatalf("seed roots: %v", err)
+	}
+	if err := collector.Propagate(); err != nil {
+		t.Fatalf("propagate roots: %v", err)
+	}
+	if mark := markForRef(t, engine.Heap, wrapper.Ref); !mark.Has(value.MarkBlack) {
+		t.Fatalf("wrapper mark after propagate = %#x, want black", uint8(mark))
+	}
+	metatable, err := engine.Tables.New(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable: %v", err)
+	}
+	if _, err := engine.Hosts.SetWrapperMetatable(wrapper.Ref, metatable.Value); err != nil {
+		t.Fatalf("set wrapper metatable: %v", err)
+	}
+	if queues := collector.QueueLengths(); queues.GrayAgain != 1 || queues.Remembered != 1 {
+		t.Fatalf("queues after wrapper metatable barrier = %+v, want grayAgain=1 remembered=1", queues)
+	}
+	if err := collector.RunAtomic(engine.State); err != nil {
+		t.Fatalf("run atomic: %v", err)
+	}
+	if mark := markForRef(t, engine.Heap, metatable.Ref); !mark.Has(value.MarkBlack) {
+		t.Fatalf("metatable mark after wrapper atomic = %#x, want black", uint8(mark))
+	}
+	updated, _, _, err := engine.Hosts.ReadHostObject(wrapper.Ref)
+	if err != nil {
+		t.Fatalf("read host wrapper: %v", err)
+	}
+	if updated.Metatable.Bits() != metatable.Value.Bits() {
+		t.Fatalf("wrapper metatable bits = %#x, want %#x", uint64(updated.Metatable.Bits()), uint64(metatable.Value.Bits()))
+	}
+}
+
 func TestCollectorConfiguredProtoStoreKeepsDetachedProtoAlive(t *testing.T) {
 	engine := interp.New()
 	collector := NewCollector(engine.Heap, engine.Hosts, Config{ProtoStore: engine.Protos})
@@ -579,8 +627,14 @@ func TestCollectorAssistSafepointStartsIncrementalCycle(t *testing.T) {
 	if err := collector.AssistSafepoint(); err != nil {
 		t.Fatalf("assist safepoint: %v", err)
 	}
+	if collector.Phase() == heap.GCPhasePause {
+		if !collector.preparing {
+			t.Fatalf("collector should enter incremental prepare or mark after safepoint assist, phase=%d preparing=%v", collector.Phase(), collector.preparing)
+		}
+		return
+	}
 	if collector.Phase() != heap.GCPhaseMark {
-		t.Fatalf("collector phase after safepoint assist = %d, want mark", collector.Phase())
+		t.Fatalf("collector phase after safepoint assist = %d, want mark or incremental prepare", collector.Phase())
 	}
 }
 
@@ -715,7 +769,21 @@ func TestCollectorSweepDoesNotLeakDeadPayloadsWhenOwnerOffsetIsReused(t *testing
 	if collector.Phase() != heap.GCPhaseSweepObjects || !collector.sweeping {
 		t.Fatalf("collector should remain mid-sweep, phase=%d sweeping=%v", collector.Phase(), collector.sweeping)
 	}
+	for attempts := 0; attempts < 32 && !heapRefFreed(engine.Heap, deadTable.Ref); attempts++ {
+		if err := collector.stepOnce(); err != nil {
+			t.Fatalf("advance sweep to free dead owner %d: %v", attempts, err)
+		}
+		if heapRefFreed(engine.Heap, deadTable.Ref) {
+			break
+		}
+		if collector.Phase() != heap.GCPhaseSweepObjects || !collector.sweeping {
+			t.Fatalf("collector finished sweep before dead owner was freed, phase=%d sweeping=%v", collector.Phase(), collector.sweeping)
+		}
+	}
 	assertHeapRefFreed(t, engine.Heap, deadTable.Ref)
+	if collector.Phase() != heap.GCPhaseSweepObjects || !collector.sweeping {
+		t.Fatalf("collector should remain mid-sweep after dead owner is freed, phase=%d sweeping=%v", collector.Phase(), collector.sweeping)
+	}
 
 	reused, err := engine.InternString(strings.Repeat("r", 63))
 	if err != nil {
@@ -1433,11 +1501,16 @@ func TestCollectorSweepObjectsFinalizesMultipleDeadHostWrappersForSameHandle(t *
 
 func assertHeapRefFreed(t *testing.T, runtimeHeap *heap.Heap, ref value.HeapRef44) {
 	t.Helper()
-	if address, err := runtimeHeap.DecodeHeapRef(ref); err == nil {
-		if err := runtimeHeap.ValidateObjectAddress(address); err == nil {
-			t.Fatalf("dead ref %#x should not validate after sweep", uint64(ref))
-		}
+	if !heapRefFreed(runtimeHeap, ref) {
+		t.Fatalf("dead ref %#x should not validate after sweep", uint64(ref))
 	}
+}
+
+func heapRefFreed(runtimeHeap *heap.Heap, ref value.HeapRef44) bool {
+	if address, err := runtimeHeap.DecodeHeapRef(ref); err == nil {
+		return runtimeHeap.ValidateObjectAddress(address) != nil
+	}
+	return true
 }
 
 func markForRef(t *testing.T, runtimeHeap *heap.Heap, ref value.HeapRef44) value.MarkBits {

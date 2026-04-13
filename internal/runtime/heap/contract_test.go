@@ -30,6 +30,7 @@ func TestNativeBoundaryContractsStayConstrained(t *testing.T) {
 		"internal/runtime/closure/store_test.go",
 		"internal/runtime/heap/heap.go",
 		"internal/runtime/heap/heap_test.go",
+		"internal/runtime/meta/registry.go",
 		"internal/runtime/proto/store.go",
 		"internal/runtime/proto/store_test.go",
 		"internal/runtime/table/store_test.go",

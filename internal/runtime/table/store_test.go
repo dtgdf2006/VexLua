@@ -130,6 +130,55 @@ func TestArrayPartReadWriteAndLenHint(t *testing.T) {
 	}
 }
 
+func TestLengthMatchesLua51BoundarySearch(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	tables := NewStore(runtimeHeap)
+	handle, err := tables.New(0, 0)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for _, key := range []float64{1, 2, 4} {
+		if err := tables.Set(handle.Ref, value.NumberValue(key), value.NumberValue(key*10)); err != nil {
+			t.Fatalf("set key %v: %v", key, err)
+		}
+	}
+	object, err := tables.Object(handle.Ref)
+	if err != nil {
+		t.Fatalf("read table object: %v", err)
+	}
+	if object.ArrayLenHint != 2 {
+		t.Fatalf("array len hint = %d, want 2", object.ArrayLenHint)
+	}
+	length, err := tables.Length(handle.Ref)
+	if err != nil {
+		t.Fatalf("table length: %v", err)
+	}
+	if length != 4 {
+		t.Fatalf("table length = %d, want 4", length)
+	}
+}
+
+func TestLengthStopsAtFirstBoundaryWhenArrayTailIsNil(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	tables := NewStore(runtimeHeap)
+	handle, err := tables.New(0, 0)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for _, key := range []float64{1, 2, 5} {
+		if err := tables.Set(handle.Ref, value.NumberValue(key), value.NumberValue(key*10)); err != nil {
+			t.Fatalf("set key %v: %v", key, err)
+		}
+	}
+	length, err := tables.Length(handle.Ref)
+	if err != nil {
+		t.Fatalf("table length: %v", err)
+	}
+	if length != 2 {
+		t.Fatalf("table length = %d, want 2", length)
+	}
+}
+
 func TestHashPartVersionAndMetatableBlockers(t *testing.T) {
 	runtimeHeap := heap.MustNew(0, 0)
 	strings := rtstring.NewInternTable(runtimeHeap, 0xCAFEBABE)
@@ -170,6 +219,28 @@ func TestHashPartVersionAndMetatableBlockers(t *testing.T) {
 	}
 	if afterOverwrite.TableVersion != afterInsert.TableVersion {
 		t.Fatalf("expected overwrite to keep version stable, got %d -> %d", afterInsert.TableVersion, afterOverwrite.TableVersion)
+	}
+
+	metaMethodKey, err := strings.Intern("__call")
+	if err != nil {
+		t.Fatalf("intern metamethod key: %v", err)
+	}
+	if err := tables.Set(handle.Ref, metaMethodKey.Value, value.NumberValue(7)); err != nil {
+		t.Fatalf("insert metamethod key: %v", err)
+	}
+	afterMetaInsert, err := tables.Object(handle.Ref)
+	if err != nil {
+		t.Fatalf("read table after metamethod insert: %v", err)
+	}
+	if err := tables.Set(handle.Ref, metaMethodKey.Value, value.NumberValue(8)); err != nil {
+		t.Fatalf("overwrite metamethod key: %v", err)
+	}
+	afterMetaOverwrite, err := tables.Object(handle.Ref)
+	if err != nil {
+		t.Fatalf("read table after metamethod overwrite: %v", err)
+	}
+	if afterMetaOverwrite.TableVersion <= afterMetaInsert.TableVersion {
+		t.Fatalf("expected metamethod overwrite to bump version, got %d -> %d", afterMetaInsert.TableVersion, afterMetaOverwrite.TableVersion)
 	}
 
 	metatableKey, err := strings.Intern("meta")

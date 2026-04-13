@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	VMStateHeaderSize              = 0x38
+	VMStateHeaderSize              = 0x40
 	VMStateHeapBaseOffset          = 0x00
 	VMStateActiveThreadStackOffset = 0x08
 	VMStateActiveThreadFrameOffset = 0x10
@@ -18,6 +18,7 @@ const (
 	VMStateThreadCountOffset       = 0x28
 	VMStateFlagsOffset             = 0x2C
 	VMStateActiveThreadStateOffset = 0x30
+	VMStateTypeMetatableStateOff   = 0x38
 )
 
 const (
@@ -26,14 +27,15 @@ const (
 )
 
 type VMStateHeader struct {
-	HeapBase              uint64
-	ActiveThreadStackBase uint64
-	ActiveThreadFrameBase uint64
-	ActiveThreadStackEnd  uint64
-	ActiveThreadFrameEnd  uint64
-	ThreadCount           uint32
-	Flags                 uint32
-	ActiveThreadStateBase uint64
+	HeapBase               uint64
+	ActiveThreadStackBase  uint64
+	ActiveThreadFrameBase  uint64
+	ActiveThreadStackEnd   uint64
+	ActiveThreadFrameEnd   uint64
+	ThreadCount            uint32
+	Flags                  uint32
+	ActiveThreadStateBase  uint64
+	TypeMetatableStateBase uint64
 }
 
 func (vm *VMState) NativePointer() unsafe.Pointer {
@@ -50,6 +52,16 @@ func (vm *VMState) SyncActiveThread(thread *ThreadState) {
 	vm.syncHeader(thread)
 }
 
+func (vm *VMState) SetTypeMetatableStateBase(base uintptr) {
+	if vm == nil {
+		return
+	}
+	vm.typeMetaBase = base
+	if vm.nativeHeader != nil {
+		vm.nativeHeader.TypeMetatableStateBase = uint64(base)
+	}
+}
+
 func (vm *VMState) syncHeader(thread *ThreadState) {
 	if vm == nil || vm.nativeHeader == nil {
 		return
@@ -57,6 +69,7 @@ func (vm *VMState) syncHeader(thread *ThreadState) {
 	vm.nativeHeader.HeapBase = uint64(vm.HeapBase)
 	vm.nativeHeader.ThreadCount = uint32(len(vm.threads))
 	vm.nativeHeader.Flags = 0
+	vm.nativeHeader.TypeMetatableStateBase = uint64(vm.typeMetaBase)
 	if vm.Heap != nil && vm.Heap.GCPhase() == heap.GCPhaseMark {
 		vm.nativeHeader.Flags |= VMFlagGCMarking
 	}
@@ -105,6 +118,9 @@ func ValidateVMStateLayout() error {
 	}
 	if unsafe.Offsetof(VMStateHeader{}.ActiveThreadStateBase) != VMStateActiveThreadStateOffset {
 		return fmt.Errorf("VMStateHeader.ActiveThreadStateBase offset mismatch: got %#x want %#x", unsafe.Offsetof(VMStateHeader{}.ActiveThreadStateBase), VMStateActiveThreadStateOffset)
+	}
+	if unsafe.Offsetof(VMStateHeader{}.TypeMetatableStateBase) != VMStateTypeMetatableStateOff {
+		return fmt.Errorf("VMStateHeader.TypeMetatableStateBase offset mismatch: got %#x want %#x", unsafe.Offsetof(VMStateHeader{}.TypeMetatableStateBase), VMStateTypeMetatableStateOff)
 	}
 	if err := ValidateThreadStateLayout(); err != nil {
 		return err

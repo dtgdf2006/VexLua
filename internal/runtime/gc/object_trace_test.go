@@ -1,11 +1,14 @@
 package gc
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"vexlua/internal/bytecode"
 	"vexlua/internal/interp"
 	"vexlua/internal/runtime/feedback"
+	"vexlua/internal/runtime/heap"
 	"vexlua/internal/runtime/value"
 	"vexlua/internal/vexarc/baseline"
 )
@@ -139,6 +142,119 @@ func TestTracerClosureTreatsFeedbackCellsAsWeakAndScrubsDeadTargets(t *testing.T
 	}
 	if updated.State != feedback.StateGeneric || updated.HeapRef != 0 || updated.ValueBits != 0 {
 		t.Fatalf("scrubbed feedback cell = %+v, want generic zeroed cell", updated)
+	}
+}
+
+func TestTracerClosureScrubsPolymorphicFeedbackEntriesIndividually(t *testing.T) {
+	engine := interp.New()
+	tracer := NewTracer(engine.Heap, engine.Hosts)
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@poly-feedback.lua",
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closureHandle, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	if _, err := engine.Closures.EnsureFeedbackVector(closureHandle.Ref, feedback.LayoutForProto(proto)); err != nil {
+		t.Fatalf("ensure feedback vector: %v", err)
+	}
+	receiver1, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new receiver1: %v", err)
+	}
+	receiver2, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new receiver2: %v", err)
+	}
+	target1, err := engine.NewClosure(&bytecode.Proto{Source: "@poly-target-1.lua", MaxStackSize: 1, Constants: []bytecode.Constant{bytecode.NumberConstant(41)}, Code: []bytecode.Instruction{bytecode.CreateABx(bytecode.OP_LOADK, 0, 0), bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0)}}, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new target1: %v", err)
+	}
+	target2, err := engine.NewClosure(&bytecode.Proto{Source: "@poly-target-2.lua", MaxStackSize: 1, Constants: []bytecode.Constant{bytecode.NumberConstant(42)}, Code: []bytecode.Instruction{bytecode.CreateABx(bytecode.OP_LOADK, 0, 0), bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0)}}, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new target2: %v", err)
+	}
+	payload, err := engine.Heap.AllocPayload(feedback.CallPolymorphicDataSize, heap.PayloadLayoutOpaque, 0)
+	if err != nil {
+		t.Fatalf("alloc call polymorphic payload: %v", err)
+	}
+	entries := [feedback.CallPolymorphicEntryCount]feedback.CallPolymorphicEntry{
+		feedback.NewCallPolymorphicEntry(feedback.AccessCallResolvedLuaClosure, target1.Ref, receiver1.Value.Bits(), feedback.CallShape{Kind: feedback.CallShapeTableMetatable, VersionA: 7, VersionB: 11}),
+		feedback.NewCallPolymorphicEntry(feedback.AccessCallResolvedLuaClosure, target2.Ref, receiver2.Value.Bits(), feedback.CallShape{Kind: feedback.CallShapeTableMetatable, VersionA: 8, VersionB: 12}),
+	}
+	if err := feedback.WriteCallPolymorphicEntries(payload.Bytes, entries); err != nil {
+		t.Fatalf("write call polymorphic entries: %v", err)
+	}
+	if err := engine.Closures.WriteFeedbackCell(closureHandle.Ref, 0, feedback.NewCallPolymorphicCell(feedback.SlotCall, payload.Offset)); err != nil {
+		t.Fatalf("write polymorphic feedback cell: %v", err)
+	}
+	strong, weak := collectObjectEdges(t, tracer, closureHandle.Ref)
+	for _, ref := range []value.HeapRef44{receiver1.Ref, receiver2.Ref, target1.Ref, target2.Ref} {
+		if _, ok := strong[ref]; ok {
+			t.Fatalf("polymorphic feedback ref %#x should not be strong", uint64(ref))
+		}
+	}
+	for _, ref := range []value.HeapRef44{target1.Ref, target2.Ref} {
+		if !hasWeakRef(weak, WeakRefFeedbackCellHeapRef, closureHandle.Ref, ref, 0) {
+			t.Fatalf("missing polymorphic weak heap edge for %#x: %+v", uint64(ref), weak)
+		}
+	}
+	for _, ref := range []value.HeapRef44{receiver1.Ref, receiver2.Ref} {
+		if !hasWeakRef(weak, WeakRefFeedbackCellValueBits, closureHandle.Ref, ref, 0) {
+			t.Fatalf("missing polymorphic weak value edge for %#x: %+v", uint64(ref), weak)
+		}
+	}
+	scrubbed, err := tracer.ScrubDeadFeedbackCells(closureHandle.Ref, func(ref value.HeapRef44) bool {
+		return ref == target1.Ref || ref == receiver1.Ref
+	})
+	if err != nil {
+		t.Fatalf("scrub polymorphic feedback cells: %v", err)
+	}
+	if scrubbed != 1 {
+		t.Fatalf("scrubbed polymorphic cells = %d, want 1", scrubbed)
+	}
+	updated, err := engine.Closures.ReadFeedbackCell(closureHandle.Ref, 0)
+	if err != nil {
+		t.Fatalf("read scrubbed polymorphic feedback cell: %v", err)
+	}
+	if updated.State != feedback.StateMonomorphic || updated.AccessKind != feedback.AccessCallResolvedLuaClosure || updated.TargetRef() != target2.Ref || updated.ValueBits != receiver2.Value.Bits() {
+		t.Fatalf("scrubbed polymorphic feedback cell = %+v, want receiver2/target2 monomorphic", updated)
+	}
+	metadata, err := engine.Heap.SpanMetadata(payload.Offset)
+	if err != nil {
+		t.Fatalf("read polymorphic payload metadata: %v", err)
+	}
+	if metadata.State != heap.SpanStateFree {
+		t.Fatalf("polymorphic payload state = %d, want free", metadata.State)
+	}
+}
+
+func TestTracerPolymorphicFeedbackSourceAudit(t *testing.T) {
+	source, err := os.ReadFile("object_trace.go")
+	if err != nil {
+		t.Fatalf("read object_trace.go: %v", err)
+	}
+	text := string(source)
+	for _, needle := range []string{
+		"callPolymorphicEntryDead(",
+		"visitWeak(WeakRef{Kind: WeakRefFeedbackCellHeapRef, Owner: closureRef, Target: entry.TargetRef, Slot: slot})",
+		"visitWeakTValue(value.FromRaw(entry.ValueBits), WeakRef{Kind: WeakRefFeedbackCellValueBits, Owner: closureRef, Slot: slot}, visitWeak)",
+		"live[0].MonomorphicCell(cell.SlotKind)",
+		"feedback.NewGenericCell(cell.SlotKind)",
+		"tracer.heap.FreeSpan(offset)",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("polymorphic feedback GC contract should retain %q", needle)
+		}
 	}
 }
 

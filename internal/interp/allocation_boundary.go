@@ -2,7 +2,6 @@ package interp
 
 import (
 	"fmt"
-	"strings"
 
 	"vexlua/internal/bytecode"
 	"vexlua/internal/runtime/state"
@@ -25,24 +24,16 @@ func (engine *Engine) NewTableBoundary(arrayCap uint32, hashCap uint32, publish 
 	return engine.advanceGCAfterBoundary(before)
 }
 
-func (engine *Engine) ConcatValuesBoundary(values []value.TValue, publish func(value.TValue) error) error {
+func (engine *Engine) ConcatValuesBoundary(thread *state.ThreadState, values []value.TValue, publish func(value.TValue) error) error {
 	if publish == nil {
 		return fmt.Errorf("concat boundary requires publish callback")
 	}
 	before := engine.liveBytes()
-	var builder strings.Builder
-	for _, slotValue := range values {
-		part, err := engine.concatOperandText(slotValue)
-		if err != nil {
-			return err
-		}
-		builder.WriteString(part)
-	}
-	handle, err := engine.Strings.Intern(builder.String())
+	result, err := engine.ConcatBoundary(thread, values)
 	if err != nil {
 		return err
 	}
-	if err := publish(handle.Value); err != nil {
+	if err := publish(result); err != nil {
 		return err
 	}
 	return engine.advanceGCAfterBoundary(before)

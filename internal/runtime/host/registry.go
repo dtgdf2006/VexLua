@@ -18,8 +18,8 @@ const (
 	DescriptorKindFunction
 )
 
-type Getter func(target any, key string) (any, bool, error)
-type Setter func(target any, key string, newValue any) error
+type Getter func(target any, key any) (any, bool, error)
+type Setter func(target any, key any, newValue any) error
 type Caller func(target any, args []any) ([]any, error)
 
 type Descriptor struct {
@@ -418,6 +418,28 @@ func (registry *Registry) SetWrapperEnv(ref value.HeapRef44, env value.TValue) (
 		return WrapperHeader{}, err
 	}
 	if err := registry.heap.WriteBarrierValueByOffset(offset, env); err != nil {
+		return WrapperHeader{}, err
+	}
+	return header, nil
+}
+
+func (registry *Registry) SetWrapperMetatable(ref value.HeapRef44, metatable value.TValue) (WrapperHeader, error) {
+	header, offset, bytes, err := registry.readAnyWrapperBytes(ref)
+	if err != nil {
+		return WrapperHeader{}, err
+	}
+	if header.Metatable.Bits() == metatable.Bits() {
+		return header, nil
+	}
+	header.Metatable = metatable
+	header.MetatableVersion++
+	if header.MetatableVersion == 0 {
+		header.MetatableVersion = 1
+	}
+	if err := writeWrapperHeader(bytes, header); err != nil {
+		return WrapperHeader{}, err
+	}
+	if err := registry.heap.WriteBarrierValueByOffset(offset, metatable); err != nil {
 		return WrapperHeader{}, err
 	}
 	return header, nil

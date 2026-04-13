@@ -24,15 +24,15 @@ func (state *compileState) emitLoadOperandValue(operand int, dst amd64.Register)
 }
 
 func (state *compileState) emitArithmetic(bytecodePC int, opcode bytecode.Opcode, a int, b int, c int) {
-	deoptPath := state.assembler.NewLabel()
+	stubPath := state.assembler.NewLabel()
 	done := state.assembler.NewLabel()
-	siteID := state.recordContinuationSite(metadata.ContinuationArithmetic, stubs.StubInvalid, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(a), uint32(b), uint32(c), uint32(opcode), metadata.ContinuationFlagDeoptOnUncovered)
+	siteID := state.recordContinuationSite(metadata.ContinuationArithmetic, stubs.StubArithmetic, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(a), uint32(b), uint32(c), uint32(opcode), metadata.ContinuationFlagDeoptOnUncovered)
 
 	state.emitLoadOperandValue(b, amd64.RegRAX)
-	emitLoadNumberFromValueReg(state.assembler, amd64.RegRAX, amd64.RegR9, amd64.XMM0, deoptPath)
+	emitLoadNumberFromValueReg(state.assembler, amd64.RegRAX, amd64.RegR9, amd64.XMM0, stubPath)
 	if opcode != bytecode.OP_UNM {
 		state.emitLoadOperandValue(c, amd64.RegRBX)
-		emitLoadNumberFromValueReg(state.assembler, amd64.RegRBX, amd64.RegR10, amd64.XMM1, deoptPath)
+		emitLoadNumberFromValueReg(state.assembler, amd64.RegRBX, amd64.RegR10, amd64.XMM1, stubPath)
 	}
 
 	switch opcode {
@@ -49,38 +49,9 @@ func (state *compileState) emitArithmetic(bytecodePC int, opcode bytecode.Opcode
 		state.assembler.DivsdXmmXmm(amd64.XMM0, amd64.XMM1)
 		state.assembler.MoveMemXmm64(amd64.RegR12, slotDisp(a), amd64.XMM0)
 	case bytecode.OP_MOD:
-		state.assembler.XorpsXmmXmm(amd64.XMM2, amd64.XMM2)
-		state.assembler.UcomisdXmmXmm(amd64.XMM1, amd64.XMM2)
-		state.assembler.Jcc(amd64.CondParity, deoptPath)
-		state.assembler.Jcc(amd64.CondEqual, deoptPath)
-		state.assembler.MoveMemXmm64(amd64.RegR12, slotDisp(a), amd64.XMM0)
-		state.assembler.MoveXmmMem64(amd64.XMM2, amd64.RegR12, slotDisp(a))
-		state.assembler.DivsdXmmXmm(amd64.XMM2, amd64.XMM1)
-		state.assembler.Cvttsd2siReg64(amd64.RegRCX, amd64.XMM2)
-		state.assembler.Cvtsi2sdXmmReg64(amd64.XMM3, amd64.RegRCX)
-		state.assembler.MulsdXmmXmm(amd64.XMM3, amd64.XMM1)
-		state.assembler.SubsdXmmXmm(amd64.XMM0, amd64.XMM3)
-		state.assembler.MoveMemXmm64(amd64.RegR12, slotDisp(a), amd64.XMM0)
+		state.assembler.Jmp(stubPath)
 	case bytecode.OP_POW:
-		state.assembler.Cvttsd2siReg64(amd64.RegRCX, amd64.XMM1)
-		state.assembler.Cvtsi2sdXmmReg64(amd64.XMM2, amd64.RegRCX)
-		state.assembler.UcomisdXmmXmm(amd64.XMM1, amd64.XMM2)
-		state.assembler.Jcc(amd64.CondParity, deoptPath)
-		state.assembler.Jcc(amd64.CondNotEqual, deoptPath)
-		state.assembler.CmpRegImm32(amd64.RegRCX, 0)
-		state.assembler.Jcc(amd64.CondLess, deoptPath)
-		emitLoadFloat64Immediate(state.assembler, amd64.XMM2, uint64(value.NumberValue(1).Bits()), amd64.RegR9)
-		powDone := state.assembler.NewLabel()
-		powLoop := state.assembler.NewLabel()
-		state.assembler.CmpRegImm32(amd64.RegRCX, 0)
-		state.assembler.Jcc(amd64.CondEqual, powDone)
-		_ = state.assembler.Bind(powLoop)
-		state.assembler.MulsdXmmXmm(amd64.XMM2, amd64.XMM0)
-		state.assembler.AddRegImm32(amd64.RegRCX, -1)
-		state.assembler.CmpRegImm32(amd64.RegRCX, 0)
-		state.assembler.Jcc(amd64.CondGreater, powLoop)
-		_ = state.assembler.Bind(powDone)
-		state.assembler.MoveMemXmm64(amd64.RegR12, slotDisp(a), amd64.XMM2)
+		state.assembler.Jmp(stubPath)
 	case bytecode.OP_UNM:
 		state.assembler.XorpsXmmXmm(amd64.XMM1, amd64.XMM1)
 		state.assembler.SubsdXmmXmm(amd64.XMM1, amd64.XMM0)
@@ -91,8 +62,8 @@ func (state *compileState) emitArithmetic(bytecodePC int, opcode bytecode.Opcode
 	state.emitAdvanceTopForSlot(a)
 	state.assembler.Jmp(done)
 
-	_ = state.assembler.Bind(deoptPath)
-	state.emitDeoptExit(siteID)
+	_ = state.assembler.Bind(stubPath)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubArithmetic], siteID, stubs.StubArithmetic, uint64(a), uint64(b), uint64(c), uint64(opcode), 0)
 
 	_ = state.assembler.Bind(done)
 }
@@ -114,8 +85,7 @@ func (state *compileState) emitNot(_ int, dst int, src int) {
 
 func (state *compileState) emitLength(bytecodePC int, dst int, src int) {
 	stringPath := state.assembler.NewLabel()
-	tablePath := state.assembler.NewLabel()
-	deoptPath := state.assembler.NewLabel()
+	stubPath := state.assembler.NewLabel()
 	done := state.assembler.NewLabel()
 	siteID := state.recordContinuationSite(metadata.ContinuationLength, stubs.StubLen, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(dst), uint32(src), 0, 0, metadata.ContinuationFlagDeoptOnUncovered)
 
@@ -124,9 +94,7 @@ func (state *compileState) emitLength(bytecodePC int, dst int, src int) {
 	state.assembler.ShiftRightRegImm8(amd64.RegR10, value.TagShift)
 	state.assembler.CmpRegImm32(amd64.RegR10, shiftedBoxedTag(value.TagStringRef))
 	state.assembler.Jcc(amd64.CondEqual, stringPath)
-	state.assembler.CmpRegImm32(amd64.RegR10, shiftedBoxedTag(value.TagTableRef))
-	state.assembler.Jcc(amd64.CondEqual, tablePath)
-	state.assembler.Jmp(deoptPath)
+	state.assembler.Jmp(stubPath)
 
 	_ = state.assembler.Bind(stringPath)
 	emitExtractHeapRefPayloadFromTValue(state.assembler, amd64.RegRDX, amd64.RegRAX)
@@ -137,21 +105,8 @@ func (state *compileState) emitLength(bytecodePC int, dst int, src int) {
 	state.emitAdvanceTopForSlot(dst)
 	state.assembler.Jmp(done)
 
-	_ = state.assembler.Bind(tablePath)
-	emitExtractHeapRefPayloadFromTValue(state.assembler, amd64.RegRDX, amd64.RegRAX)
-	emitDecodeHeapRefFromRaw(state.assembler, amd64.RegRDX)
-	state.assembler.MoveRegMem32(amd64.RegRCX, amd64.RegRDX, rttable.FlagsOffset)
-	state.assembler.AndRegImm32(amd64.RegRCX, uint32(rttable.FlagHasMetatable))
-	state.assembler.CmpRegImm32(amd64.RegRCX, 0)
-	state.assembler.Jcc(amd64.CondNotEqual, deoptPath)
-	state.assembler.MoveRegMem32(amd64.RegRCX, amd64.RegRDX, rttable.ArrayLenHintOffset)
-	state.assembler.Cvtsi2sdXmmReg64(amd64.XMM0, amd64.RegRCX)
-	state.assembler.MoveMemXmm64(amd64.RegR12, slotDisp(dst), amd64.XMM0)
-	state.emitAdvanceTopForSlot(dst)
-	state.assembler.Jmp(done)
-
-	_ = state.assembler.Bind(deoptPath)
-	state.emitDeoptExit(siteID)
+	_ = state.assembler.Bind(stubPath)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubLen], siteID, stubs.StubLen, uint64(dst), uint64(src), 0, 0, 0)
 
 	_ = state.assembler.Bind(done)
 }
@@ -162,7 +117,7 @@ func (state *compileState) emitSelf(bytecodePC int, dst int, tableSlot int, keyO
 	nextEntry := state.assembler.NewLabel()
 	notFound := state.assembler.NewLabel()
 	storeResult := state.assembler.NewLabel()
-	deoptPath := state.assembler.NewLabel()
+	dispatchPath := state.assembler.NewLabel()
 	done := state.assembler.NewLabel()
 	siteID := state.recordContinuationSite(metadata.ContinuationSelf, stubs.StubSelf, bytecodePC, bytecodePC, bytecodePC+1, -1, uint32(dst), uint32(tableSlot), uint32(keyOperand), 0, metadata.ContinuationFlagDeoptOnUncovered)
 
@@ -174,13 +129,13 @@ func (state *compileState) emitSelf(bytecodePC int, dst int, tableSlot int, keyO
 	state.assembler.ShiftRightRegImm8(amd64.RegRAX, value.TagShift)
 	state.assembler.CmpRegImm32(amd64.RegRAX, shiftedBoxedTag(value.TagTableRef))
 	state.assembler.Jcc(amd64.CondEqual, tablePath)
-	state.assembler.Jmp(deoptPath)
+	state.assembler.Jmp(dispatchPath)
 
 	_ = state.assembler.Bind(tablePath)
 	state.assembler.MoveRegReg(amd64.RegRAX, amd64.RegRCX)
 	state.assembler.ShiftRightRegImm8(amd64.RegRAX, value.TagShift)
 	state.assembler.CmpRegImm32(amd64.RegRAX, shiftedBoxedTag(value.TagStringRef))
-	state.assembler.Jcc(amd64.CondNotEqual, deoptPath)
+	state.assembler.Jcc(amd64.CondNotEqual, dispatchPath)
 	state.assembler.MoveRegReg(amd64.RegRAX, amd64.RegRDX)
 	emitExtractHeapRefPayloadFromTValue(state.assembler, amd64.RegRAX, amd64.RegRAX)
 	emitDecodeHeapRefFromRaw(state.assembler, amd64.RegRAX)
@@ -214,7 +169,7 @@ func (state *compileState) emitSelf(bytecodePC int, dst int, tableSlot int, keyO
 	state.assembler.MoveRegMem32(amd64.RegRAX, amd64.RegRBX, rttable.FlagsOffset)
 	state.assembler.AndRegImm32(amd64.RegRAX, uint32(rttable.FlagIndexFastPathBlocked|rttable.FlagWeakKeys|rttable.FlagWeakValues|rttable.FlagRehashing))
 	state.assembler.CmpRegImm32(amd64.RegRAX, 0)
-	state.assembler.Jcc(amd64.CondNotEqual, deoptPath)
+	state.assembler.Jcc(amd64.CondNotEqual, dispatchPath)
 	state.assembler.Jmp(storeResult)
 
 	_ = state.assembler.Bind(storeResult)
@@ -222,8 +177,8 @@ func (state *compileState) emitSelf(bytecodePC int, dst int, tableSlot int, keyO
 	state.emitAdvanceTopForSlot(dst + 1)
 	state.assembler.Jmp(done)
 
-	_ = state.assembler.Bind(deoptPath)
-	state.emitDeoptExit(siteID)
+	_ = state.assembler.Bind(dispatchPath)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubSelf], siteID, stubs.StubSelf, uint64(dst), uint64(tableSlot), uint64(keyOperand), 0, 0)
 
 	_ = state.assembler.Bind(done)
 }
@@ -232,9 +187,9 @@ func (state *compileState) emitCompare(bytecodePC int, opcode bytecode.Opcode, a
 	conditionTrue := state.assembler.NewLabel()
 	conditionFalse := state.assembler.NewLabel()
 	leftBoxedEq := state.assembler.NewLabel()
-	deoptPath := state.assembler.NewLabel()
+	stubPath := state.assembler.NewLabel()
 	fallthroughPath := state.labelFor(bytecodePC + 2)
-	siteID := state.recordContinuationSite(metadata.ContinuationCompare, stubs.StubInvalid, bytecodePC, bytecodePC, bytecodePC+2, -1, uint32(a), uint32(b), uint32(c), uint32(opcode), metadata.ContinuationFlagDeoptOnUncovered)
+	siteID := state.recordContinuationSite(metadata.ContinuationCompare, stubs.StubCompare, bytecodePC, bytecodePC, bytecodePC+2, target, uint32(a), uint32(b), uint32(c), uint32(opcode), metadata.ContinuationFlagAlternateResume|metadata.ContinuationFlagNativeBuiltinABI|metadata.ContinuationFlagDeoptOnUncovered)
 
 	state.emitLoadOperandValue(b, amd64.RegRAX)
 	state.emitLoadOperandValue(c, amd64.RegRBX)
@@ -249,8 +204,8 @@ func (state *compileState) emitCompare(bytecodePC int, opcode bytecode.Opcode, a
 		state.assembler.ShiftRightRegImm8(amd64.RegR10, 48)
 		state.assembler.CmpRegImm32(amd64.RegR10, 0xFFFF)
 		state.assembler.Jcc(amd64.CondEqual, conditionFalse)
-		emitLoadNumberFromValueReg(state.assembler, amd64.RegRAX, amd64.RegR9, amd64.XMM0, deoptPath)
-		emitLoadNumberFromValueReg(state.assembler, amd64.RegRBX, amd64.RegR10, amd64.XMM1, deoptPath)
+		emitLoadNumberFromValueReg(state.assembler, amd64.RegRAX, amd64.RegR9, amd64.XMM0, stubPath)
+		emitLoadNumberFromValueReg(state.assembler, amd64.RegRBX, amd64.RegR10, amd64.XMM1, stubPath)
 		state.assembler.UcomisdXmmXmm(amd64.XMM0, amd64.XMM1)
 		state.assembler.Jcc(amd64.CondParity, conditionFalse)
 		state.assembler.Jcc(amd64.CondEqual, conditionTrue)
@@ -263,18 +218,28 @@ func (state *compileState) emitCompare(bytecodePC int, opcode bytecode.Opcode, a
 		state.assembler.Jcc(amd64.CondNotEqual, conditionFalse)
 		state.assembler.CmpRegReg(amd64.RegRAX, amd64.RegRBX)
 		state.assembler.Jcc(amd64.CondEqual, conditionTrue)
+		state.assembler.MoveRegReg(amd64.RegR9, amd64.RegRAX)
+		state.assembler.ShiftRightRegImm8(amd64.RegR9, value.TagShift)
+		state.assembler.MoveRegReg(amd64.RegR10, amd64.RegRBX)
+		state.assembler.ShiftRightRegImm8(amd64.RegR10, value.TagShift)
+		state.assembler.CmpRegReg(amd64.RegR9, amd64.RegR10)
+		state.assembler.Jcc(amd64.CondNotEqual, conditionFalse)
+		state.assembler.CmpRegImm32(amd64.RegR9, shiftedBoxedTag(value.TagTableRef))
+		state.assembler.Jcc(amd64.CondEqual, stubPath)
+		state.assembler.CmpRegImm32(amd64.RegR9, shiftedBoxedTag(value.TagHostObjectRef))
+		state.assembler.Jcc(amd64.CondEqual, stubPath)
 		state.assembler.Jmp(conditionFalse)
 	case bytecode.OP_LT, bytecode.OP_LE:
 		state.assembler.MoveRegReg(amd64.RegR9, amd64.RegRAX)
 		state.assembler.ShiftRightRegImm8(amd64.RegR9, 48)
 		state.assembler.CmpRegImm32(amd64.RegR9, 0xFFFF)
-		state.assembler.Jcc(amd64.CondEqual, deoptPath)
+		state.assembler.Jcc(amd64.CondEqual, stubPath)
 		state.assembler.MoveRegReg(amd64.RegR10, amd64.RegRBX)
 		state.assembler.ShiftRightRegImm8(amd64.RegR10, 48)
 		state.assembler.CmpRegImm32(amd64.RegR10, 0xFFFF)
-		state.assembler.Jcc(amd64.CondEqual, deoptPath)
-		emitLoadNumberFromValueReg(state.assembler, amd64.RegRAX, amd64.RegR9, amd64.XMM0, deoptPath)
-		emitLoadNumberFromValueReg(state.assembler, amd64.RegRBX, amd64.RegR10, amd64.XMM1, deoptPath)
+		state.assembler.Jcc(amd64.CondEqual, stubPath)
+		emitLoadNumberFromValueReg(state.assembler, amd64.RegRAX, amd64.RegR9, amd64.XMM0, stubPath)
+		emitLoadNumberFromValueReg(state.assembler, amd64.RegRBX, amd64.RegR10, amd64.XMM1, stubPath)
 		state.assembler.UcomisdXmmXmm(amd64.XMM0, amd64.XMM1)
 		state.assembler.Jcc(amd64.CondParity, conditionFalse)
 		if opcode == bytecode.OP_LT {
@@ -301,8 +266,8 @@ func (state *compileState) emitCompare(bytecodePC int, opcode bytecode.Opcode, a
 		state.assembler.Jmp(fallthroughPath)
 	}
 
-	_ = state.assembler.Bind(deoptPath)
-	state.emitDeoptExit(siteID)
+	_ = state.assembler.Bind(stubPath)
+	state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubCompare], siteID, stubs.StubCompare, uint64(a), uint64(b), uint64(c), uint64(opcode), 0)
 }
 
 func (state *compileState) emitTest(bytecodePC int, opcode bytecode.Opcode, a int, b int, c int, target int) {
@@ -330,6 +295,7 @@ func (state *compileState) emitTest(bytecodePC int, opcode bytecode.Opcode, a in
 	emitJumpIfValueFalsey(state.assembler, amd64.RegRAX, amd64.RegR10, falsey)
 	if c != 0 {
 		state.assembler.MoveMemReg64(amd64.RegR12, slotDisp(a), amd64.RegRAX)
+		state.emitAdvanceTopForSlot(a)
 		state.assembler.Jmp(state.labelFor(target))
 	}
 	state.assembler.Jmp(fallthroughPath)
@@ -337,6 +303,7 @@ func (state *compileState) emitTest(bytecodePC int, opcode bytecode.Opcode, a in
 	_ = state.assembler.Bind(falsey)
 	if c == 0 {
 		state.assembler.MoveMemReg64(amd64.RegR12, slotDisp(a), amd64.RegRAX)
+		state.emitAdvanceTopForSlot(a)
 		state.assembler.Jmp(state.labelFor(target))
 	}
 	state.assembler.Jmp(fallthroughPath)

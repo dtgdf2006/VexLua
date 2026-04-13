@@ -32,6 +32,9 @@ func TestStubManagerInstallsAllCoveredNativeBuiltinBodies(t *testing.T) {
 		stubs.StubTailCall,
 		stubs.StubForPrep,
 		stubs.StubForLoop,
+		stubs.StubArithmetic,
+		stubs.StubLen,
+		stubs.StubCompare,
 		stubs.StubSetList,
 	} {
 		if manager.stubBodies[id] == nil {
@@ -252,6 +255,26 @@ func TestCompilerEmitsNativeBuiltinContinuationContracts(t *testing.T) {
 		if !strings.Contains(compilerText, needle) {
 			t.Fatalf("compiler should lock builtin continuation metadata contract %q", needle)
 		}
+	}
+	pureJITSource, err := os.ReadFile("pure_jit_lowering.go")
+	if err != nil {
+		t.Fatalf("read pure_jit_lowering.go: %v", err)
+	}
+	pureJITText := string(pureJITSource)
+	if !strings.Contains(pureJITText, "recordContinuationSite(metadata.ContinuationArithmetic, stubs.StubArithmetic") {
+		t.Fatalf("pure jit lowering should lock arithmetic continuation metadata contract")
+	}
+	if !strings.Contains(pureJITText, "recordContinuationSite(metadata.ContinuationLength, stubs.StubLen") {
+		t.Fatalf("pure jit lowering should lock len continuation metadata contract")
+	}
+	if !strings.Contains(pureJITText, "recordContinuationSite(metadata.ContinuationCompare, stubs.StubCompare") {
+		t.Fatalf("pure jit lowering should lock compare continuation metadata contract")
+	}
+	if !strings.Contains(pureJITText, "state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubLen]") {
+		t.Fatalf("pure jit lowering should route len slow paths through the shared len stub")
+	}
+	if !strings.Contains(pureJITText, "state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubCompare]") {
+		t.Fatalf("pure jit lowering should route compare slow paths through the shared compare stub")
 	}
 	tableSource, err := os.ReadFile("table_lowering.go")
 	if err != nil {

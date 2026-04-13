@@ -85,6 +85,21 @@ func validateInstruction(proto *Proto, pc int, in Instruction, maxStack int) err
 		return nil
 	}
 
+	checkTrailingTestJump := func() error {
+		if pc+1 >= len(proto.Code) {
+			return &ValidationError{PC: pc, Opcode: op, Reason: "missing trailing JMP"}
+		}
+		jump := proto.Code[pc+1]
+		if jump.Opcode() != OP_JMP {
+			return &ValidationError{PC: pc, Opcode: op, Reason: fmt.Sprintf("expects trailing JMP, got %s", jump.Opcode())}
+		}
+		target := pc + 2 + jump.SBx()
+		if target < 0 || target >= len(proto.Code) {
+			return &ValidationError{PC: pc, Opcode: op, Reason: fmt.Sprintf("trailing JMP target out of range: %d", target)}
+		}
+		return nil
+	}
+
 	if op.Info().SetsA {
 		if err := checkReg(a, "A"); err != nil {
 			return err
@@ -144,7 +159,13 @@ func validateInstruction(proto *Proto, pc int, in Instruction, maxStack int) err
 		if err := checkRK(b, "B"); err != nil {
 			return err
 		}
-		return checkRK(c, "C")
+		if err := checkRK(c, "C"); err != nil {
+			return err
+		}
+		if op == OP_EQ || op == OP_LT || op == OP_LE {
+			return checkTrailingTestJump()
+		}
+		return nil
 	case OP_UNM, OP_NOT, OP_LEN:
 		return checkReg(b, "B")
 	case OP_CONCAT:
@@ -161,6 +182,7 @@ func validateInstruction(proto *Proto, pc int, in Instruction, maxStack int) err
 		if c > 1 {
 			return &ValidationError{PC: pc, Opcode: op, Reason: "C flag must be 0 or 1"}
 		}
+		return checkTrailingTestJump()
 	case OP_TESTSET:
 		if err := checkReg(b, "B"); err != nil {
 			return err
@@ -168,6 +190,7 @@ func validateInstruction(proto *Proto, pc int, in Instruction, maxStack int) err
 		if c > 1 {
 			return &ValidationError{PC: pc, Opcode: op, Reason: "C flag must be 0 or 1"}
 		}
+		return checkTrailingTestJump()
 	case OP_CALL, OP_TAILCALL:
 		if b > 0 {
 			if err := checkReg(a+b-1, "A+B-1"); err != nil {
@@ -195,6 +218,7 @@ func validateInstruction(proto *Proto, pc int, in Instruction, maxStack int) err
 		if err := checkReg(a+2+c, "A+2+C"); err != nil {
 			return err
 		}
+		return checkTrailingTestJump()
 	case OP_SETLIST:
 		if b > 0 {
 			if err := checkReg(a+b, "A+B"); err != nil {

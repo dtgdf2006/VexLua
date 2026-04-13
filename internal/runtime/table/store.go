@@ -36,6 +36,8 @@ type Store struct {
 	heap *heap.Heap
 }
 
+const maxLenSearchIndex = uint32(^uint32(0) >> 1)
+
 func NewStore(runtimeHeap *heap.Heap) *Store {
 	if runtimeHeap == nil {
 		panic("table store requires a heap")
@@ -78,6 +80,118 @@ func (store *Store) New(arrayCap uint32, hashCap uint32) (Handle, error) {
 func (store *Store) Object(ref value.HeapRef44) (Object, error) {
 	_, _, object, err := store.loadObject(ref)
 	return object, err
+}
+
+func (store *Store) Length(tableRef value.HeapRef44) (uint32, error) {
+	_, _, object, err := store.loadObject(tableRef)
+	if err != nil {
+		return 0, err
+	}
+	return store.tableLength(object)
+}
+
+func (store *Store) tableLength(object Object) (uint32, error) {
+	j := object.ArrayCap
+	if j > 0 {
+		lastSlot, err := store.readArraySlot(object, j)
+		if err != nil {
+			return 0, err
+		}
+		if isNilValue(lastSlot) {
+			var i uint32
+			for j-i > 1 {
+				mid := (i + j) / 2
+				slotValue, err := store.readArraySlot(object, mid)
+				if err != nil {
+					return 0, err
+				}
+				if isNilValue(slotValue) {
+					j = mid
+				} else {
+					i = mid
+				}
+			}
+			return i, nil
+		}
+	}
+	if object.HashCapacity == 0 {
+		return j, nil
+	}
+	return store.unboundLengthSearch(object, j)
+}
+
+func (store *Store) unboundLengthSearch(object Object, j uint32) (uint32, error) {
+	i := j
+	if j >= maxLenSearchIndex {
+		return store.linearLengthSearch(object)
+	}
+	j++
+	for {
+		present, err := store.integerKeyPresent(object, j)
+		if err != nil {
+			return 0, err
+		}
+		if !present {
+			break
+		}
+		i = j
+		if j > maxLenSearchIndex/2 {
+			return store.linearLengthSearch(object)
+		}
+		j *= 2
+	}
+	for j-i > 1 {
+		mid := (i + j) / 2
+		present, err := store.integerKeyPresent(object, mid)
+		if err != nil {
+			return 0, err
+		}
+		if present {
+			i = mid
+		} else {
+			j = mid
+		}
+	}
+	return i, nil
+}
+
+func (store *Store) linearLengthSearch(object Object) (uint32, error) {
+	for index := uint32(1); index < maxLenSearchIndex; index++ {
+		present, err := store.integerKeyPresent(object, index)
+		if err != nil {
+			return 0, err
+		}
+		if !present {
+			return index - 1, nil
+		}
+	}
+	return maxLenSearchIndex, nil
+}
+
+func (store *Store) integerKeyPresent(object Object, index uint32) (bool, error) {
+	if index == 0 {
+		return false, nil
+	}
+	if index <= object.ArrayCap {
+		slotValue, err := store.readArraySlot(object, index)
+		if err != nil {
+			return false, err
+		}
+		return !isNilValue(slotValue), nil
+	}
+	if object.HashCapacity == 0 {
+		return false, nil
+	}
+	key := value.NumberValue(float64(index))
+	fullHash, keyClass, _, err := store.hashKey(object, key)
+	if err != nil {
+		return false, err
+	}
+	_, found, entry, err := store.findEntry(object, key, fullHash, keyClass)
+	if err != nil {
+		return false, err
+	}
+	return found && !isNilValue(entry.Value), nil
 }
 
 func (store *Store) Get(tableRef value.HeapRef44, key value.TValue) (value.TValue, bool, error) {
@@ -386,6 +500,7 @@ func (store *Store) setHashValue(owner value.HeapOff64, object Object, key value
 			}
 			return object, nil
 		}
+		valueChanged := entry.Value.Bits() != newValue.Bits()
 		entry.Value = newValue
 		if err := store.writeEntryAt(entries, slot, entry); err != nil {
 			return Object{}, err
@@ -399,6 +514,9 @@ func (store *Store) setHashValue(owner value.HeapOff64, object Object, key value
 			if err := store.heap.RememberWeakOwnerByOffset(owner); err != nil {
 				return Object{}, err
 			}
+		}
+		if valueChanged && store.isVersionSensitiveKey(key) {
+			object.BumpVersion()
 		}
 		return object, nil
 	}
@@ -435,6 +553,18 @@ func (store *Store) setHashValue(owner value.HeapOff64, object Object, key value
 	object.BumpVersion()
 	object.SyncLayoutFlags()
 	return object, nil
+}
+
+func (store *Store) isVersionSensitiveKey(key value.TValue) bool {
+	if store == nil || !key.IsBoxedTag(value.TagStringRef) {
+		return false
+	}
+	ref, _ := key.HeapRef()
+	_, text, err := rtstring.StringAt(store.heap, ref)
+	if err != nil || len(text) < 2 {
+		return false
+	}
+	return text[0] == '_' && text[1] == '_'
 }
 
 func (store *Store) ensureArrayCapacity(owner value.HeapOff64, object Object, minimum uint32) (Object, error) {

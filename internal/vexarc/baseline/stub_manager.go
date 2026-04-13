@@ -43,7 +43,9 @@ func newStubManager(cache *codecache.Cache) (*stubManager, error) {
 		stubs.StubForPrep,
 		stubs.StubForLoop,
 		stubs.StubSelf,
+		stubs.StubArithmetic,
 		stubs.StubLen,
+		stubs.StubCompare,
 		stubs.StubSetList,
 		stubs.StubNewTable,
 		stubs.StubConcat,
@@ -124,6 +126,14 @@ func newStubManager(cache *codecache.Cache) (*stubManager, error) {
 			}
 			manager.stubBodies[id] = bodyBlock
 			block = entryBlock
+		case stubs.StubArithmetic:
+			bodyBlock, entryBlock, err := manager.installManagedNativeBuiltin(buildArithmeticBuiltinBody())
+			if err != nil {
+				_ = manager.Release()
+				return nil, err
+			}
+			manager.stubBodies[id] = bodyBlock
+			block = entryBlock
 		case stubs.StubLuaCall:
 			bodyBlock, entryBlock, err := manager.installManagedNativeBuiltin(buildLuaCallBuiltinBody())
 			if err != nil {
@@ -142,6 +152,14 @@ func newStubManager(cache *codecache.Cache) (*stubManager, error) {
 			block = entryBlock
 		case stubs.StubLen:
 			bodyBlock, entryBlock, err := manager.installManagedNativeBuiltin(buildLenBuiltinBody())
+			if err != nil {
+				_ = manager.Release()
+				return nil, err
+			}
+			manager.stubBodies[id] = bodyBlock
+			block = entryBlock
+		case stubs.StubCompare:
+			bodyBlock, entryBlock, err := manager.installManagedNativeBuiltin(buildCompareBuiltinBody())
 			if err != nil {
 				_ = manager.Release()
 				return nil, err

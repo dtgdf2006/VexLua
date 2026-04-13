@@ -19,7 +19,11 @@ func TestExecutionModelFinalAcceptanceMatrix(t *testing.T) {
 	t.Run("compiled-proto-cache", TestBaselineRuntimeCachesCompiledProtoByRef)
 	t.Run("shared-stub-feedback", TestBaselineRuntimeFeedbackTransitionsMatchInterpreter)
 	t.Run("table-slow-stub-call-continuation", TestBaselineRuntimeTableSlowStubContinuesIntoCall)
-	t.Run("metatable-blocker-slow-stub", TestBaselineRuntimeMetatableBlockedTableUsesSharedSlowStub)
+	t.Run("metatable-blocker-hit-stays-covered", TestBaselineRuntimeMetatableBlockedTableUsesSharedSlowStub)
+	t.Run("metatable-blocker-miss-slow-stub", TestBaselineRuntimeMetatableBlockedMissUsesSharedSlowStub)
+	t.Run("global-metatable-slow-stub", TestBaselineRuntimeGlobalMetamethodsStayInCompiledIsland)
+	t.Run("self-metatable-slow-stub", TestBaselineRuntimeSelfMetamethodUsesSharedSlowStub)
+	t.Run("len-slow-stub", TestBaselineRuntimeLenStubResumesCompiledContinuation)
 	t.Run("setglobal-native-builtin", TestBaselineRuntimeCompiledSetGlobalFastPathAfterWarmup)
 	t.Run("real-deopt-continuation", TestBaselineRuntimeDeoptResumesWithoutReplayingEarlierSideEffects)
 	t.Run("host-bridge-continuation", TestBaselineRuntimeHostBridgeStubsResumeCompiledContinuation)
@@ -241,6 +245,7 @@ func TestExecutionModelSourceAudit(t *testing.T) {
 		pureJITText := readRepoFile(t, "internal", "vexarc", "baseline", "pure_jit_lowering.go")
 		tableText := readRepoFile(t, "internal", "vexarc", "baseline", "table_lowering.go")
 		runtimeText := readRepoFile(t, "internal", "vexarc", "baseline", "runtime_stubs.go")
+		stubManagerText := readRepoFile(t, "internal", "vexarc", "baseline", "stub_manager.go")
 
 		for _, needle := range []string{
 			"emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubLuaCall]",
@@ -281,26 +286,42 @@ func TestExecutionModelSourceAudit(t *testing.T) {
 			t.Fatalf("phase-0 inline family should keep RETURN ownership local to compiler emitter")
 		}
 
-		for _, needle := range []string{
-			"state.compiler.stubEntries[stubs.StubSelf]",
-			"state.compiler.stubEntries[stubs.StubLen]",
-			"state.compiler.stubEntries[stubs.StubArithmetic]",
-			"state.compiler.stubEntries[stubs.StubCompare]",
-		} {
-			if strings.Contains(compilerText, needle) || strings.Contains(pureJITText, needle) || strings.Contains(tableText, needle) {
-				t.Fatalf("phase-0 inline families should not be promoted to shared native builtin dispatch via %q", needle)
-			}
+		if strings.Contains(compilerText, "state.compiler.stubEntries[stubs.StubLen]") || strings.Contains(tableText, "state.compiler.stubEntries[stubs.StubLen]") {
+			t.Fatalf("LEN should stay owned by the local length emitter instead of table/global lowering")
+		}
+		if !strings.Contains(pureJITText, "state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubArithmetic]") {
+			t.Fatalf("ARITHMETIC should route uncovered coercion/metamethod paths through the shared arithmetic stub")
+		}
+		if !strings.Contains(stubManagerText, "buildArithmeticBuiltinBody()") {
+			t.Fatalf("stub manager should install the arithmetic builtin veneer for shared runtime dispatch")
+		}
+		if !strings.Contains(pureJITText, "state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubLen]") {
+			t.Fatalf("LEN should route exact luaH_getn / TM_LEN paths through the shared len stub")
+		}
+		if !strings.Contains(stubManagerText, "buildLenBuiltinBody()") {
+			t.Fatalf("stub manager should install the len builtin veneer for shared runtime dispatch")
+		}
+		if !strings.Contains(pureJITText, "state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubSelf]") {
+			t.Fatalf("SELF should route uncovered metatable paths through the shared self stub")
+		}
+		if !strings.Contains(pureJITText, "state.emitBuiltinCallWithStubArgs(state.compiler.stubEntries[stubs.StubCompare]") {
+			t.Fatalf("COMPARE should route uncovered exact-semantic paths through the shared compare stub")
+		}
+		if !strings.Contains(stubManagerText, "buildCompareBuiltinBody()") {
+			t.Fatalf("stub manager should install the compare builtin veneer for shared runtime dispatch")
 		}
 
-		for _, needle := range []string{
-			"case stubs.StubSelf:",
-			"case stubs.StubLen:",
-			"case stubs.StubArithmetic:",
-			"case stubs.StubCompare:",
-		} {
-			if strings.Contains(runtimeText, needle) {
-				t.Fatalf("phase-0 inline families should not move runtime ownership into shared dispatcher via %q", needle)
-			}
+		if !strings.Contains(runtimeText, "case stubs.StubLen:") {
+			t.Fatalf("LEN should be owned by the shared runtime dispatcher once it exits the string fast path")
+		}
+		if !strings.Contains(runtimeText, "case stubs.StubArithmetic:") {
+			t.Fatalf("ARITHMETIC should be owned by the shared runtime dispatcher once it exits the inline fast path")
+		}
+		if !strings.Contains(runtimeText, "case stubs.StubSelf:") {
+			t.Fatalf("SELF should be owned by the shared runtime dispatcher once it exits to the exact helper path")
+		}
+		if !strings.Contains(runtimeText, "case stubs.StubCompare:") {
+			t.Fatalf("COMPARE should be owned by the shared runtime dispatcher once it exits the inline fast path")
 		}
 	})
 
@@ -309,16 +330,19 @@ func TestExecutionModelSourceAudit(t *testing.T) {
 		forbidden := []string{
 			"case stubs.StubGetUpvalue:",
 			"case stubs.StubSetUpvalue:",
-			"case stubs.StubForPrep:",
 			"case stubs.StubForLoop:",
 			"handleGetUpvalueStub(",
 			"handleSetUpvalueStub(",
-			"handleForPrepStub(",
 			"handleForLoopStub(",
 		}
 		for _, needle := range forbidden {
 			if strings.Contains(text, needle) {
 				t.Fatalf("batch-2 native builtin families should not remain in runtime dispatcher via %q", needle)
+			}
+		}
+		for _, needle := range []string{"case stubs.StubForPrep:", "handleForPrepStub("} {
+			if !strings.Contains(text, needle) {
+				t.Fatalf("FORPREP should keep its slow coercion path in the shared runtime dispatcher via %q", needle)
 			}
 		}
 	})
@@ -361,6 +385,43 @@ func TestExecutionModelSourceAudit(t *testing.T) {
 		}
 	})
 
+	t.Run("batch4-native-call-feedback-observes-polymorphic-sidecar", func(t *testing.T) {
+		text := readRepoFile(t, "internal", "vexarc", "baseline", "native_builtin.go")
+		required := []string{
+			"feedback.PackCellPrefix(feedback.StatePolymorphic, feedback.AccessInvalid, slotKind)",
+			"feedback.CallPolyEntryAccessKindOffset",
+			"feedback.CallPolyEntryTargetRefOffset",
+			"feedback.CallPolyEntryValueBitsOffset",
+			"emitLoadCallPolymorphicDataBaseFromCell(",
+		}
+		for _, needle := range required {
+			if !strings.Contains(text, needle) {
+				t.Fatalf("batch-4 native call builtin should keep polymorphic call-feedback support %q", needle)
+			}
+		}
+	})
+
+	t.Run("batch4-native-resolved-lua-closure-guard-supports-all-callable-shapes", func(t *testing.T) {
+		text := readRepoFile(t, "internal", "vexarc", "baseline", "native_builtin.go")
+		block := sourceBlock(t, text, "func emitMatchResolvedLuaClosureEntry(", "func emitMatchResolvedHostFunctionEntry(")
+		required := []string{
+			"feedback.CallShapeHostObjectMetatable",
+			"feedback.CallShapeTypeMetatable",
+			"value.TagHostObjectRef",
+			"rthost.WrapperMetatableVersionOffset",
+			"rthost.WrapperMetatableOffset",
+			"emitLoadTypeMetatableKind(",
+			"rtstate.VMStateTypeMetatableStateOff",
+			"rtmeta.RegistryEntryVersionOffset",
+			"rtmeta.RegistryEntryMetatableOffset",
+		}
+		for _, needle := range required {
+			if !strings.Contains(block, needle) {
+				t.Fatalf("resolved-lua native guard should keep callable-shape coverage %q", needle)
+			}
+		}
+	})
+
 	t.Run("covered-families-do-not-install-legacy-status-exits", func(t *testing.T) {
 		text := readRepoFile(t, "internal", "vexarc", "baseline", "stub_manager.go")
 		if strings.Contains(text, "buildExitStub(compiledStatusStub") {
@@ -388,7 +449,7 @@ func TestExecutionModelSourceAudit(t *testing.T) {
 	t.Run("call-tail-runtime-boundaries-stay-terminal", func(t *testing.T) {
 		text := readRepoFile(t, "internal", "vexarc", "baseline", "runtime_stubs.go")
 		callBlock := sourceBlock(t, text, "func (runtime *Runtime) handleCallStub(", "func (runtime *Runtime) handleTailCallStub(")
-		for _, needle := range []string{"finishNestedCompiledCall(", "callValueBoundary(", "storeFrameCallResults(", "resumeCallContinuation("} {
+		for _, needle := range []string{"finishNestedCompiledCall(", "callResolvedBoundary(", "storeFrameCallResults(", "resumeCallContinuation("} {
 			if !strings.Contains(callBlock, needle) {
 				t.Fatalf("handleCallStub should keep terminal-boundary glue %q", needle)
 			}
@@ -399,7 +460,7 @@ func TestExecutionModelSourceAudit(t *testing.T) {
 			}
 		}
 		tailBlock := sourceBlock(t, text, "func (runtime *Runtime) handleTailCallStub(", "func (runtime *Runtime) callValueBoundary(")
-		for _, needle := range []string{"finishNestedCompiledCall(", "callValueBoundary(", "FrameFlagIsTailcall"} {
+		for _, needle := range []string{"finishNestedCompiledCall(", "callResolvedBoundary(", "FrameFlagIsTailcall"} {
 			if !strings.Contains(tailBlock, needle) {
 				t.Fatalf("handleTailCallStub should keep terminal-boundary glue %q", needle)
 			}

@@ -1,6 +1,7 @@
 package baseline
 
 import (
+	"fmt"
 	"math"
 	"testing"
 	"unsafe"
@@ -20,6 +21,22 @@ import (
 
 type safepointAssist struct {
 	count int
+}
+
+type hostTaggedScore struct {
+	Value float64 `lua:"score"`
+}
+
+type hostTaggedMethodScore struct {
+	Value float64
+}
+
+func (score *hostTaggedMethodScore) DoubleValue() float64 {
+	return score.Value * 2
+}
+
+func (score *hostTaggedMethodScore) LuaMethodMap() map[string]string {
+	return map[string]string{"double-score": "DoubleValue"}
 }
 
 func (assist *safepointAssist) AssistAllocation(uint64) error {
@@ -175,6 +192,62 @@ func TestBaselineRuntimeNewTableStubResumesCompiledContinuation(t *testing.T) {
 	}
 }
 
+func TestBaselineRuntimeLenStubResumesCompiledContinuation(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	tableValue, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new table value: %v", err)
+	}
+	for _, key := range []float64{1, 2, 4} {
+		if err := engine.Tables.Set(tableValue.Ref, value.NumberValue(key), value.NumberValue(key*10)); err != nil {
+			t.Fatalf("seed table key %v: %v", key, err)
+		}
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-len-stub.lua",
+		NumParams:    1,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_LEN, 1, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 1, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	compiled, err := runtime.Compile(proto)
+	if err != nil {
+		t.Fatalf("compile proto: %v", err)
+	}
+	if !compiled.Supported {
+		t.Fatalf("len stub test should compile, unsupported reason: %s", compiled.UnsupportedReason)
+	}
+	beforeStub := runtime.SlowStubCount(stubs.StubLen)
+	beforeDeopt := runtime.DeoptCount()
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{tableValue.Value}, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(4)})
+	if got := runtime.SlowStubCount(stubs.StubLen) - beforeStub; got != 1 {
+		t.Fatalf("len slow path should use exactly one shared stub, got %d", got)
+	}
+	if runtime.DeoptCount() != beforeDeopt {
+		t.Fatalf("len slow path should avoid deopt, got %d", runtime.DeoptCount()-beforeDeopt)
+	}
+}
+
 func TestBaselineRuntimeConcatStubResumesCompiledContinuation(t *testing.T) {
 	engine := interp.New()
 	runtime := NewRuntime(engine)
@@ -220,6 +293,127 @@ func TestBaselineRuntimeConcatStubResumesCompiledContinuation(t *testing.T) {
 	if runtime.DeoptCount() != 0 {
 		t.Fatalf("CONCAT continuation should avoid deopt, got %d", runtime.DeoptCount())
 	}
+}
+
+func TestBaselineRuntimeConcatStubUsesMetamethodAndAvoidsDeopt(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	concatKey, err := engine.InternString("__concat")
+	if err != nil {
+		t.Fatalf("intern __concat key: %v", err)
+	}
+	labelKey, err := engine.InternString("label")
+	if err != nil {
+		t.Fatalf("intern label key: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable: %v", err)
+	}
+	concatCalls := 0
+	concatMeta, err := engine.RegisterHostFunction("concat-meta", func(lhs value.TValue, rhs value.TValue) (string, error) {
+		concatCalls++
+		leftLabel, err := concatRuntimeLabel(engine, lhs, labelKey.Value)
+		if err != nil {
+			return "", err
+		}
+		rightLabel, err := concatRuntimeLabel(engine, rhs, labelKey.Value)
+		if err != nil {
+			return "", err
+		}
+		return leftLabel + rightLabel, nil
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register __concat host function: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, concatKey.Value, concatMeta.Value); err != nil {
+		t.Fatalf("seed __concat metamethod: %v", err)
+	}
+	leftTable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new left table: %v", err)
+	}
+	rightTable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new right table: %v", err)
+	}
+	for handle, label := range map[value.HeapRef44]string{leftTable.Ref: "B", rightTable.Ref: "C"} {
+		textHandle, err := engine.InternString(label)
+		if err != nil {
+			t.Fatalf("intern label %q: %v", label, err)
+		}
+		if err := engine.Tables.Set(handle, labelKey.Value, textHandle.Value); err != nil {
+			t.Fatalf("seed label %q: %v", label, err)
+		}
+	}
+	if err := engine.SetValueMetatableBoundary(leftTable.Value, metatable.Value); err != nil {
+		t.Fatalf("set left metatable: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(rightTable.Value, metatable.Value); err != nil {
+		t.Fatalf("set right metatable: %v", err)
+	}
+	want, err := engine.InternString("BC")
+	if err != nil {
+		t.Fatalf("intern expected string: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-concat-meta.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CONCAT, 0, 0, 1),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	beforeStub := runtime.SlowStubCount(stubs.StubConcat)
+	beforeDeopt := runtime.DeoptCount()
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{leftTable.Value, rightTable.Value}, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{want.Value})
+	if got := runtime.SlowStubCount(stubs.StubConcat) - beforeStub; got != 1 {
+		t.Fatalf("concat slow path should use exactly one shared stub, got %d", got)
+	}
+	if runtime.DeoptCount() != beforeDeopt {
+		t.Fatalf("concat slow path should avoid deopt, got %d", runtime.DeoptCount()-beforeDeopt)
+	}
+	if concatCalls != 1 {
+		t.Fatalf("__concat call count = %d, want 1", concatCalls)
+	}
+}
+
+func concatRuntimeLabel(engine *interp.Engine, candidate value.TValue, labelKey value.TValue) (string, error) {
+	if candidate.IsBoxedTag(value.TagTableRef) {
+		ref, _ := candidate.HeapRef()
+		labelValue, found, err := engine.Tables.Get(ref, labelKey)
+		if err != nil {
+			return "", err
+		}
+		if !found {
+			return "", fmt.Errorf("missing label field")
+		}
+		labelRef, _ := labelValue.HeapRef()
+		return engine.Strings.Text(labelRef)
+	}
+	if candidate.IsBoxedTag(value.TagStringRef) {
+		ref, _ := candidate.HeapRef()
+		return engine.Strings.Text(ref)
+	}
+	return "", fmt.Errorf("unexpected concat operand %s", candidate)
 }
 
 func TestBaselineRuntimeCloseStubResumesCompiledContinuation(t *testing.T) {
@@ -943,6 +1137,47 @@ func TestBaselineRuntimeOpenReturnUsesUpdatedTopAfterGetUpvalueBuiltin(t *testin
 	}
 }
 
+func TestBaselineRuntimeOpenReturnUsesUpdatedTopAfterTestSet(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@testset-open-return.lua",
+		MaxStackSize: 3,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_LOADBOOL, 0, 1, 0),
+			bytecode.CreateABC(bytecode.OP_TESTSET, 2, 0, 1),
+			bytecode.CreateAsBx(bytecode.OP_JMP, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 2, 0, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	compiled, err := runtime.Compile(proto)
+	if err != nil {
+		t.Fatalf("compile proto: %v", err)
+	}
+	if !compiled.Supported {
+		t.Fatalf("TESTSET open return test should compile, unsupported reason: %s", compiled.UnsupportedReason)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.BoolValue(true)})
+	assertNoNativeFallback(t, runtime)
+}
+
 func TestBaselineRuntimeOpenReturnUsesUpdatedTopAfterHostGetGlobalStub(t *testing.T) {
 	engine := interp.New()
 	runtime := NewRuntime(engine)
@@ -1331,8 +1566,8 @@ func TestBaselineRuntimeTForLoopHostBoundaryResumesCompiledContinuation(t *testi
 		t.Fatalf("runtime call: %v", err)
 	}
 	assertValuesEqual(t, results, []value.TValue{value.NumberValue(23)})
-	if runtime.SlowStubCount(stubs.StubLuaCall) != 3 {
-		t.Fatalf("host-backed TFORLOOP should use one shared call stub per iterator step, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("host-backed TFORLOOP should use one shared call stub for the first iterator step only, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
 	}
 	if runtime.DeoptCount() != 0 {
 		t.Fatalf("host-backed TFORLOOP should avoid deopt, got %d", runtime.DeoptCount())
@@ -1933,6 +2168,189 @@ func TestBaselineRuntimeCompilesArithmeticFastPath(t *testing.T) {
 	assertNoNativeFallback(t, runtime)
 }
 
+func TestBaselineRuntimeArithmeticStubResumesCompiledContinuation(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@arith-stub.lua",
+		MaxStackSize: 3,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("0x10"),
+			bytecode.NumberConstant(2),
+			bytecode.NumberConstant(-5),
+			bytecode.NumberConstant(3),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABC(bytecode.OP_ADD, 0, 0, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 2),
+			bytecode.CreateABx(bytecode.OP_LOADK, 2, 3),
+			bytecode.CreateABC(bytecode.OP_MOD, 1, 1, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 3, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	compiled, err := runtime.Compile(proto)
+	if err != nil {
+		t.Fatalf("compile proto: %v", err)
+	}
+	if !compiled.Supported {
+		t.Fatalf("arithmetic stub test should compile, unsupported reason: %s", compiled.UnsupportedReason)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(18), value.NumberValue(1)})
+	if runtime.SlowStubCount(stubs.StubArithmetic) == 0 {
+		t.Fatalf("arithmetic slow path should resume through shared stub")
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("arithmetic slow path should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeArithmeticStubReturnsLua51ErrorWithoutDeopt(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@arith-error-stub.lua",
+		MaxStackSize: 2,
+		Constants:    []bytecode.Constant{bytecode.NumberConstant(1)},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_LOADBOOL, 0, 1, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 0),
+			bytecode.CreateABC(bytecode.OP_ADD, 0, 0, 1),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	_, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err == nil || err.Error() != "attempt to perform arithmetic on a boolean value" {
+		t.Fatalf("runtime arithmetic error = %v, want Lua 5.1 boolean arithmetic error", err)
+	}
+	if runtime.SlowStubCount(stubs.StubArithmetic) != 1 {
+		t.Fatalf("arithmetic error path should use exactly one shared stub, got %d", runtime.SlowStubCount(stubs.StubArithmetic))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("arithmetic error path should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeCompareStubResumesContinuation(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	ltKey, err := engine.InternString("__lt")
+	if err != nil {
+		t.Fatalf("intern __lt key: %v", err)
+	}
+	left, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new left table: %v", err)
+	}
+	right, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new right table: %v", err)
+	}
+	leftMeta, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new left metatable: %v", err)
+	}
+	rightMeta, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new right metatable: %v", err)
+	}
+	ltMeta, err := engine.RegisterHostFunction("lt-meta", func(lhs value.TValue, rhs value.TValue) bool {
+		return lhs.Bits() == left.Value.Bits() && rhs.Bits() == right.Value.Bits()
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register __lt host function: %v", err)
+	}
+	for _, metatable := range []value.TValue{leftMeta.Value, rightMeta.Value} {
+		metaRef, _ := metatable.HeapRef()
+		if err := engine.Tables.Set(metaRef, ltKey.Value, ltMeta.Value); err != nil {
+			t.Fatalf("seed __lt metamethod: %v", err)
+		}
+	}
+	if err := engine.SetValueMetatableBoundary(left.Value, leftMeta.Value); err != nil {
+		t.Fatalf("set left metatable: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(right.Value, rightMeta.Value); err != nil {
+		t.Fatalf("set right metatable: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@compare-stub.lua",
+		NumParams:    2,
+		MaxStackSize: 3,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_LOADBOOL, 2, 0, 0),
+			bytecode.CreateABC(bytecode.OP_LT, 1, 0, 1),
+			bytecode.CreateAsBx(bytecode.OP_JMP, 0, 1),
+			bytecode.CreateABC(bytecode.OP_RETURN, 2, 2, 0),
+			bytecode.CreateABC(bytecode.OP_LOADBOOL, 2, 1, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 2, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	compiled, err := runtime.Compile(proto)
+	if err != nil {
+		t.Fatalf("compile proto: %v", err)
+	}
+	if !compiled.Supported {
+		t.Fatalf("compare stub test should compile, unsupported reason: %s", compiled.UnsupportedReason)
+	}
+	beforeStub := runtime.SlowStubCount(stubs.StubCompare)
+	beforeDeopt := runtime.DeoptCount()
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{left.Value, right.Value}, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.BoolValue(true)})
+	if got := runtime.SlowStubCount(stubs.StubCompare) - beforeStub; got != 1 {
+		t.Fatalf("compare slow path should use exactly one shared stub, got %d", got)
+	}
+	if runtime.DeoptCount() != beforeDeopt {
+		t.Fatalf("compare slow path should avoid deopt, got %d", runtime.DeoptCount()-beforeDeopt)
+	}
+}
+
 func TestBaselineRuntimeCompiledCallerCanFallbackCallee(t *testing.T) {
 	engine := interp.New()
 	runtime := NewRuntime(engine)
@@ -2074,6 +2492,154 @@ func TestBaselineRuntimeNumericForLoopBackedgeAdvancesGCSafepoint(t *testing.T) 
 	}
 	if runtime.DeoptCount() != 0 {
 		t.Fatalf("loop backedge safepoint should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeForPrepStubCoercesStringNumbers(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@forprep-string.lua",
+		MaxStackSize: 5,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("1"),
+			bytecode.StringConstant("3"),
+			bytecode.StringConstant("1"),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 2, 2),
+			bytecode.CreateAsBx(bytecode.OP_FORPREP, 0, 1),
+			bytecode.CreateABC(bytecode.OP_MOVE, 4, 3, 0),
+			bytecode.CreateAsBx(bytecode.OP_FORLOOP, 0, -2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 4, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(3)})
+	if runtime.SlowStubCount(stubs.StubForPrep) != 1 {
+		t.Fatalf("FORPREP string coercion should use exactly one shared slow stub, got %d", runtime.SlowStubCount(stubs.StubForPrep))
+	}
+	if runtime.SlowStubCount(stubs.StubForLoop) != 0 {
+		t.Fatalf("FORLOOP should stay inside native builtin after coercion, got %d", runtime.SlowStubCount(stubs.StubForLoop))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("FORPREP string coercion should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeForPrepStubReturnsLua51RoleErrorWithoutDeopt(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@forprep-error.lua",
+		MaxStackSize: 5,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("1"),
+			bytecode.StringConstant("3"),
+			bytecode.StringConstant("oops"),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 2, 2),
+			bytecode.CreateAsBx(bytecode.OP_FORPREP, 0, 1),
+			bytecode.CreateABC(bytecode.OP_MOVE, 4, 3, 0),
+			bytecode.CreateAsBx(bytecode.OP_FORLOOP, 0, -2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 4, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	_, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err == nil || err.Error() != "for step must be a number" {
+		t.Fatalf("runtime forprep error = %v, want Lua 5.1 step error", err)
+	}
+	if runtime.SlowStubCount(stubs.StubForPrep) != 1 {
+		t.Fatalf("FORPREP error path should use exactly one shared slow stub, got %d", runtime.SlowStubCount(stubs.StubForPrep))
+	}
+	if runtime.SlowStubCount(stubs.StubForLoop) != 0 {
+		t.Fatalf("FORLOOP should not run after FORPREP role error, got %d", runtime.SlowStubCount(stubs.StubForLoop))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("FORPREP error path should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeForPrepStubReturnsLua51LimitErrorWithoutDeopt(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@forprep-limit-error.lua",
+		MaxStackSize: 5,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("1"),
+			bytecode.StringConstant("oops"),
+			bytecode.StringConstant("1"),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 2, 2),
+			bytecode.CreateAsBx(bytecode.OP_FORPREP, 0, 1),
+			bytecode.CreateABC(bytecode.OP_MOVE, 4, 3, 0),
+			bytecode.CreateAsBx(bytecode.OP_FORLOOP, 0, -2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 4, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	_, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err == nil || err.Error() != "for limit must be a number" {
+		t.Fatalf("runtime forprep limit error = %v, want Lua 5.1 limit error", err)
+	}
+	if runtime.SlowStubCount(stubs.StubForPrep) != 1 {
+		t.Fatalf("FORPREP limit error path should use exactly one shared slow stub, got %d", runtime.SlowStubCount(stubs.StubForPrep))
+	}
+	if runtime.SlowStubCount(stubs.StubForLoop) != 0 {
+		t.Fatalf("FORLOOP should not run after FORPREP limit error, got %d", runtime.SlowStubCount(stubs.StubForLoop))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("FORPREP limit error path should avoid deopt, got %d", runtime.DeoptCount())
 	}
 }
 
@@ -2384,7 +2950,7 @@ func TestBaselineRuntimeMetatableBlockedTableUsesSharedSlowStub(t *testing.T) {
 	}
 	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
 	if runtime.SlowStubCount(stubs.StubGetTable) != 0 {
-		t.Fatalf("blocked-table covered path should stay inside native builtin, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+		t.Fatalf("blocked-table hit should stay inside native builtin, got %d", runtime.SlowStubCount(stubs.StubGetTable))
 	}
 	results, err = runtime.Call(thread, closure.Value, []value.TValue{box.Value}, -1)
 	if err != nil {
@@ -2392,10 +2958,276 @@ func TestBaselineRuntimeMetatableBlockedTableUsesSharedSlowStub(t *testing.T) {
 	}
 	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
 	if runtime.SlowStubCount(stubs.StubGetTable) != 0 {
-		t.Fatalf("blocked-table covered path should continue to avoid Go slow stubs, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+		t.Fatalf("blocked-table hit should continue to avoid Go slow stubs, got %d", runtime.SlowStubCount(stubs.StubGetTable))
 	}
 	if runtime.DeoptCount() != 0 {
-		t.Fatalf("metatable blocker should not deopt current covered semantics, got %d", runtime.DeoptCount())
+		t.Fatalf("metatable blocker should not deopt exact helper path, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeMetatableBlockedMissUsesSharedSlowStub(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	box, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new box table: %v", err)
+	}
+	fallback, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new fallback table: %v", err)
+	}
+	meta, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable: %v", err)
+	}
+	valueKey, err := engine.InternString("value")
+	if err != nil {
+		t.Fatalf("intern value key: %v", err)
+	}
+	indexKey, err := engine.InternString("__index")
+	if err != nil {
+		t.Fatalf("intern __index key: %v", err)
+	}
+	if err := engine.Tables.Set(fallback.Ref, valueKey.Value, value.NumberValue(42)); err != nil {
+		t.Fatalf("seed fallback table: %v", err)
+	}
+	if err := engine.Tables.Set(meta.Ref, indexKey.Value, fallback.Value); err != nil {
+		t.Fatalf("seed metatable index: %v", err)
+	}
+	if err := engine.Tables.SetMetatable(box.Ref, meta.Value); err != nil {
+		t.Fatalf("set metatable: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@blocked-miss-gettable.lua",
+		NumParams:    1,
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("value"),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_GETTABLE, 1, 0, bytecode.RKAsk(0)),
+			bytecode.CreateABC(bytecode.OP_RETURN, 1, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{box.Value}, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubGetTable) != 1 {
+		t.Fatalf("blocked-table miss should use shared gettable stub once, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{box.Value}, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubGetTable) != 2 {
+		t.Fatalf("blocked-table miss should stay on shared gettable stub, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("blocked-table miss should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeGlobalMetamethodsStayInCompiledIsland(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	backing, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new backing table: %v", err)
+	}
+	meta, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable: %v", err)
+	}
+	answerKey, err := engine.InternString("answer")
+	if err != nil {
+		t.Fatalf("intern answer key: %v", err)
+	}
+	createdKey, err := engine.InternString("created")
+	if err != nil {
+		t.Fatalf("intern created key: %v", err)
+	}
+	indexKey, err := engine.InternString("__index")
+	if err != nil {
+		t.Fatalf("intern __index key: %v", err)
+	}
+	newIndexKey, err := engine.InternString("__newindex")
+	if err != nil {
+		t.Fatalf("intern __newindex key: %v", err)
+	}
+	if err := engine.Tables.Set(backing.Ref, answerKey.Value, value.NumberValue(42)); err != nil {
+		t.Fatalf("seed backing answer: %v", err)
+	}
+	if err := engine.Tables.Set(meta.Ref, indexKey.Value, backing.Value); err != nil {
+		t.Fatalf("seed __index table: %v", err)
+	}
+	if err := engine.Tables.Set(meta.Ref, newIndexKey.Value, backing.Value); err != nil {
+		t.Fatalf("seed __newindex table: %v", err)
+	}
+	if err := engine.Tables.SetMetatable(env.Ref, meta.Value); err != nil {
+		t.Fatalf("set env metatable: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@global-metatable.lua",
+		MaxStackSize: 3,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("answer"),
+			bytecode.StringConstant("created"),
+			bytecode.NumberConstant(9),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 2),
+			bytecode.CreateABx(bytecode.OP_SETGLOBAL, 1, 1),
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 2, 1),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 4, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42), value.NumberValue(9), value.NumberValue(9)})
+	if runtime.SlowStubCount(stubs.StubGetGlobal) != 2 {
+		t.Fatalf("global __index path should use shared getglobal stub twice, got %d", runtime.SlowStubCount(stubs.StubGetGlobal))
+	}
+	if runtime.SlowStubCount(stubs.StubSetGlobal) != 1 {
+		t.Fatalf("global __newindex path should use shared setglobal stub once, got %d", runtime.SlowStubCount(stubs.StubSetGlobal))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("global metatable path should avoid deopt, got %d", runtime.DeoptCount())
+	}
+	stored, found, err := engine.Tables.Get(backing.Ref, createdKey.Value)
+	if err != nil {
+		t.Fatalf("read created from backing: %v", err)
+	}
+	if !found || stored.Bits() != value.NumberValue(9).Bits() {
+		t.Fatalf("created backing value = %s (found=%v), want number(9)", stored, found)
+	}
+	stored, found, err = engine.Tables.Get(env.Ref, createdKey.Value)
+	if err != nil {
+		t.Fatalf("read created from env: %v", err)
+	}
+	if found {
+		t.Fatalf("created should be routed through __newindex table, env still has %s", stored)
+	}
+}
+
+func TestBaselineRuntimeSelfMetamethodUsesSharedSlowStub(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	methods, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new methods table: %v", err)
+	}
+	meta, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable: %v", err)
+	}
+	box, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new receiver table: %v", err)
+	}
+	idKey, err := engine.InternString("id")
+	if err != nil {
+		t.Fatalf("intern id key: %v", err)
+	}
+	indexKey, err := engine.InternString("__index")
+	if err != nil {
+		t.Fatalf("intern __index key: %v", err)
+	}
+	methodProto := &bytecode.Proto{
+		Source:       "@meta-self-method.lua",
+		NumParams:    1,
+		MaxStackSize: 1,
+		Constants: []bytecode.Constant{
+			bytecode.NumberConstant(99),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	methodClosure, err := engine.NewClosure(methodProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new method closure: %v", err)
+	}
+	if err := engine.Tables.Set(methods.Ref, idKey.Value, methodClosure.Value); err != nil {
+		t.Fatalf("seed methods table: %v", err)
+	}
+	if err := engine.Tables.Set(meta.Ref, indexKey.Value, methods.Value); err != nil {
+		t.Fatalf("seed __index table: %v", err)
+	}
+	if err := engine.Tables.SetMetatable(box.Ref, meta.Value); err != nil {
+		t.Fatalf("set receiver metatable: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@meta-self.lua",
+		NumParams:    1,
+		MaxStackSize: 3,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("id"),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_SELF, 1, 0, bytecode.RKAsk(0)),
+			bytecode.CreateABC(bytecode.OP_CALL, 1, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 1, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{box.Value}, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(99)})
+	if runtime.SlowStubCount(stubs.StubSelf) != 1 {
+		t.Fatalf("SELF metatable path should use shared self stub once, got %d", runtime.SlowStubCount(stubs.StubSelf))
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("SELF continuation should still use shared call stub once, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("SELF metatable path should avoid deopt, got %d", runtime.DeoptCount())
 	}
 }
 
@@ -2974,6 +3806,2416 @@ func TestBaselineRuntimeHostBridgeStubsResumeCompiledContinuation(t *testing.T) 
 	}
 }
 
+func TestBaselineRuntimeDirectHostFunctionCallBecomesCoveredAfterWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	observed := make([]float64, 0, 2)
+	directHost, err := engine.RegisterHostFunction("direct-call-host", func(x float64) float64 {
+		observed = append(observed, x)
+		return x + 1
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register direct host function: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-direct-host-call-top.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{directHost.Value, value.NumberValue(41)}, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if cell.State != feedback.StateMonomorphic || cell.AccessKind != feedback.AccessCallHostFunction || cell.ValueBits != directHost.Value.Bits() {
+		t.Fatalf("direct host call feedback cell = %+v, want direct-host monomorphic", cell)
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("first direct host call should use one shared call stub for warmup, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{directHost.Value, value.NumberValue(41)}, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("second direct host call should stay on covered host path after warmup, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if len(observed) != 2 || observed[0] != 41 || observed[1] != 41 {
+		t.Fatalf("direct host observed args = %v, want [41 41]", observed)
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("direct host call warmup should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeDirectHostFunctionTailCallBecomesCoveredAfterWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	observed := make([]float64, 0, 2)
+	directHost, err := engine.RegisterHostFunction("direct-tail-host", func(x float64) float64 {
+		observed = append(observed, x)
+		return x + 1
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register direct tail host function: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-direct-host-tail-top.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_TAILCALL, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{directHost.Value, value.NumberValue(41)}, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if cell.State != feedback.StateMonomorphic || cell.AccessKind != feedback.AccessCallHostFunction || cell.ValueBits != directHost.Value.Bits() {
+		t.Fatalf("direct host tail feedback cell = %+v, want direct-host monomorphic", cell)
+	}
+	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
+		t.Fatalf("first direct host tailcall should use one shared tail stub for warmup, got %d", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{directHost.Value, value.NumberValue(41)}, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
+		t.Fatalf("second direct host tailcall should stay on covered host path after warmup, got %d shared tail stubs", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	if len(observed) != 2 || observed[0] != 41 || observed[1] != 41 {
+		t.Fatalf("direct host tail observed args = %v, want [41 41]", observed)
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("direct host tailcall warmup should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeDirectHostAndTMCallHostFunctionMixedCallSiteStaysCoveredAfterPolymorphicWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	directObserved := make([]float64, 0, 2)
+	directHost, err := engine.RegisterHostFunction("mixed-direct-host", func(x float64) float64 {
+		directObserved = append(directObserved, x)
+		return x + 1
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register direct host function: %v", err)
+	}
+	metaObserved := make([]float64, 0, 2)
+	callMeta, err := engine.RegisterHostFunction("mixed-call-meta", func(_ value.TValue, x float64) float64 {
+		metaObserved = append(metaObserved, x)
+		return x + 2
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function: %v", err)
+	}
+	callable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, callMeta.Value); err != nil {
+		t.Fatalf("seed __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable.Value, metatable.Value); err != nil {
+		t.Fatalf("set callable metatable: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-direct-host-mixed-call-top.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{directHost.Value, value.NumberValue(40)}, -1)
+	if err != nil {
+		t.Fatalf("first direct runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("first direct host call should use one shared call stub, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable.Value, value.NumberValue(40)}, -1)
+	if err != nil {
+		t.Fatalf("first tm_call runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 2 {
+		t.Fatalf("first callable-object host call should use one shared call stub, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if cell.State != feedback.StatePolymorphic {
+		t.Fatalf("mixed direct-host/tm_call feedback cell = %+v, want polymorphic", cell)
+	}
+	matched, ok, err := engine.MatchCallFeedbackCell(directHost.Value, cell)
+	if err != nil || !ok || matched.Bits() != directHost.Value.Bits() {
+		t.Fatalf("polymorphic feedback should still match direct host function = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, directHost.Value)
+	}
+	matched, ok, err = engine.MatchCallFeedbackCell(callable.Value, cell)
+	if err != nil || !ok || matched.Bits() != callMeta.Value.Bits() {
+		t.Fatalf("polymorphic feedback should match callable object host metamethod = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, callMeta.Value)
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{directHost.Value, value.NumberValue(40)}, -1)
+	if err != nil {
+		t.Fatalf("second direct runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable.Value, value.NumberValue(40)}, -1)
+	if err != nil {
+		t.Fatalf("second tm_call runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 2 {
+		t.Fatalf("polymorphic warmup should keep later direct-host/tm_call host calls on covered path, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if len(directObserved) != 2 || directObserved[0] != 40 || directObserved[1] != 40 {
+		t.Fatalf("direct host observed args = %v, want [40 40]", directObserved)
+	}
+	if len(metaObserved) != 2 || metaObserved[0] != 40 || metaObserved[1] != 40 {
+		t.Fatalf("tm_call host observed args = %v, want [40 40]", metaObserved)
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("mixed direct-host/tm_call host site should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeDirectHostAndTMCallHostFunctionMixedTailSiteStaysCoveredAfterPolymorphicWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	directObserved := make([]float64, 0, 2)
+	directHost, err := engine.RegisterHostFunction("mixed-direct-tail-host", func(x float64) float64 {
+		directObserved = append(directObserved, x)
+		return x + 1
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register direct tail host function: %v", err)
+	}
+	metaObserved := make([]float64, 0, 2)
+	callMeta, err := engine.RegisterHostFunction("mixed-tail-call-meta", func(_ value.TValue, x float64) float64 {
+		metaObserved = append(metaObserved, x)
+		return x + 2
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register tail __call host function: %v", err)
+	}
+	callable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, callMeta.Value); err != nil {
+		t.Fatalf("seed tail __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable.Value, metatable.Value); err != nil {
+		t.Fatalf("set callable metatable: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-direct-host-mixed-tail-top.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_TAILCALL, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{directHost.Value, value.NumberValue(40)}, -1)
+	if err != nil {
+		t.Fatalf("first direct runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
+		t.Fatalf("first direct host tailcall should use one shared tail stub, got %d", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable.Value, value.NumberValue(40)}, -1)
+	if err != nil {
+		t.Fatalf("first tm_call runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubTailCall) != 2 {
+		t.Fatalf("first callable-object host tailcall should use one shared tail stub, got %d", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if cell.State != feedback.StatePolymorphic {
+		t.Fatalf("mixed direct-host/tm_call tail feedback cell = %+v, want polymorphic", cell)
+	}
+	matched, ok, err := engine.MatchCallFeedbackCell(directHost.Value, cell)
+	if err != nil || !ok || matched.Bits() != directHost.Value.Bits() {
+		t.Fatalf("polymorphic tail feedback should still match direct host function = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, directHost.Value)
+	}
+	matched, ok, err = engine.MatchCallFeedbackCell(callable.Value, cell)
+	if err != nil || !ok || matched.Bits() != callMeta.Value.Bits() {
+		t.Fatalf("polymorphic tail feedback should match callable object host metamethod = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, callMeta.Value)
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{directHost.Value, value.NumberValue(40)}, -1)
+	if err != nil {
+		t.Fatalf("second direct runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable.Value, value.NumberValue(40)}, -1)
+	if err != nil {
+		t.Fatalf("second tm_call runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubTailCall) != 2 {
+		t.Fatalf("polymorphic warmup should keep later direct-host/tm_call host tailcalls on covered path, got %d shared tail stubs", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	if len(directObserved) != 2 || directObserved[0] != 40 || directObserved[1] != 40 {
+		t.Fatalf("direct host tail observed args = %v, want [40 40]", directObserved)
+	}
+	if len(metaObserved) != 2 || metaObserved[0] != 40 || metaObserved[1] != 40 {
+		t.Fatalf("tm_call host tail observed args = %v, want [40 40]", metaObserved)
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("mixed direct-host/tm_call host tail site should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallHostMetamethodResumesCompiledContinuation(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	callMeta, err := engine.RegisterHostFunction("call-meta", func(_ value.TValue, x float64, y float64) float64 {
+		return x + y
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function: %v", err)
+	}
+	callable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, callMeta.Value); err != nil {
+		t.Fatalf("seed __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable.Value, metatable.Value); err != nil {
+		t.Fatalf("set callable metatable: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "callable", callable.Value); err != nil {
+		t.Fatalf("set global callable: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-tmcall-host-metamethod.lua",
+		MaxStackSize: 3,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("callable"),
+			bytecode.NumberConstant(10),
+			bytecode.NumberConstant(32),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 2, 2),
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 3, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell0 := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	cell1 := mustFeedbackCell(t, runtime, closure.Ref, 1)
+	if !isResolvedCallFeedbackCell(cell0, feedback.AccessCallResolvedHostFunction, callable.Value) && !isResolvedCallFeedbackCell(cell1, feedback.AccessCallResolvedHostFunction, callable.Value) {
+		t.Fatalf("tm_call host metamethod feedback cells = [%+v %+v], want one resolved-host monomorphic cell on callable receiver", cell0, cell1)
+	}
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell0 = mustFeedbackCell(t, runtime, closure.Ref, 0)
+	cell1 = mustFeedbackCell(t, runtime, closure.Ref, 1)
+	if !isResolvedCallFeedbackCell(cell0, feedback.AccessCallResolvedHostFunction, callable.Value) && !isResolvedCallFeedbackCell(cell1, feedback.AccessCallResolvedHostFunction, callable.Value) {
+		t.Fatalf("tm_call host metamethod feedback should stay monomorphic, got [%+v %+v]", cell0, cell1)
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("tm_call host metamethod should stay on covered host path after warmup, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("tm_call host metamethod should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallHostMetamethodVersionInvalidatesCoveredPath(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	callMeta1, err := engine.RegisterHostFunction("call-meta-1", func(_ value.TValue, x float64) float64 {
+		return x
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function1: %v", err)
+	}
+	callMeta2, err := engine.RegisterHostFunction("call-meta-2", func(_ value.TValue, x float64) float64 {
+		return x + 1
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function2: %v", err)
+	}
+	callable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, callMeta1.Value); err != nil {
+		t.Fatalf("seed __call metamethod1: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable.Value, metatable.Value); err != nil {
+		t.Fatalf("set callable metatable: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "callable", callable.Value); err != nil {
+		t.Fatalf("set global callable: %v", err)
+	}
+	topProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-host-shape-call-top.lua",
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("callable"),
+			bytecode.NumberConstant(41),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(topProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("warm tm_call host callable should use one shared call stub before covered path, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, callMeta2.Value); err != nil {
+		t.Fatalf("swap __call host metamethod: %v", err)
+	}
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("third runtime call after metatable change: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 2 {
+		t.Fatalf("host metatable change should force one shared call stub refresh, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("fourth runtime call after metatable change: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 2 {
+		t.Fatalf("refreshed tm_call host callable should return to covered path, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	cell0 := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	cell1 := mustFeedbackCell(t, runtime, closure.Ref, 1)
+	if !isResolvedCallFeedbackCell(cell0, feedback.AccessCallResolvedHostFunction, callable.Value) && !isResolvedCallFeedbackCell(cell1, feedback.AccessCallResolvedHostFunction, callable.Value) {
+		t.Fatalf("tm_call host feedback should stay monomorphic after metatable change, got [%+v %+v]", cell0, cell1)
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("tm_call host metatable invalidation should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallHostWrapperMetamethodBecomesCoveredAfterWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	wrapper, err := engine.RegisterHostObject("bag", map[string]float64{"x": 1}, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	callMeta, err := engine.RegisterHostFunction("call-wrapper", func(_ value.TValue, x float64) float64 {
+		return x + 2
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register wrapper __call host function: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new wrapper metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, callMeta.Value); err != nil {
+		t.Fatalf("seed wrapper __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(wrapper.Value, metatable.Value); err != nil {
+		t.Fatalf("set wrapper metatable: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "callable", wrapper.Value); err != nil {
+		t.Fatalf("set global callable: %v", err)
+	}
+	topProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-host-wrapper-top.lua",
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("callable"),
+			bytecode.NumberConstant(40),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(topProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("first tm_call host wrapper call should use one shared call stub, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if !isResolvedCallFeedbackCell(cell, feedback.AccessCallResolvedHostFunction, wrapper.Value) {
+		cell = mustFeedbackCell(t, runtime, closure.Ref, 1)
+	}
+	if !isResolvedCallFeedbackCell(cell, feedback.AccessCallResolvedHostFunction, wrapper.Value) {
+		t.Fatalf("host-wrapper tm_call feedback cell = %+v, want resolved-host monomorphic", cell)
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("second tm_call host wrapper call should stay on covered host path after warmup, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("tm_call host wrapper warmup should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallHostWrapperLuaClosureMetamethodBecomesCoveredAfterWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	metaProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-host-wrapper-lua-meta.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_MOVE, 0, 1, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	metaClosure, err := engine.NewClosure(metaProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new tm_call host-wrapper closure: %v", err)
+	}
+	if _, err := runtime.Compile(metaProto); err != nil {
+		t.Fatalf("compile tm_call host-wrapper proto: %v", err)
+	}
+	wrapper, err := engine.RegisterHostObject("bag", map[string]float64{"x": 1}, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new wrapper metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, metaClosure.Value); err != nil {
+		t.Fatalf("seed wrapper __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(wrapper.Value, metatable.Value); err != nil {
+		t.Fatalf("set wrapper metatable: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "callable", wrapper.Value); err != nil {
+		t.Fatalf("set global callable: %v", err)
+	}
+	topProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-host-wrapper-lua-top.lua",
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("callable"),
+			bytecode.NumberConstant(40),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(topProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(40)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("first tm_call host-wrapper lua closure call should use one shared call stub, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(40)})
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if !isResolvedCallFeedbackCell(cell, feedback.AccessCallResolvedLuaClosure, wrapper.Value) {
+		cell = mustFeedbackCell(t, runtime, closure.Ref, 1)
+	}
+	if !isResolvedCallFeedbackCell(cell, feedback.AccessCallResolvedLuaClosure, wrapper.Value) {
+		t.Fatalf("host-wrapper lua tm_call feedback cell = %+v, want resolved-lua monomorphic", cell)
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("second tm_call host-wrapper lua closure call should stay on covered path after warmup, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("tm_call host-wrapper lua closure warmup should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallLuaClosureMetamethodKeepsNestedCompiledCall(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	addOne, err := engine.RegisterHostFunction("add1", func(v float64) float64 {
+		return v + 1
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register host function: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "add1", addOne.Value); err != nil {
+		t.Fatalf("set global add1: %v", err)
+	}
+	metaProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-lua-meta.lua",
+		NumParams:    2,
+		MaxStackSize: 4,
+		Constants:    []bytecode.Constant{bytecode.StringConstant("add1")},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 2, 0),
+			bytecode.CreateABC(bytecode.OP_MOVE, 3, 1, 0),
+			bytecode.CreateABC(bytecode.OP_CALL, 2, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 2, 2, 0),
+		},
+	}
+	metaClosure, err := engine.NewClosure(metaProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new tm_call metamethod closure: %v", err)
+	}
+	callable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, metaClosure.Value); err != nil {
+		t.Fatalf("seed __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable.Value, metatable.Value); err != nil {
+		t.Fatalf("set callable metatable: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "callable", callable.Value); err != nil {
+		t.Fatalf("set global callable: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-tmcall-lua-metamethod-top.lua",
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("callable"),
+			bytecode.NumberConstant(42),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(43)})
+	cell0 := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	cell1 := mustFeedbackCell(t, runtime, closure.Ref, 1)
+	if !isResolvedCallFeedbackCell(cell0, feedback.AccessCallResolvedLuaClosure, callable.Value) && !isResolvedCallFeedbackCell(cell1, feedback.AccessCallResolvedLuaClosure, callable.Value) {
+		t.Fatalf("tm_call covered-call feedback cells = [%+v %+v], want one resolved-lua monomorphic cell on callable receiver", cell0, cell1)
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 2 {
+		t.Fatalf("tm_call lua closure metamethod should keep nested compiled host call, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("tm_call lua closure metamethod should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallLuaClosureMetamethodBecomesCoveredAfterWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	metaProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-covered-call-meta.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_MOVE, 0, 1, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	metaClosure, err := engine.NewClosure(metaProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new tm_call metamethod closure: %v", err)
+	}
+	if _, err := runtime.Compile(metaProto); err != nil {
+		t.Fatalf("compile tm_call metamethod proto: %v", err)
+	}
+	callable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, metaClosure.Value); err != nil {
+		t.Fatalf("seed __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable.Value, metatable.Value); err != nil {
+		t.Fatalf("set callable metatable: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "callable", callable.Value); err != nil {
+		t.Fatalf("set global callable: %v", err)
+	}
+	topProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-covered-call-top.lua",
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("callable"),
+			bytecode.NumberConstant(42),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(topProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell0 := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	cell1 := mustFeedbackCell(t, runtime, closure.Ref, 1)
+	if !isResolvedCallFeedbackCell(cell0, feedback.AccessCallResolvedLuaClosure, callable.Value) && !isResolvedCallFeedbackCell(cell1, feedback.AccessCallResolvedLuaClosure, callable.Value) {
+		t.Fatalf("tm_call covered-tail feedback cells = [%+v %+v], want one resolved-lua monomorphic cell on callable receiver", cell0, cell1)
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("first tm_call lua closure call should use one shared call stub, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("second tm_call lua closure call should stay on covered fast path after warmup, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("tm_call covered-call warmup should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeDirectAndTMCallLuaClosureCallSiteStaysCoveredAfterPolymorphicWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	directProto := &bytecode.Proto{
+		Source:       "@jit-direct-poly-call-callee.lua",
+		NumParams:    1,
+		MaxStackSize: 1,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_MOVE, 0, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	directClosure, err := engine.NewClosure(directProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new direct closure: %v", err)
+	}
+	if _, err := runtime.Compile(directProto); err != nil {
+		t.Fatalf("compile direct proto: %v", err)
+	}
+	metaProto := &bytecode.Proto{
+		Source:       "@jit-direct-poly-call-meta.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_MOVE, 0, 1, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	metaClosure, err := engine.NewClosure(metaProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new tm_call metamethod closure: %v", err)
+	}
+	if _, err := runtime.Compile(metaProto); err != nil {
+		t.Fatalf("compile meta proto: %v", err)
+	}
+	callable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, metaClosure.Value); err != nil {
+		t.Fatalf("seed __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable.Value, metatable.Value); err != nil {
+		t.Fatalf("set callable metatable: %v", err)
+	}
+	topProto := &bytecode.Proto{
+		Source:       "@jit-direct-poly-call-top.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(topProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{directClosure.Value, value.NumberValue(42)}, -1)
+	if err != nil {
+		t.Fatalf("direct runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 0 {
+		t.Fatalf("direct covered call should avoid shared call stub, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable.Value, value.NumberValue(42)}, -1)
+	if err != nil {
+		t.Fatalf("first tm_call runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("first callable-object call should use one shared call stub, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if cell.State != feedback.StatePolymorphic {
+		t.Fatalf("mixed direct/tm_call feedback cell = %+v, want polymorphic", cell)
+	}
+	matched, ok, err := engine.MatchCallFeedbackCell(directClosure.Value, cell)
+	if err != nil || !ok || matched.Bits() != directClosure.Value.Bits() {
+		t.Fatalf("polymorphic feedback should still match direct closure = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, directClosure.Value)
+	}
+	matched, ok, err = engine.MatchCallFeedbackCell(callable.Value, cell)
+	if err != nil || !ok || matched.Bits() != metaClosure.Value.Bits() {
+		t.Fatalf("polymorphic feedback should match callable object = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, metaClosure.Value)
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{directClosure.Value, value.NumberValue(42)}, -1)
+	if err != nil {
+		t.Fatalf("second direct runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable.Value, value.NumberValue(42)}, -1)
+	if err != nil {
+		t.Fatalf("second tm_call runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("polymorphic warmup should keep later direct/tm_call calls on covered path, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("mixed direct/tm_call call site should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallLuaClosureMetamethodVersionInvalidatesCoveredPath(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	metaProto1 := &bytecode.Proto{
+		Source:       "@jit-tmcall-shape-call-meta-1.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_MOVE, 0, 1, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	metaProto2 := &bytecode.Proto{
+		Source:       "@jit-tmcall-shape-call-meta-2.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Constants:    []bytecode.Constant{bytecode.NumberConstant(1)},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_ADD, 0, 1, bytecode.RKAsk(0)),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	metaClosure1, err := engine.NewClosure(metaProto1, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new tm_call metamethod closure1: %v", err)
+	}
+	metaClosure2, err := engine.NewClosure(metaProto2, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new tm_call metamethod closure2: %v", err)
+	}
+	callable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, metaClosure1.Value); err != nil {
+		t.Fatalf("seed __call metamethod 1: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable.Value, metatable.Value); err != nil {
+		t.Fatalf("set callable metatable: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "callable", callable.Value); err != nil {
+		t.Fatalf("set global callable: %v", err)
+	}
+	topProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-shape-call-top.lua",
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("callable"),
+			bytecode.NumberConstant(41),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(topProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("warm tm_call callable should use one shared call stub before covered path, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, metaClosure2.Value); err != nil {
+		t.Fatalf("swap __call metamethod: %v", err)
+	}
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("third runtime call after metatable change: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 2 {
+		t.Fatalf("metatable change should force one shared call stub refresh, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("fourth runtime call after metatable change: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 2 {
+		t.Fatalf("refreshed tm_call callable should return to covered path, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	cell0 := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	cell1 := mustFeedbackCell(t, runtime, closure.Ref, 1)
+	if !isResolvedCallFeedbackCell(cell0, feedback.AccessCallResolvedLuaClosure, callable.Value) && !isResolvedCallFeedbackCell(cell1, feedback.AccessCallResolvedLuaClosure, callable.Value) {
+		t.Fatalf("tm_call feedback should stay monomorphic after metatable change, got [%+v %+v]", cell0, cell1)
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("tm_call metatable version invalidation should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallTypeMetatableRefreshStaysMonomorphic(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	callMeta1, err := engine.RegisterHostFunction("call-meta-1", func(value.TValue) float64 { return 41 }, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function1: %v", err)
+	}
+	callMeta2, err := engine.RegisterHostFunction("call-meta-2", func(value.TValue) float64 { return 42 }, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function2: %v", err)
+	}
+	metatable1, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable1: %v", err)
+	}
+	metatable2, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable2: %v", err)
+	}
+	if err := engine.Tables.Set(metatable1.Ref, callKey.Value, callMeta1.Value); err != nil {
+		t.Fatalf("seed metatable1 __call: %v", err)
+	}
+	if err := engine.Tables.Set(metatable2.Ref, callKey.Value, callMeta2.Value); err != nil {
+		t.Fatalf("seed metatable2 __call: %v", err)
+	}
+	callableNumber := value.NumberValue(7)
+	if err := engine.SetValueMetatableBoundary(callableNumber, metatable1.Value); err != nil {
+		t.Fatalf("set number metatable1: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-tmcall-type-meta-top.lua",
+		NumParams:    1,
+		MaxStackSize: 1,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 1, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{callableNumber}, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callableNumber}, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if !isResolvedCallFeedbackCell(cell, feedback.AccessCallResolvedHostFunction, callableNumber) {
+		t.Fatalf("type-metatable tm_call feedback cell = %+v, want resolved-host monomorphic", cell)
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("type-metatable tm_call should become covered after warmup, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if err := engine.SetValueMetatableBoundary(callableNumber, metatable2.Value); err != nil {
+		t.Fatalf("set number metatable2: %v", err)
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callableNumber}, -1)
+	if err != nil {
+		t.Fatalf("third runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell = mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if !isResolvedCallFeedbackCell(cell, feedback.AccessCallResolvedHostFunction, callableNumber) {
+		t.Fatalf("type-metatable tm_call feedback should stay monomorphic after metatable change, got %+v", cell)
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 2 {
+		t.Fatalf("type-metatable metatable change should force one shared call stub refresh, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callableNumber}, -1)
+	if err != nil {
+		t.Fatalf("fourth runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 2 {
+		t.Fatalf("refreshed type-metatable tm_call should return to covered path, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("type-metatable tm_call refresh should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallTypeMetatableLuaClosureRefreshStaysMonomorphic(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	metaProto1 := &bytecode.Proto{
+		Source:       "@jit-tmcall-type-lua-meta-1.lua",
+		NumParams:    1,
+		MaxStackSize: 1,
+		Constants:    []bytecode.Constant{bytecode.NumberConstant(41)},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	metaProto2 := &bytecode.Proto{
+		Source:       "@jit-tmcall-type-lua-meta-2.lua",
+		NumParams:    1,
+		MaxStackSize: 1,
+		Constants:    []bytecode.Constant{bytecode.NumberConstant(42)},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	metaClosure1, err := engine.NewClosure(metaProto1, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new type-metatable lua closure1: %v", err)
+	}
+	metaClosure2, err := engine.NewClosure(metaProto2, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new type-metatable lua closure2: %v", err)
+	}
+	if _, err := runtime.Compile(metaProto1); err != nil {
+		t.Fatalf("compile type-metatable lua proto1: %v", err)
+	}
+	if _, err := runtime.Compile(metaProto2); err != nil {
+		t.Fatalf("compile type-metatable lua proto2: %v", err)
+	}
+	metatable1, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable1: %v", err)
+	}
+	metatable2, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable2: %v", err)
+	}
+	if err := engine.Tables.Set(metatable1.Ref, callKey.Value, metaClosure1.Value); err != nil {
+		t.Fatalf("seed metatable1 __call: %v", err)
+	}
+	if err := engine.Tables.Set(metatable2.Ref, callKey.Value, metaClosure2.Value); err != nil {
+		t.Fatalf("seed metatable2 __call: %v", err)
+	}
+	callableNumber := value.NumberValue(7)
+	if err := engine.SetValueMetatableBoundary(callableNumber, metatable1.Value); err != nil {
+		t.Fatalf("set number metatable1: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-tmcall-type-lua-top.lua",
+		NumParams:    1,
+		MaxStackSize: 1,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 1, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{callableNumber}, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callableNumber}, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if !isResolvedCallFeedbackCell(cell, feedback.AccessCallResolvedLuaClosure, callableNumber) {
+		t.Fatalf("type-metatable lua tm_call feedback cell = %+v, want resolved-lua monomorphic", cell)
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("type-metatable lua tm_call should become covered after warmup, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if err := engine.SetValueMetatableBoundary(callableNumber, metatable2.Value); err != nil {
+		t.Fatalf("set number metatable2: %v", err)
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callableNumber}, -1)
+	if err != nil {
+		t.Fatalf("third runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell = mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if !isResolvedCallFeedbackCell(cell, feedback.AccessCallResolvedLuaClosure, callableNumber) {
+		t.Fatalf("type-metatable lua tm_call feedback should stay monomorphic after metatable change, got %+v", cell)
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 2 {
+		t.Fatalf("type-metatable lua metatable change should force one shared call stub refresh, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callableNumber}, -1)
+	if err != nil {
+		t.Fatalf("fourth runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 2 {
+		t.Fatalf("refreshed type-metatable lua tm_call should return to covered path, got %d shared call stubs", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("type-metatable lua tm_call refresh should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallDifferentCallableReceiversBecomePolymorphic(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	callMeta1, err := engine.RegisterHostFunction("call-meta-1-poly", func(value.TValue, float64) float64 { return 41 }, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function1: %v", err)
+	}
+	callMeta2, err := engine.RegisterHostFunction("call-meta-2-poly", func(value.TValue, float64) float64 { return 42 }, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function2: %v", err)
+	}
+	callMeta3, err := engine.RegisterHostFunction("call-meta-3-poly", func(value.TValue, float64) float64 { return 43 }, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function3: %v", err)
+	}
+	callable1, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable1: %v", err)
+	}
+	callable2, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable2: %v", err)
+	}
+	callable3, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable3: %v", err)
+	}
+	metatable1, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable1 metatable: %v", err)
+	}
+	metatable2, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable2 metatable: %v", err)
+	}
+	metatable3, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable3 metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable1.Ref, callKey.Value, callMeta1.Value); err != nil {
+		t.Fatalf("seed callable1 __call: %v", err)
+	}
+	if err := engine.Tables.Set(metatable2.Ref, callKey.Value, callMeta2.Value); err != nil {
+		t.Fatalf("seed callable2 __call: %v", err)
+	}
+	if err := engine.Tables.Set(metatable3.Ref, callKey.Value, callMeta3.Value); err != nil {
+		t.Fatalf("seed callable3 __call: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable1.Value, metatable1.Value); err != nil {
+		t.Fatalf("set callable1 metatable: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable2.Value, metatable2.Value); err != nil {
+		t.Fatalf("set callable2 metatable: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable3.Value, metatable3.Value); err != nil {
+		t.Fatalf("set callable3 metatable: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-tmcall-polymorphic-top.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 2, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{callable1.Value, value.NumberValue(0)}, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable2.Value, value.NumberValue(0)}, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if cell.State != feedback.StatePolymorphic {
+		t.Fatalf("call feedback state = %d, want polymorphic", cell.State)
+	}
+	matched, ok, err := engine.MatchCallFeedbackCell(callable1.Value, cell)
+	if err != nil || !ok || matched.Bits() != callMeta1.Value.Bits() {
+		t.Fatalf("polymorphic feedback should match callable1 = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, callMeta1.Value)
+	}
+	matched, ok, err = engine.MatchCallFeedbackCell(callable2.Value, cell)
+	if err != nil || !ok || matched.Bits() != callMeta2.Value.Bits() {
+		t.Fatalf("polymorphic feedback should match callable2 = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, callMeta2.Value)
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable3.Value, value.NumberValue(0)}, -1)
+	if err != nil {
+		t.Fatalf("third runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(43)})
+	cell = mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if cell.State != feedback.StateMegamorphic {
+		t.Fatalf("third callable receiver should force megamorphic state, got %+v", cell)
+	}
+	matched, ok, err = engine.MatchCallFeedbackCell(callable3.Value, cell)
+	if err != nil || !ok || matched.Bits() != callMeta3.Value.Bits() {
+		t.Fatalf("third callable receiver should populate megamorphic cache for callable3 = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, callMeta3.Value)
+	}
+	matched, ok, err = engine.MatchCallFeedbackCell(callable1.Value, cell)
+	if err != nil || !ok || matched.Bits() != callMeta1.Value.Bits() {
+		t.Fatalf("megamorphic cache should retain callable1 = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, callMeta1.Value)
+	}
+	before := runtime.SlowStubCount(stubs.StubLuaCall)
+	beforeBoundary := runtime.MegamorphicCallBoundaryCount()
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable1.Value, value.NumberValue(0)}, -1)
+	if err != nil {
+		t.Fatalf("post-megamorphic runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	if got := runtime.MegamorphicCallBoundaryCount() - beforeBoundary; got != 0 {
+		t.Fatalf("cached megamorphic tm_call receiver should stay on covered path, got %d runtime boundaries", got)
+	}
+	beforeBoundary = runtime.MegamorphicCallBoundaryCount()
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable3.Value, value.NumberValue(0)}, -1)
+	if err != nil {
+		t.Fatalf("second cached megamorphic runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(43)})
+	if got := runtime.MegamorphicCallBoundaryCount() - beforeBoundary; got != 0 {
+		t.Fatalf("another cached megamorphic tm_call receiver should stay on covered path, got %d runtime boundaries", got)
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != before {
+		t.Fatalf("megamorphic tm_call should stay on call-family runtime boundary without growing shared call stubs: before=%d after=%d", before, runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("polymorphic shared tm_call should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallMegamorphicTailSiteStaysOffSharedTailStub(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	callMeta1, err := engine.RegisterHostFunction("tail-call-meta-1-mega", func(value.TValue, float64) float64 { return 41 }, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function1: %v", err)
+	}
+	callMeta2, err := engine.RegisterHostFunction("tail-call-meta-2-mega", func(value.TValue, float64) float64 { return 42 }, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function2: %v", err)
+	}
+	callMeta3, err := engine.RegisterHostFunction("tail-call-meta-3-mega", func(value.TValue, float64) float64 { return 43 }, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function3: %v", err)
+	}
+	callable1, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable1: %v", err)
+	}
+	callable2, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable2: %v", err)
+	}
+	callable3, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable3: %v", err)
+	}
+	metatable1, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable1 metatable: %v", err)
+	}
+	metatable2, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable2 metatable: %v", err)
+	}
+	metatable3, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable3 metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable1.Ref, callKey.Value, callMeta1.Value); err != nil {
+		t.Fatalf("seed callable1 __call: %v", err)
+	}
+	if err := engine.Tables.Set(metatable2.Ref, callKey.Value, callMeta2.Value); err != nil {
+		t.Fatalf("seed callable2 __call: %v", err)
+	}
+	if err := engine.Tables.Set(metatable3.Ref, callKey.Value, callMeta3.Value); err != nil {
+		t.Fatalf("seed callable3 __call: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable1.Value, metatable1.Value); err != nil {
+		t.Fatalf("set callable1 metatable: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable2.Value, metatable2.Value); err != nil {
+		t.Fatalf("set callable2 metatable: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable3.Value, metatable3.Value); err != nil {
+		t.Fatalf("set callable3 metatable: %v", err)
+	}
+	tailProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-megamorphic-tail-top.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_TAILCALL, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(tailProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{callable1.Value, value.NumberValue(0)}, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable2.Value, value.NumberValue(0)}, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if cell.State != feedback.StatePolymorphic {
+		t.Fatalf("tail feedback state = %d, want polymorphic", cell.State)
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable3.Value, value.NumberValue(0)}, -1)
+	if err != nil {
+		t.Fatalf("third runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(43)})
+	cell = mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if cell.State != feedback.StateMegamorphic {
+		t.Fatalf("third callable receiver should force megamorphic tail state, got %+v", cell)
+	}
+	matched, ok, err := engine.MatchCallFeedbackCell(callable3.Value, cell)
+	if err != nil || !ok || matched.Bits() != callMeta3.Value.Bits() {
+		t.Fatalf("third callable receiver should populate megamorphic tail cache for callable3 = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, callMeta3.Value)
+	}
+	matched, ok, err = engine.MatchCallFeedbackCell(callable1.Value, cell)
+	if err != nil || !ok || matched.Bits() != callMeta1.Value.Bits() {
+		t.Fatalf("megamorphic tail cache should retain callable1 = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, callMeta1.Value)
+	}
+	before := runtime.SlowStubCount(stubs.StubTailCall)
+	beforeBoundary := runtime.MegamorphicCallBoundaryCount()
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable1.Value, value.NumberValue(0)}, -1)
+	if err != nil {
+		t.Fatalf("post-megamorphic tail runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	if got := runtime.MegamorphicCallBoundaryCount() - beforeBoundary; got != 0 {
+		t.Fatalf("cached megamorphic tm_call tail receiver should stay on covered path, got %d runtime boundaries", got)
+	}
+	beforeBoundary = runtime.MegamorphicCallBoundaryCount()
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable3.Value, value.NumberValue(0)}, -1)
+	if err != nil {
+		t.Fatalf("second cached megamorphic tail runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(43)})
+	if got := runtime.MegamorphicCallBoundaryCount() - beforeBoundary; got != 0 {
+		t.Fatalf("another cached megamorphic tm_call tail receiver should stay on covered path, got %d runtime boundaries", got)
+	}
+	if runtime.SlowStubCount(stubs.StubTailCall) != before {
+		t.Fatalf("megamorphic tm_call tail site should stay on call-family runtime boundary without growing shared tail stubs: before=%d after=%d", before, runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("megamorphic tm_call tail site should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallHostMetamethodTailCallBecomesCoveredAfterWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	callMeta, err := engine.RegisterHostFunction("tail-call-meta", func(_ value.TValue, x float64) float64 {
+		return x + 1
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function: %v", err)
+	}
+	callable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, callMeta.Value); err != nil {
+		t.Fatalf("seed __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable.Value, metatable.Value); err != nil {
+		t.Fatalf("set callable metatable: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "callable", callable.Value); err != nil {
+		t.Fatalf("set global callable: %v", err)
+	}
+	tailProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-host-tail-top.lua",
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("callable"),
+			bytecode.NumberConstant(41),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABC(bytecode.OP_TAILCALL, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(tailProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell0 := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	cell1 := mustFeedbackCell(t, runtime, closure.Ref, 1)
+	if !isResolvedCallFeedbackCell(cell0, feedback.AccessCallResolvedHostFunction, callable.Value) && !isResolvedCallFeedbackCell(cell1, feedback.AccessCallResolvedHostFunction, callable.Value) {
+		t.Fatalf("tm_call host tail feedback cells = [%+v %+v], want one resolved-host monomorphic cell on callable receiver", cell0, cell1)
+	}
+	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
+		t.Fatalf("first tm_call host tailcall should use one shared tail stub, got %d", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
+		t.Fatalf("second tm_call host tailcall should stay on covered host path after warmup, got %d shared tail stubs", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("tm_call host tailcall warmup should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallHostWrapperLuaClosureTailCallBecomesCoveredAfterWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	metaProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-host-wrapper-lua-tail-meta.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_MOVE, 0, 1, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	metaClosure, err := engine.NewClosure(metaProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new tm_call host-wrapper tail closure: %v", err)
+	}
+	if _, err := runtime.Compile(metaProto); err != nil {
+		t.Fatalf("compile tm_call host-wrapper tail proto: %v", err)
+	}
+	wrapper, err := engine.RegisterHostObject("bag", map[string]float64{"x": 1}, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new wrapper metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, metaClosure.Value); err != nil {
+		t.Fatalf("seed wrapper __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(wrapper.Value, metatable.Value); err != nil {
+		t.Fatalf("set wrapper metatable: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "callable", wrapper.Value); err != nil {
+		t.Fatalf("set global callable: %v", err)
+	}
+	tailProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-host-wrapper-lua-tail-top.lua",
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("callable"),
+			bytecode.NumberConstant(41),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABC(bytecode.OP_TAILCALL, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(tailProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	cell0 := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	cell1 := mustFeedbackCell(t, runtime, closure.Ref, 1)
+	if !isResolvedCallFeedbackCell(cell0, feedback.AccessCallResolvedLuaClosure, wrapper.Value) && !isResolvedCallFeedbackCell(cell1, feedback.AccessCallResolvedLuaClosure, wrapper.Value) {
+		t.Fatalf("tm_call host-wrapper lua tail feedback cells = [%+v %+v], want one resolved-lua monomorphic cell on callable receiver", cell0, cell1)
+	}
+	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
+		t.Fatalf("first tm_call host-wrapper lua closure tailcall should use one shared tail stub, got %d", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
+		t.Fatalf("second tm_call host-wrapper lua closure tailcall should stay on covered path after warmup, got %d shared tail stubs", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("tm_call host-wrapper lua closure tailcall warmup should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallTypeMetatableLuaClosureTailRefreshStaysMonomorphic(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	metaProto1 := &bytecode.Proto{
+		Source:       "@jit-tmcall-type-lua-tail-meta-1.lua",
+		NumParams:    1,
+		MaxStackSize: 1,
+		Constants:    []bytecode.Constant{bytecode.NumberConstant(41)},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	metaProto2 := &bytecode.Proto{
+		Source:       "@jit-tmcall-type-lua-tail-meta-2.lua",
+		NumParams:    1,
+		MaxStackSize: 1,
+		Constants:    []bytecode.Constant{bytecode.NumberConstant(42)},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	metaClosure1, err := engine.NewClosure(metaProto1, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new type-metatable tail lua closure1: %v", err)
+	}
+	metaClosure2, err := engine.NewClosure(metaProto2, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new type-metatable tail lua closure2: %v", err)
+	}
+	if _, err := runtime.Compile(metaProto1); err != nil {
+		t.Fatalf("compile type-metatable tail lua proto1: %v", err)
+	}
+	if _, err := runtime.Compile(metaProto2); err != nil {
+		t.Fatalf("compile type-metatable tail lua proto2: %v", err)
+	}
+	metatable1, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable1: %v", err)
+	}
+	metatable2, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable2: %v", err)
+	}
+	if err := engine.Tables.Set(metatable1.Ref, callKey.Value, metaClosure1.Value); err != nil {
+		t.Fatalf("seed metatable1 __call: %v", err)
+	}
+	if err := engine.Tables.Set(metatable2.Ref, callKey.Value, metaClosure2.Value); err != nil {
+		t.Fatalf("seed metatable2 __call: %v", err)
+	}
+	callableNumber := value.NumberValue(7)
+	if err := engine.SetValueMetatableBoundary(callableNumber, metatable1.Value); err != nil {
+		t.Fatalf("set number metatable1: %v", err)
+	}
+	tailProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-type-lua-tail-top.lua",
+		NumParams:    1,
+		MaxStackSize: 1,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_TAILCALL, 0, 1, 0),
+		},
+	}
+	closure, err := engine.NewClosure(tailProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{callableNumber}, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callableNumber}, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(41)})
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if !isResolvedCallFeedbackCell(cell, feedback.AccessCallResolvedLuaClosure, callableNumber) {
+		t.Fatalf("type-metatable lua tail feedback cell = %+v, want resolved-lua monomorphic", cell)
+	}
+	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
+		t.Fatalf("type-metatable lua tailcall should become covered after warmup, got %d shared tail stubs", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	if err := engine.SetValueMetatableBoundary(callableNumber, metatable2.Value); err != nil {
+		t.Fatalf("set number metatable2: %v", err)
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callableNumber}, -1)
+	if err != nil {
+		t.Fatalf("third runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell = mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if !isResolvedCallFeedbackCell(cell, feedback.AccessCallResolvedLuaClosure, callableNumber) {
+		t.Fatalf("type-metatable lua tail feedback should stay monomorphic after metatable change, got %+v", cell)
+	}
+	if runtime.SlowStubCount(stubs.StubTailCall) != 2 {
+		t.Fatalf("type-metatable lua tail metatable change should force one shared tail stub refresh, got %d", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callableNumber}, -1)
+	if err != nil {
+		t.Fatalf("fourth runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubTailCall) != 2 {
+		t.Fatalf("refreshed type-metatable lua tailcall should return to covered path, got %d shared tail stubs", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("type-metatable lua tail refresh should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallLuaClosureTailCallBecomesCoveredAfterWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	metaProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-covered-tail-meta.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_MOVE, 0, 1, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	metaClosure, err := engine.NewClosure(metaProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new tm_call metamethod closure: %v", err)
+	}
+	if _, err := runtime.Compile(metaProto); err != nil {
+		t.Fatalf("compile tm_call metamethod proto: %v", err)
+	}
+	callable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, metaClosure.Value); err != nil {
+		t.Fatalf("seed __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable.Value, metatable.Value); err != nil {
+		t.Fatalf("set callable metatable: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "callable", callable.Value); err != nil {
+		t.Fatalf("set global callable: %v", err)
+	}
+	tailProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-covered-tail-top.lua",
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("callable"),
+			bytecode.NumberConstant(42),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABC(bytecode.OP_TAILCALL, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(tailProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("first runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	cell0 := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	cell1 := mustFeedbackCell(t, runtime, closure.Ref, 1)
+	if !isResolvedCallFeedbackCell(cell0, feedback.AccessCallResolvedLuaClosure, callable.Value) && !isResolvedCallFeedbackCell(cell1, feedback.AccessCallResolvedLuaClosure, callable.Value) {
+		t.Fatalf("tm_call covered-tail feedback cells = [%+v %+v], want one resolved-lua monomorphic cell on callable receiver", cell0, cell1)
+	}
+	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
+		t.Fatalf("first tm_call lua closure tailcall should use one shared tail stub, got %d", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("second runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
+		t.Fatalf("second tm_call lua closure tailcall should stay on covered fast path after warmup, got %d shared tail stubs", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("tm_call covered-tail warmup should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeDirectAndTMCallLuaClosureTailSiteStaysCoveredAfterPolymorphicWarmup(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	directProto := &bytecode.Proto{
+		Source:       "@jit-direct-poly-tail-callee.lua",
+		NumParams:    1,
+		MaxStackSize: 1,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_MOVE, 0, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	directClosure, err := engine.NewClosure(directProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new direct closure: %v", err)
+	}
+	if _, err := runtime.Compile(directProto); err != nil {
+		t.Fatalf("compile direct proto: %v", err)
+	}
+	metaProto := &bytecode.Proto{
+		Source:       "@jit-direct-poly-tail-meta.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_MOVE, 0, 1, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	metaClosure, err := engine.NewClosure(metaProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new tm_call metamethod closure: %v", err)
+	}
+	if _, err := runtime.Compile(metaProto); err != nil {
+		t.Fatalf("compile meta proto: %v", err)
+	}
+	callable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, metaClosure.Value); err != nil {
+		t.Fatalf("seed __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable.Value, metatable.Value); err != nil {
+		t.Fatalf("set callable metatable: %v", err)
+	}
+	tailProto := &bytecode.Proto{
+		Source:       "@jit-direct-poly-tail-top.lua",
+		NumParams:    2,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_TAILCALL, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(tailProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{directClosure.Value, value.NumberValue(42)}, -1)
+	if err != nil {
+		t.Fatalf("direct tail runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubTailCall) != 0 {
+		t.Fatalf("direct covered tailcall should avoid shared tail stub, got %d", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable.Value, value.NumberValue(42)}, -1)
+	if err != nil {
+		t.Fatalf("first tm_call tail runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
+		t.Fatalf("first callable-object tailcall should use one shared tail stub, got %d", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if cell.State != feedback.StatePolymorphic {
+		t.Fatalf("mixed direct/tm_call tail feedback cell = %+v, want polymorphic", cell)
+	}
+	matched, ok, err := engine.MatchCallFeedbackCell(directClosure.Value, cell)
+	if err != nil || !ok || matched.Bits() != directClosure.Value.Bits() {
+		t.Fatalf("polymorphic tail feedback should still match direct closure = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, directClosure.Value)
+	}
+	matched, ok, err = engine.MatchCallFeedbackCell(callable.Value, cell)
+	if err != nil || !ok || matched.Bits() != metaClosure.Value.Bits() {
+		t.Fatalf("polymorphic tail feedback should match callable object = (%s, %v, %v), want (%s, true, nil)", matched, ok, err, metaClosure.Value)
+	}
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{directClosure.Value, value.NumberValue(42)}, -1)
+	if err != nil {
+		t.Fatalf("second direct tail runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	results, err = runtime.Call(thread, closure.Value, []value.TValue{callable.Value, value.NumberValue(42)}, -1)
+	if err != nil {
+		t.Fatalf("second tm_call tail runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubTailCall) != 1 {
+		t.Fatalf("polymorphic warmup should keep later direct/tm_call tailcalls on covered path, got %d shared tail stubs", runtime.SlowStubCount(stubs.StubTailCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("mixed direct/tm_call tail site should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallLuaClosureTForLoopBecomesCoveredWithinLoop(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	metaProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-covered-tfor-meta.lua",
+		NumParams:    3,
+		MaxStackSize: 5,
+		Constants: []bytecode.Constant{
+			bytecode.NumberConstant(1),
+			bytecode.NumberConstant(10),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_LT, 1, 2, 1),
+			bytecode.CreateAsBx(bytecode.OP_JMP, 0, 2),
+			bytecode.CreateABC(bytecode.OP_LOADNIL, 3, 4, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 3, 3, 0),
+			bytecode.CreateABC(bytecode.OP_ADD, 3, 2, bytecode.RKAsk(0)),
+			bytecode.CreateABC(bytecode.OP_ADD, 4, 3, bytecode.RKAsk(1)),
+			bytecode.CreateABC(bytecode.OP_RETURN, 3, 3, 0),
+		},
+	}
+	metaClosure, err := engine.NewClosure(metaProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new tm_call iterator metamethod closure: %v", err)
+	}
+	if _, err := runtime.Compile(metaProto); err != nil {
+		t.Fatalf("compile tm_call iterator metamethod proto: %v", err)
+	}
+	iterator, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new iterator table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new iterator metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, metaClosure.Value); err != nil {
+		t.Fatalf("seed __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(iterator.Value, metatable.Value); err != nil {
+		t.Fatalf("set iterator metatable: %v", err)
+	}
+	topProto := &bytecode.Proto{
+		Source:       "@jit-tmcall-covered-tfor-top.lua",
+		NumParams:    4,
+		MaxStackSize: 6,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_MOVE, 5, 3, 0),
+			bytecode.CreateABC(bytecode.OP_TFORLOOP, 0, 0, 2),
+			bytecode.CreateAsBx(bytecode.OP_JMP, 0, 1),
+			bytecode.CreateABC(bytecode.OP_RETURN, 5, 2, 0),
+			bytecode.CreateABC(bytecode.OP_ADD, 5, 5, 4),
+			bytecode.CreateAsBx(bytecode.OP_JMP, 0, -5),
+		},
+	}
+	closure, err := engine.NewClosure(topProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new top closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, []value.TValue{iterator.Value, value.NumberValue(2), value.NumberValue(0), value.NumberValue(0)}, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(23)})
+	cell := mustFeedbackCell(t, runtime, closure.Ref, 0)
+	if cell.State != feedback.StateMonomorphic || cell.AccessKind != feedback.AccessCallResolvedLuaClosure || cell.ValueBits != iterator.Value.Bits() {
+		t.Fatalf("tm_call covered-tfor feedback cell = %+v, want resolved-lua monomorphic on iterator receiver", cell)
+	}
+	if runtime.SlowStubCount(stubs.StubLuaCall) != 1 {
+		t.Fatalf("tm_call lua closure tforloop should use one shared call stub for the first iterator step only, got %d", runtime.SlowStubCount(stubs.StubLuaCall))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("tm_call covered-tforloop should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeTMCallFeedbackMatchesInterpreter(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	interpThread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new interpreter thread: %v", err)
+	}
+	compiledThread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new compiled thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	callKey, err := engine.InternString("__call")
+	if err != nil {
+		t.Fatalf("intern __call key: %v", err)
+	}
+	callMeta, err := engine.RegisterHostFunction("call-meta", func(_ value.TValue, x float64, y float64) float64 {
+		return x + y
+	}, env.Value)
+	if err != nil {
+		t.Fatalf("register __call host function: %v", err)
+	}
+	callable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new callable metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, callKey.Value, callMeta.Value); err != nil {
+		t.Fatalf("seed __call metamethod: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(callable.Value, metatable.Value); err != nil {
+		t.Fatalf("set callable metatable: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@feedback-tmcall-shared.lua",
+		NumParams:    1,
+		MaxStackSize: 4,
+		Constants: []bytecode.Constant{
+			bytecode.NumberConstant(10),
+			bytecode.NumberConstant(32),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_MOVE, 1, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 2, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 3, 1),
+			bytecode.CreateABC(bytecode.OP_CALL, 1, 3, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 1, 2, 0),
+		},
+	}
+	interpClosure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new interpreter closure: %v", err)
+	}
+	compiledClosure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new compiled closure: %v", err)
+	}
+	compiled, err := runtime.Compile(proto)
+	if err != nil {
+		t.Fatalf("compile shared proto: %v", err)
+	}
+	if _, err := engine.Closures.EnsureFeedbackVector(interpClosure.Ref, compiled.FeedbackLayout); err != nil {
+		t.Fatalf("ensure interpreter feedback vector: %v", err)
+	}
+	if _, err := engine.Call(interpThread, interpClosure.Value, []value.TValue{callable.Value}, -1); err != nil {
+		t.Fatalf("interpreter warm call: %v", err)
+	}
+	if _, err := runtime.Call(compiledThread, compiledClosure.Value, []value.TValue{callable.Value}, -1); err != nil {
+		t.Fatalf("compiled warm call: %v", err)
+	}
+	assertFeedbackCellEqual(t, mustFeedbackCell(t, runtime, interpClosure.Ref, 0), mustFeedbackCell(t, runtime, compiledClosure.Ref, 0))
+}
+
+func TestBaselineRuntimeFailedCallFeedbackMatchesInterpreter(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	interpThread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new interpreter thread: %v", err)
+	}
+	compiledThread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new compiled thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	calleeProto := &bytecode.Proto{
+		Source:       "@failed-call-feedback-callee.lua",
+		MaxStackSize: 1,
+		Constants:    []bytecode.Constant{bytecode.NumberConstant(42)},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_LOADK, 0, 0),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	callee, err := engine.NewClosure(calleeProto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new callee closure: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@failed-call-feedback-shared.lua",
+		NumParams:    1,
+		MaxStackSize: 1,
+		Code: []bytecode.Instruction{
+			bytecode.CreateABC(bytecode.OP_CALL, 0, 1, 2),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	interpClosure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new interpreter closure: %v", err)
+	}
+	compiledClosure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new compiled closure: %v", err)
+	}
+	compiled, err := runtime.Compile(proto)
+	if err != nil {
+		t.Fatalf("compile shared proto: %v", err)
+	}
+	if _, err := engine.Closures.EnsureFeedbackVector(interpClosure.Ref, compiled.FeedbackLayout); err != nil {
+		t.Fatalf("ensure interpreter feedback vector: %v", err)
+	}
+	if _, err := engine.Call(interpThread, interpClosure.Value, []value.TValue{callee.Value}, -1); err != nil {
+		t.Fatalf("interpreter warm call: %v", err)
+	}
+	if _, err := runtime.Call(compiledThread, compiledClosure.Value, []value.TValue{callee.Value}, -1); err != nil {
+		t.Fatalf("compiled warm call: %v", err)
+	}
+	warmInterp := mustFeedbackCell(t, runtime, interpClosure.Ref, 0)
+	warmCompiled := mustFeedbackCell(t, runtime, compiledClosure.Ref, 0)
+	assertFeedbackCellEqual(t, warmInterp, warmCompiled)
+	if _, err := engine.Call(interpThread, interpClosure.Value, []value.TValue{value.NumberValue(7)}, -1); err == nil {
+		t.Fatalf("interpreter invalid call should fail")
+	}
+	if _, err := runtime.Call(compiledThread, compiledClosure.Value, []value.TValue{value.NumberValue(7)}, -1); err == nil {
+		t.Fatalf("compiled invalid call should fail")
+	}
+	assertFeedbackCellEqual(t, warmInterp, mustFeedbackCell(t, runtime, interpClosure.Ref, 0))
+	assertFeedbackCellEqual(t, warmCompiled, mustFeedbackCell(t, runtime, compiledClosure.Ref, 0))
+	assertFeedbackCellEqual(t, mustFeedbackCell(t, runtime, interpClosure.Ref, 0), mustFeedbackCell(t, runtime, compiledClosure.Ref, 0))
+}
+
 func TestBaselineRuntimeHostDescriptorRefreshKeepsCompiledContinuation(t *testing.T) {
 	engine := interp.New()
 	runtime := NewRuntime(engine)
@@ -3035,6 +6277,233 @@ func TestBaselineRuntimeHostDescriptorRefreshKeepsCompiledContinuation(t *testin
 	}
 	if runtime.DeoptCount() != 0 {
 		t.Fatalf("descriptor refresh should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeHostNumericMapKeysReuseSharedStubs(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	bag := map[float64]float64{1: 5}
+	bagObject, err := engine.RegisterHostObject("bag", bag, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "bag", bagObject.Value); err != nil {
+		t.Fatalf("set global bag: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-host-numeric-keys.lua",
+		MaxStackSize: 4,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("bag"),
+			bytecode.NumberConstant(2),
+			bytecode.NumberConstant(42),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 2, 2),
+			bytecode.CreateABC(bytecode.OP_SETTABLE, 0, 1, 2),
+			bytecode.CreateABC(bytecode.OP_GETTABLE, 3, 0, 1),
+			bytecode.CreateABC(bytecode.OP_RETURN, 3, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if bag[2] != 42 {
+		t.Fatalf("host numeric map key should update Go target, got %v", bag)
+	}
+	if runtime.SlowStubCount(stubs.StubSetTable) != 1 {
+		t.Fatalf("host numeric map set should use one shared set-table stub, got %d", runtime.SlowStubCount(stubs.StubSetTable))
+	}
+	if runtime.SlowStubCount(stubs.StubGetTable) != 1 {
+		t.Fatalf("host numeric map get should use one shared get-table stub, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("host numeric map bridge should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeHostDescriptorErrorsCollapseToUserdata(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	bagObject, err := engine.RegisterHostObject("bag", map[string]float64{"x": 1}, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "bag", bagObject.Value); err != nil {
+		t.Fatalf("set global bag: %v", err)
+	}
+	_, _, descriptor, err := engine.Hosts.ReadHostObject(bagObject.Ref)
+	if err != nil {
+		t.Fatalf("read host object: %v", err)
+	}
+	descriptor.Get = func(target any, key any) (any, bool, error) {
+		return nil, false, fmt.Errorf("boom")
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-host-descriptor-error.lua",
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("bag"),
+			bytecode.StringConstant("x"),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABC(bytecode.OP_GETTABLE, 0, 0, 1),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	_, err = runtime.Call(thread, closure.Value, nil, -1)
+	if err == nil || err.Error() != "attempt to index a userdata value" {
+		t.Fatalf("runtime error = %v, want userdata index error", err)
+	}
+	if runtime.SlowStubCount(stubs.StubGetTable) != 1 {
+		t.Fatalf("host descriptor error should use one shared get-table stub, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("host descriptor error should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeHostStructLuaFieldTagsReuseSharedStubs(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	target := &hostTaggedScore{Value: 5}
+	bagObject, err := engine.RegisterHostObject("counter", target, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "counter", bagObject.Value); err != nil {
+		t.Fatalf("set global counter: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-host-tagged-struct.lua",
+		MaxStackSize: 4,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("counter"),
+			bytecode.StringConstant("score"),
+			bytecode.NumberConstant(42),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABx(bytecode.OP_LOADK, 2, 2),
+			bytecode.CreateABC(bytecode.OP_SETTABLE, 0, 1, 2),
+			bytecode.CreateABC(bytecode.OP_GETTABLE, 3, 0, 1),
+			bytecode.CreateABC(bytecode.OP_RETURN, 3, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if target.Value != 42 {
+		t.Fatalf("host tagged field should update Go target, got %v", target.Value)
+	}
+	if runtime.SlowStubCount(stubs.StubSetTable) != 1 {
+		t.Fatalf("host tagged field set should use one shared set-table stub, got %d", runtime.SlowStubCount(stubs.StubSetTable))
+	}
+	if runtime.SlowStubCount(stubs.StubGetTable) != 1 {
+		t.Fatalf("host tagged field get should use one shared get-table stub, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("host tagged field bridge should avoid deopt, got %d", runtime.DeoptCount())
+	}
+}
+
+func TestBaselineRuntimeHostStructLuaMethodTagsReuseSharedStubs(t *testing.T) {
+	engine := interp.New()
+	runtime := NewRuntime(engine)
+	defer func() { _ = runtime.Close() }()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	target := &hostTaggedMethodScore{Value: 21}
+	bagObject, err := engine.RegisterHostObject("counter", target, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	if err := engine.SetGlobal(env.Value, "counter", bagObject.Value); err != nil {
+		t.Fatalf("set global counter: %v", err)
+	}
+	proto := &bytecode.Proto{
+		Source:       "@jit-host-tagged-method.lua",
+		MaxStackSize: 2,
+		Constants: []bytecode.Constant{
+			bytecode.StringConstant("counter"),
+			bytecode.StringConstant("double-score"),
+		},
+		Code: []bytecode.Instruction{
+			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
+			bytecode.CreateABx(bytecode.OP_LOADK, 1, 1),
+			bytecode.CreateABC(bytecode.OP_GETTABLE, 0, 0, 1),
+			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
+		},
+	}
+	closure, err := engine.NewClosure(proto, env.Value, nil)
+	if err != nil {
+		t.Fatalf("new closure: %v", err)
+	}
+	results, err := runtime.Call(thread, closure.Value, nil, -1)
+	if err != nil {
+		t.Fatalf("runtime call: %v", err)
+	}
+	assertValuesEqual(t, results, []value.TValue{value.NumberValue(42)})
+	if runtime.SlowStubCount(stubs.StubGetTable) != 1 {
+		t.Fatalf("host tagged method get should use one shared get-table stub, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("host tagged method bridge should avoid deopt, got %d", runtime.DeoptCount())
 	}
 }
 
@@ -3301,13 +6770,16 @@ func TestBaselineRuntimeDeoptResumesWithoutReplayingEarlierSideEffects(t *testin
 		t.Fatalf("new closure: %v", err)
 	}
 	if _, err := runtime.Call(thread, closure.Value, []value.TValue{hostFunc.Value, value.NumberValue(7)}, -1); err == nil {
-		t.Fatalf("expected deopted GETTABLE to surface an interpreter error")
+		t.Fatalf("expected slow-path GETTABLE to surface an error")
 	}
 	if calls != 1 {
 		t.Fatalf("earlier host side effect was replayed %d times, want 1", calls)
 	}
-	if runtime.DeoptCount() != 1 {
-		t.Fatalf("expected exactly one continuation-aware deopt, got %d", runtime.DeoptCount())
+	if runtime.SlowStubCount(stubs.StubGetTable) != 1 {
+		t.Fatalf("unsupported GETTABLE should use shared slow stub once, got %d", runtime.SlowStubCount(stubs.StubGetTable))
+	}
+	if runtime.DeoptCount() != 0 {
+		t.Fatalf("unsupported GETTABLE should avoid deopt after runtime dispatch, got %d", runtime.DeoptCount())
 	}
 }
 
@@ -3405,6 +6877,10 @@ func assertFeedbackCellEqual(t *testing.T, got feedback.Cell, want feedback.Cell
 	if got != want {
 		t.Fatalf("feedback cell mismatch: got %+v want %+v", got, want)
 	}
+}
+
+func isResolvedCallFeedbackCell(cell feedback.Cell, accessKind feedback.AccessKind, receiver value.TValue) bool {
+	return cell.State == feedback.StateMonomorphic && cell.AccessKind == accessKind && cell.ValueBits == receiver.Bits()
 }
 
 func assertNoNativeFallback(t *testing.T, runtime *Runtime) {

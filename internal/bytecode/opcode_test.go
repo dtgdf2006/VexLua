@@ -83,3 +83,59 @@ func TestProtoClosureTemplateAndValidation(t *testing.T) {
 		t.Fatalf("expected proto validation success, got: %v", err)
 	}
 }
+
+func TestValidateProtoRejectsMalformedTestOpcodeShapes(t *testing.T) {
+	tests := []struct {
+		name   string
+		proto  *bytecode.Proto
+		needle string
+	}{
+		{
+			name: "testset missing trailing jump",
+			proto: &bytecode.Proto{
+				MaxStackSize: 3,
+				Code: []bytecode.Instruction{
+					bytecode.CreateABC(bytecode.OP_LOADBOOL, 0, 1, 0),
+					bytecode.CreateABC(bytecode.OP_TESTSET, 2, 0, 1),
+				},
+			},
+			needle: "missing trailing JMP",
+		},
+		{
+			name: "compare expects trailing jump",
+			proto: &bytecode.Proto{
+				MaxStackSize: 2,
+				Constants:    []bytecode.Constant{bytecode.NumberConstant(1), bytecode.NumberConstant(2)},
+				Code: []bytecode.Instruction{
+					bytecode.CreateABC(bytecode.OP_EQ, 0, bytecode.RKAsk(0), bytecode.RKAsk(1)),
+					bytecode.CreateABC(bytecode.OP_RETURN, 0, 1, 0),
+				},
+			},
+			needle: "expects trailing JMP",
+		},
+		{
+			name: "tforloop jump target in range",
+			proto: &bytecode.Proto{
+				MaxStackSize: 4,
+				Code: []bytecode.Instruction{
+					bytecode.CreateABC(bytecode.OP_TFORLOOP, 0, 0, 1),
+					bytecode.CreateAsBx(bytecode.OP_JMP, 0, 9),
+					bytecode.CreateABC(bytecode.OP_RETURN, 0, 1, 0),
+				},
+			},
+			needle: "trailing JMP target out of range",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := bytecode.ValidateProto(test.proto)
+			if err == nil {
+				t.Fatalf("expected validation error")
+			}
+			if !strings.Contains(err.Error(), test.needle) {
+				t.Fatalf("validation error = %q, want substring %q", err.Error(), test.needle)
+			}
+		})
+	}
+}

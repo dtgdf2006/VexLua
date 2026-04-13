@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"vexlua/internal/bytecode"
+	"vexlua/internal/runtime/feedback"
+	rtlua "vexlua/internal/runtime/lua"
 	rtproto "vexlua/internal/runtime/proto"
 	"vexlua/internal/runtime/state"
 	"vexlua/internal/runtime/value"
@@ -20,8 +22,11 @@ func (runtime *Runtime) handleStub(thread *state.ThreadState, frame *state.CallF
 		return 0, false, nil, fmt.Errorf("stub/site mismatch: exit=%d metadata=%d", stubID, site.StubID)
 	}
 	countStub := true
-	if (stubID == stubs.StubLuaCall || stubID == stubs.StubTailCall) && ctx.Flags&execCtxFlagNestedCallPending != 0 {
+	if (stubID == stubs.StubLuaCall || stubID == stubs.StubTailCall) && ctx.Flags&(execCtxFlagNestedCallPending|execCtxFlagResolvedHostCallBoundary|execCtxFlagMegamorphicCallBoundary) != 0 {
 		countStub = false
+	}
+	if (stubID == stubs.StubLuaCall || stubID == stubs.StubTailCall) && ctx.Flags&execCtxFlagMegamorphicCallBoundary != 0 {
+		runtime.megamorphicCallBoundaryCount++
 	}
 	if countStub {
 		runtime.stubCounts[stubID]++
@@ -31,6 +36,16 @@ func (runtime *Runtime) handleStub(thread *state.ThreadState, frame *state.CallF
 		return runtime.handleGetGlobalStub(thread, frame, closureRef, compiled, site, nresults)
 	case stubs.StubGetTable:
 		return runtime.handleGetTableStub(thread, frame, closureRef, compiled, site, nresults)
+	case stubs.StubForPrep:
+		return runtime.handleForPrepStub(thread, frame, compiled, site, nresults)
+	case stubs.StubSelf:
+		return runtime.handleSelfStub(thread, frame, compiled, site, nresults)
+	case stubs.StubArithmetic:
+		return runtime.handleArithmeticStub(thread, frame, compiled, site, nresults)
+	case stubs.StubLen:
+		return runtime.handleLenStub(thread, frame, compiled, site, nresults)
+	case stubs.StubCompare:
+		return runtime.handleCompareStub(thread, frame, compiled, site, nresults)
 	case stubs.StubSetGlobal:
 		return runtime.handleSetGlobalStub(thread, frame, closureRef, compiled, site, nresults)
 	case stubs.StubSetTable:
@@ -46,12 +61,104 @@ func (runtime *Runtime) handleStub(thread *state.ThreadState, frame *state.CallF
 	case stubs.StubClosure:
 		return runtime.handleClosureStub(thread, frame, closureRef, compiled, site, nresults)
 	case stubs.StubLuaCall:
-		return runtime.handleCallStub(thread, frame, compiled, site, ctx)
+		return runtime.handleCallStub(thread, frame, closureRef, compiled, site, ctx)
 	case stubs.StubTailCall:
-		return runtime.handleTailCallStub(thread, frame, compiled, site, ctx, nresults)
+		return runtime.handleTailCallStub(thread, frame, closureRef, compiled, site, ctx, nresults)
 	default:
 		return 0, false, nil, fmt.Errorf("unknown stub id %d", stubID)
 	}
+}
+
+func (runtime *Runtime) handleForPrepStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, _ int) (uintptr, bool, []value.TValue, error) {
+	a := int(site.Operand0)
+	initNumber, err := runtime.coerceLoopRegisterNumber(thread, frame, a, "initial value")
+	if err != nil {
+		return 0, false, nil, err
+	}
+	_, err = runtime.coerceLoopRegisterNumber(thread, frame, a+1, "limit")
+	if err != nil {
+		return 0, false, nil, err
+	}
+	stepNumber, err := runtime.coerceLoopRegisterNumber(thread, frame, a+2, "step")
+	if err != nil {
+		return 0, false, nil, err
+	}
+	prepared, err := rtlua.ArithmeticNumberResult(bytecode.OP_SUB, initNumber, stepNumber)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if err := thread.SetRegister(frame, uint16(a), value.NumberValue(prepared)); err != nil {
+		return 0, false, nil, err
+	}
+	if err := advanceFrameTopForSlot(frame, a); err != nil {
+		return 0, false, nil, err
+	}
+	entry, err := compiled.EntryAtSite(site, false)
+	return entry, false, nil, err
+}
+
+func (runtime *Runtime) handleArithmeticStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, _ int) (uintptr, bool, []value.TValue, error) {
+	opcode := bytecode.Opcode(site.Operand3)
+	left, err := runtime.frameRKValue(thread, frame, compiled, int(site.Operand1))
+	if err != nil {
+		return 0, false, nil, err
+	}
+	right := left
+	if opcode != bytecode.OP_UNM {
+		right, err = runtime.frameRKValue(thread, frame, compiled, int(site.Operand2))
+		if err != nil {
+			return 0, false, nil, err
+		}
+	}
+	result, err := runtime.Engine.ArithmeticBoundary(thread, opcode, left, right)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if err := thread.SetRegister(frame, uint16(site.Operand0), result); err != nil {
+		return 0, false, nil, err
+	}
+	if err := advanceFrameTopForSlot(frame, int(site.Operand0)); err != nil {
+		return 0, false, nil, err
+	}
+	entry, err := compiled.EntryAtSite(site, false)
+	return entry, false, nil, err
+}
+
+func (runtime *Runtime) handleLenStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, _ int) (uintptr, bool, []value.TValue, error) {
+	slotValue, err := thread.Register(frame, uint16(site.Operand1))
+	if err != nil {
+		return 0, false, nil, err
+	}
+	result, err := runtime.Engine.LengthBoundary(thread, slotValue)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if err := thread.SetRegister(frame, uint16(site.Operand0), result); err != nil {
+		return 0, false, nil, err
+	}
+	if err := advanceFrameTopForSlot(frame, int(site.Operand0)); err != nil {
+		return 0, false, nil, err
+	}
+	entry, err := compiled.EntryAtSite(site, false)
+	return entry, false, nil, err
+}
+
+func (runtime *Runtime) handleCompareStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, _ int) (uintptr, bool, []value.TValue, error) {
+	opcode := bytecode.Opcode(site.Operand3)
+	left, err := runtime.frameRKValue(thread, frame, compiled, int(site.Operand1))
+	if err != nil {
+		return 0, false, nil, err
+	}
+	right, err := runtime.frameRKValue(thread, frame, compiled, int(site.Operand2))
+	if err != nil {
+		return 0, false, nil, err
+	}
+	compare, err := runtime.Engine.CompareBoundary(thread, opcode, left, right)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	entry, err := compiled.EntryAtSite(site, compare == (site.Operand0 != 0))
+	return entry, false, nil, err
 }
 
 func (runtime *Runtime) deoptFromContext(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, ctx *executionContext) ([]value.TValue, error) {
@@ -88,14 +195,9 @@ func (runtime *Runtime) handleGetGlobalStub(thread *state.ThreadState, frame *st
 	if err != nil {
 		return 0, false, nil, err
 	}
-	var result value.TValue
-	if env.IsBoxedTag(value.TagHostObjectRef) {
-		result, _, err = runtime.Engine.ReadIndexBoundary(env, key)
-		if err != nil {
-			return 0, false, nil, err
-		}
-	} else {
-		return runtime.deoptThroughSite(thread, frame, site, nresults)
+	result, _, err := runtime.Engine.ReadIndexMetaBoundary(thread, env, key)
+	if err != nil {
+		return 0, false, nil, err
 	}
 	if err := thread.SetRegister(frame, uint16(site.Operand0), result); err != nil {
 		return 0, false, nil, err
@@ -116,19 +218,40 @@ func (runtime *Runtime) handleGetTableStub(thread *state.ThreadState, frame *sta
 	if err != nil {
 		return 0, false, nil, err
 	}
-	var result value.TValue
-	if tableValue.IsBoxedTag(value.TagHostObjectRef) {
-		result, _, err = runtime.Engine.ReadIndexBoundary(tableValue, key)
-		if err != nil {
-			return 0, false, nil, err
-		}
-	} else {
-		return runtime.deoptThroughSite(thread, frame, site, nresults)
+	result, _, err := runtime.Engine.ReadIndexMetaBoundary(thread, tableValue, key)
+	if err != nil {
+		return 0, false, nil, err
 	}
 	if err := thread.SetRegister(frame, uint16(site.Operand0), result); err != nil {
 		return 0, false, nil, err
 	}
 	if err := advanceFrameTopForSlot(frame, int(site.Operand0)); err != nil {
+		return 0, false, nil, err
+	}
+	entry, err := compiled.EntryAtSite(site, false)
+	return entry, false, nil, err
+}
+
+func (runtime *Runtime) handleSelfStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, nresults int) (uintptr, bool, []value.TValue, error) {
+	tableValue, err := thread.Register(frame, uint16(site.Operand1))
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if err := thread.SetRegister(frame, uint16(site.Operand0)+1, tableValue); err != nil {
+		return 0, false, nil, err
+	}
+	key, err := runtime.frameRKValue(thread, frame, compiled, int(site.Operand2))
+	if err != nil {
+		return 0, false, nil, err
+	}
+	result, _, err := runtime.Engine.ReadIndexMetaBoundary(thread, tableValue, key)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if err := thread.SetRegister(frame, uint16(site.Operand0), result); err != nil {
+		return 0, false, nil, err
+	}
+	if err := advanceFrameTopForSlot(frame, int(site.Operand0)+1); err != nil {
 		return 0, false, nil, err
 	}
 	entry, err := compiled.EntryAtSite(site, false)
@@ -148,7 +271,7 @@ func (runtime *Runtime) handleSetGlobalStub(thread *state.ThreadState, frame *st
 	if err != nil {
 		return 0, false, nil, err
 	}
-	if err := runtime.Engine.WriteIndexBoundary(env, key, newValue); err != nil {
+	if err := runtime.Engine.WriteIndexMetaBoundary(thread, env, key, newValue); err != nil {
 		return 0, false, nil, err
 	}
 	entry, err := compiled.EntryAtSite(site, false)
@@ -168,7 +291,7 @@ func (runtime *Runtime) handleSetTableStub(thread *state.ThreadState, frame *sta
 	if err != nil {
 		return 0, false, nil, err
 	}
-	if err := runtime.Engine.WriteIndexBoundary(tableValue, key, newValue); err != nil {
+	if err := runtime.Engine.WriteIndexMetaBoundary(thread, tableValue, key, newValue); err != nil {
 		return 0, false, nil, err
 	}
 	entry, err := compiled.EntryAtSite(site, false)
@@ -242,7 +365,7 @@ func (runtime *Runtime) handleConcatStub(thread *state.ThreadState, frame *state
 		values = append(values, slotValue)
 	}
 	frame.SavedBCOff = site.ResumePC
-	if err := runtime.Engine.ConcatValuesBoundary(values, func(result value.TValue) error {
+	if err := runtime.Engine.ConcatValuesBoundary(thread, values, func(result value.TValue) error {
 		if err := thread.SetRegister(frame, uint16(site.Operand0), result); err != nil {
 			return err
 		}
@@ -335,7 +458,7 @@ func (runtime *Runtime) handleClosureStub(thread *state.ThreadState, frame *stat
 	return entry, false, nil, err
 }
 
-func (runtime *Runtime) handleCallStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, ctx *executionContext) (uintptr, bool, []value.TValue, error) {
+func (runtime *Runtime) handleCallStub(thread *state.ThreadState, frame *state.CallFrameHeader, closureRef value.HeapRef44, compiled *CompiledCode, site metadata.ContinuationSite, ctx *executionContext) (uintptr, bool, []value.TValue, error) {
 	a := int(site.Operand0)
 	b := int(site.Operand1)
 	c := int(site.Operand2)
@@ -343,6 +466,9 @@ func (runtime *Runtime) handleCallStub(thread *state.ThreadState, frame *state.C
 	previousTop := frame.LogicalTop()
 	if site.HasAlternateResume() && site.Operand3 != 0 {
 		resultBase = a + 3
+	}
+	if ctx != nil && ctx.Flags&execCtxFlagMegamorphicCallBoundary != 0 {
+		ctx.Flags &^= execCtxFlagMegamorphicCallBoundary
 	}
 	if ctx != nil && ctx.Flags&execCtxFlagNestedCallPending != 0 {
 		results, err := runtime.finishNestedCompiledCall(thread, frame, ctx)
@@ -359,15 +485,45 @@ func (runtime *Runtime) handleCallStub(thread *state.ThreadState, frame *state.C
 		}
 		return runtime.resumeCallContinuation(thread, frame, compiled, site)
 	}
+	if ctx != nil && ctx.Flags&execCtxFlagResolvedHostCallBoundary != 0 {
+		wantedResults := -1
+		if c > 0 {
+			wantedResults = c - 1
+		}
+		results, err := runtime.finishResolvedHostCall(thread, frame, site, ctx, wantedResults)
+		if err != nil {
+			return 0, false, nil, err
+		}
+		if err := storeFrameCallResults(thread, frame, resultBase, c, results); err != nil {
+			return 0, false, nil, err
+		}
+		if site.HasAlternateResume() && previousTop > frame.LogicalTop() {
+			if err := frame.SetTop(previousTop); err != nil {
+				return 0, false, nil, err
+			}
+		}
+		return runtime.resumeCallContinuationAtSafepoint(thread, frame, compiled, site)
+	}
 	callee, args, err := runtime.collectFrameCallArguments(thread, frame, a, b)
 	if err != nil {
 		return 0, false, nil, err
+	}
+	resolvedCallee, resolvedArgs, matched, err := runtime.matchCallFeedbackCell(closureRef, compiled, int(site.BytecodePC), feedback.SlotCall, callee, args)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if !matched {
+		resolvedCallee, resolvedArgs, err = runtime.Engine.ResolveCallBoundary(callee, args)
+		if err != nil {
+			return 0, false, nil, err
+		}
+		runtime.updateResolvedCallFeedback(closureRef, compiled, site, feedback.SlotCall, callee, resolvedCallee)
 	}
 	wantedResults := -1
 	if c > 0 {
 		wantedResults = c - 1
 	}
-	results, err := runtime.callValueBoundary(thread, callee, args, wantedResults)
+	results, err := runtime.callResolvedBoundary(thread, resolvedCallee, resolvedArgs, wantedResults)
 	if err != nil {
 		return 0, false, nil, err
 	}
@@ -414,10 +570,20 @@ func (runtime *Runtime) resumeCallContinuationAtSafepoint(thread *state.ThreadSt
 	return entry, false, nil, nil
 }
 
-func (runtime *Runtime) handleTailCallStub(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite, ctx *executionContext, nresults int) (uintptr, bool, []value.TValue, error) {
+func (runtime *Runtime) handleTailCallStub(thread *state.ThreadState, frame *state.CallFrameHeader, closureRef value.HeapRef44, compiled *CompiledCode, site metadata.ContinuationSite, ctx *executionContext, nresults int) (uintptr, bool, []value.TValue, error) {
 	frame.SetFlag(state.FrameFlagIsTailcall, true)
+	if ctx != nil && ctx.Flags&execCtxFlagMegamorphicCallBoundary != 0 {
+		ctx.Flags &^= execCtxFlagMegamorphicCallBoundary
+	}
 	if ctx != nil && ctx.Flags&execCtxFlagNestedCallPending != 0 {
 		results, err := runtime.finishNestedCompiledCall(thread, frame, ctx)
+		if err != nil {
+			return 0, false, nil, err
+		}
+		return 0, true, normalizeResults(results, nresults), nil
+	}
+	if ctx != nil && ctx.Flags&execCtxFlagResolvedHostCallBoundary != 0 {
+		results, err := runtime.finishResolvedHostCall(thread, frame, site, ctx, -1)
 		if err != nil {
 			return 0, false, nil, err
 		}
@@ -429,18 +595,69 @@ func (runtime *Runtime) handleTailCallStub(thread *state.ThreadState, frame *sta
 	if err != nil {
 		return 0, false, nil, err
 	}
-	results, err := runtime.callValueBoundary(thread, callee, args, -1)
+	resolvedCallee, resolvedArgs, matched, err := runtime.matchCallFeedbackCell(closureRef, compiled, int(site.BytecodePC), feedback.SlotTailCall, callee, args)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if !matched {
+		resolvedCallee, resolvedArgs, err = runtime.Engine.ResolveCallBoundary(callee, args)
+		if err != nil {
+			return 0, false, nil, err
+		}
+		runtime.updateResolvedCallFeedback(closureRef, compiled, site, feedback.SlotTailCall, callee, resolvedCallee)
+	}
+	results, err := runtime.callResolvedBoundary(thread, resolvedCallee, resolvedArgs, -1)
 	if err != nil {
 		return 0, false, nil, err
 	}
 	return 0, true, normalizeResults(results, nresults), nil
 }
 
-func (runtime *Runtime) callValueBoundary(thread *state.ThreadState, callee value.TValue, args []value.TValue, nresults int) ([]value.TValue, error) {
-	if callee.IsBoxedTag(value.TagLuaClosureRef) {
-		return runtime.Call(thread, callee, args, nresults)
+func (runtime *Runtime) matchCallFeedbackCell(closureRef value.HeapRef44, compiled *CompiledCode, bytecodePC int, kind feedback.SlotKind, callee value.TValue, args []value.TValue) (value.TValue, []value.TValue, bool, error) {
+	if compiled == nil || compiled.FeedbackLayout == nil {
+		return value.NilValue(), nil, false, nil
 	}
-	return runtime.Engine.CallValueBoundary(thread, callee, args, nresults)
+	slot, slotIndex, ok := compiled.FeedbackLayout.SlotAtPC(bytecodePC)
+	if !ok || slot.Kind != kind {
+		return value.NilValue(), nil, false, nil
+	}
+	cell, err := runtime.Engine.Closures.ReadFeedbackCell(closureRef, slotIndex)
+	if err != nil {
+		return value.NilValue(), nil, false, err
+	}
+	resolvedCallee, matched, err := runtime.Engine.MatchCallFeedbackCell(callee, cell)
+	if err != nil || !matched {
+		return value.NilValue(), nil, false, err
+	}
+	resolvedArgs := args
+	if feedback.IsResolvedCallAccessKind(cell.AccessKind) {
+		resolvedArgs = make([]value.TValue, 0, len(args)+1)
+		resolvedArgs = append(resolvedArgs, callee)
+		resolvedArgs = append(resolvedArgs, args...)
+	}
+	return resolvedCallee, resolvedArgs, true, nil
+}
+
+func (runtime *Runtime) callValueBoundary(thread *state.ThreadState, callee value.TValue, args []value.TValue, nresults int) ([]value.TValue, error) {
+	resolvedCallee, resolvedArgs, err := runtime.Engine.ResolveCallBoundary(callee, args)
+	if err != nil {
+		return nil, err
+	}
+	return runtime.callResolvedBoundary(thread, resolvedCallee, resolvedArgs, nresults)
+}
+
+func (runtime *Runtime) callResolvedBoundary(thread *state.ThreadState, resolvedCallee value.TValue, resolvedArgs []value.TValue, nresults int) ([]value.TValue, error) {
+	if resolvedCallee.IsBoxedTag(value.TagLuaClosureRef) {
+		return runtime.Call(thread, resolvedCallee, resolvedArgs, nresults)
+	}
+	return runtime.Engine.CallResolvedBoundary(thread, resolvedCallee, resolvedArgs, nresults)
+}
+
+func (runtime *Runtime) updateResolvedCallFeedback(closureRef value.HeapRef44, compiled *CompiledCode, site metadata.ContinuationSite, kind feedback.SlotKind, callee value.TValue, resolvedCallee value.TValue) {
+	if compiled == nil || compiled.Proto == nil {
+		return
+	}
+	runtime.Engine.UpdateCallFeedbackAtPC(closureRef, compiled.Proto, int(site.BytecodePC), kind, callee, resolvedCallee)
 }
 
 func (runtime *Runtime) callContinuationEntry(thread *state.ThreadState, frame *state.CallFrameHeader, compiled *CompiledCode, site metadata.ContinuationSite) (uintptr, uint32, error) {
@@ -515,6 +732,17 @@ func (runtime *Runtime) finishNestedCompiledCall(thread *state.ThreadState, call
 		}
 		return nil, err
 	}
+	if _, err := runtime.Engine.Closures.EnsureFeedbackVector(closureRef, activeCompiled.FeedbackLayout); err != nil {
+		ctx.Flags = 0
+		ctx.Reserved0 = 0
+		ctx.Reserved1 = 0
+		ctx.Reserved2 = 0
+		ctx.Reserved3 = 0
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			return nil, cleanupErr
+		}
+		return nil, err
+	}
 	nestedCtx := executionContext{SiteID: ctx.Reserved0}
 	nresults := int(activeFrame.NResults)
 	var results []value.TValue
@@ -545,6 +773,42 @@ func (runtime *Runtime) finishNestedCompiledCall(thread *state.ThreadState, call
 		return nil, err
 	}
 	return normalizeResults(results, nresults), nil
+}
+
+func (runtime *Runtime) finishResolvedHostCall(thread *state.ThreadState, frame *state.CallFrameHeader, site metadata.ContinuationSite, ctx *executionContext, nresults int) ([]value.TValue, error) {
+	resolvedCallee, prependOriginalCallee, err := takeResolvedHostCallFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	callee, args, err := runtime.collectFrameCallArguments(thread, frame, int(site.Operand0), int(site.Operand1))
+	if err != nil {
+		return nil, err
+	}
+	resolvedArgs := args
+	if prependOriginalCallee {
+		resolvedArgs = make([]value.TValue, 0, len(args)+1)
+		resolvedArgs = append(resolvedArgs, callee)
+		resolvedArgs = append(resolvedArgs, args...)
+	}
+	return runtime.callResolvedBoundary(thread, resolvedCallee, resolvedArgs, nresults)
+}
+
+func takeResolvedHostCallFromContext(ctx *executionContext) (value.TValue, bool, error) {
+	if ctx == nil || ctx.Flags&execCtxFlagResolvedHostCallBoundary == 0 {
+		return value.NilValue(), false, fmt.Errorf("resolved host call boundary is not pending")
+	}
+	raw := value.Raw(uint64(ctx.Reserved0) | uint64(ctx.Reserved1)<<32)
+	prependOriginalCallee := ctx.Reserved2 == hostCallProtocolResolvedPrependCallee
+	ctx.Flags &^= execCtxFlagResolvedHostCallBoundary
+	ctx.Reserved0 = 0
+	ctx.Reserved1 = 0
+	ctx.Reserved2 = 0
+	ctx.Reserved3 = 0
+	resolvedCallee := value.FromRaw(raw)
+	if !resolvedCallee.IsBoxedTag(value.TagHostFunctionRef) {
+		return value.NilValue(), false, fmt.Errorf("resolved host call boundary requires host function, got %s", resolvedCallee)
+	}
+	return resolvedCallee, prependOriginalCallee, nil
 }
 
 func (runtime *Runtime) compiledFrameState(frame *state.CallFrameHeader) (value.HeapRef44, *CompiledCode, error) {
@@ -619,4 +883,23 @@ func (runtime *Runtime) frameRKValue(thread *state.ThreadState, frame *state.Cal
 		return runtime.constantOperandValue(compiled, bytecode.IndexK(operand))
 	}
 	return thread.Register(frame, uint16(operand))
+}
+
+func (runtime *Runtime) coerceLoopRegisterNumber(thread *state.ThreadState, frame *state.CallFrameHeader, index int, role string) (float64, error) {
+	registerValue, err := thread.Register(frame, uint16(index))
+	if err != nil {
+		return 0, err
+	}
+	numberValue, ok, err := rtlua.ToNumber(registerValue, runtime.Engine.Strings.Text)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, fmt.Errorf("for %s must be a number", role)
+	}
+	if err := thread.SetRegister(frame, uint16(index), numberValue); err != nil {
+		return 0, err
+	}
+	number, _ := numberValue.Float64()
+	return number, nil
 }

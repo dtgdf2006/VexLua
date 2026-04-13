@@ -6,84 +6,109 @@ import (
 	"strings"
 )
 
+const luaStructFieldTag = "lua"
+
+type LuaMethodMapper interface {
+	LuaMethodMap() map[string]string
+}
+
 func makeGetter() Getter {
-	return func(current any, key string) (any, bool, error) {
+	return func(current any, key any) (any, bool, error) {
 		value := reflect.ValueOf(current)
 		if !value.IsValid() {
-			return nil, false, fmt.Errorf("host target is invalid")
+			return nil, false, newBridgeImplementationError("host target is invalid")
 		}
 		for value.Kind() == reflect.Pointer {
 			if value.IsNil() {
-				return nil, false, fmt.Errorf("host target pointer is nil")
+				return nil, false, newBridgeImplementationError("host target pointer is nil")
 			}
 			value = value.Elem()
 		}
 		switch value.Kind() {
 		case reflect.Map:
-			if value.Type().Key().Kind() != reflect.String {
-				return nil, false, fmt.Errorf("host map key type must be string")
+			if key == nil {
+				return nil, false, newBridgeImplementationError("host map key cannot be nil")
 			}
-			result := value.MapIndex(reflect.ValueOf(key))
+			convertedKey, err := assignableValue(reflect.TypeOf(key), value.Type().Key(), key)
+			if err != nil {
+				return nil, false, newBridgeImplementationError(err.Error())
+			}
+			result := value.MapIndex(convertedKey)
 			if !result.IsValid() {
 				return nil, false, nil
 			}
 			return result.Interface(), true, nil
 		case reflect.Struct:
-			field, ok := lookupStructField(value, key)
+			keyText, ok := key.(string)
 			if !ok {
-				method := reflect.ValueOf(current).MethodByName(exportName(key))
-				if method.IsValid() && method.Type().NumIn() == 0 && method.Type().NumOut() >= 1 {
-					results := method.Call(nil)
-					return results[0].Interface(), true, nil
+				return nil, false, newBridgeImplementationError("host struct property key must be string")
+			}
+			field, ok := lookupStructField(value, keyText)
+			if !ok {
+				method, found, err := lookupStructMethod(current, keyText)
+				if err != nil {
+					return nil, false, err
 				}
-				return nil, false, nil
+				if !found {
+					return nil, false, nil
+				}
+				results := method.Call(nil)
+				return results[0].Interface(), true, nil
 			}
 			return field.Interface(), true, nil
 		default:
-			return nil, false, fmt.Errorf("unsupported host object kind %s", value.Kind())
+			return nil, false, newBridgeImplementationError("unsupported host object kind %s", value.Kind())
 		}
 	}
 }
 
 func makeSetter() Setter {
-	return func(current any, key string, newValue any) error {
+	return func(current any, key any, newValue any) error {
 		value := reflect.ValueOf(current)
 		if !value.IsValid() {
-			return fmt.Errorf("host target is invalid")
+			return newBridgeImplementationError("host target is invalid")
 		}
 		for value.Kind() == reflect.Pointer {
 			if value.IsNil() {
-				return fmt.Errorf("host target pointer is nil")
+				return newBridgeImplementationError("host target pointer is nil")
 			}
 			value = value.Elem()
 		}
 		switch value.Kind() {
 		case reflect.Map:
-			if value.Type().Key().Kind() != reflect.String {
-				return fmt.Errorf("host map key type must be string")
+			if key == nil {
+				return newBridgeImplementationError("host map key cannot be nil")
+			}
+			convertedKey, err := assignableValue(reflect.TypeOf(key), value.Type().Key(), key)
+			if err != nil {
+				return newBridgeImplementationError(err.Error())
 			}
 			converted, err := assignableValue(reflect.TypeOf(newValue), value.Type().Elem(), newValue)
 			if err != nil {
-				return err
+				return newBridgeImplementationError(err.Error())
 			}
-			value.SetMapIndex(reflect.ValueOf(key), converted)
+			value.SetMapIndex(convertedKey, converted)
 			return nil
 		case reflect.Struct:
-			field, ok := lookupStructField(value, key)
+			keyText, ok := key.(string)
 			if !ok {
-				return fmt.Errorf("host field %q not found", key)
+				return newBridgeImplementationError("host struct property key must be string")
+			}
+			field, ok := lookupStructField(value, keyText)
+			if !ok {
+				return newBridgeImplementationError("host field %q not found", keyText)
 			}
 			if !field.CanSet() {
-				return fmt.Errorf("host field %q is not settable", key)
+				return newBridgeImplementationError("host field %q is not settable", keyText)
 			}
 			converted, err := assignableValue(reflect.TypeOf(newValue), field.Type(), newValue)
 			if err != nil {
-				return err
+				return newBridgeImplementationError(err.Error())
 			}
 			field.Set(converted)
 			return nil
 		default:
-			return fmt.Errorf("unsupported host object kind %s", value.Kind())
+			return newBridgeImplementationError("unsupported host object kind %s", value.Kind())
 		}
 	}
 }
@@ -137,18 +162,65 @@ func lookupStructField(value reflect.Value, key string) (reflect.Value, bool) {
 		if !field.IsExported() {
 			continue
 		}
-		if strings.EqualFold(field.Name, key) {
-			return value.Field(index), true
+		if !structFieldMatchesKey(field, key) {
+			continue
 		}
+		return value.Field(index), true
 	}
 	return reflect.Value{}, false
 }
 
-func exportName(name string) string {
-	if name == "" {
-		return ""
+func structFieldMatchesKey(field reflect.StructField, key string) bool {
+	if tagName, ok := luaStructFieldName(field); ok {
+		return tagName == key
 	}
-	return strings.ToUpper(name[:1]) + name[1:]
+	return strings.EqualFold(field.Name, key)
+}
+
+func luaStructFieldName(field reflect.StructField) (string, bool) {
+	rawTag := field.Tag.Get(luaStructFieldTag)
+	if rawTag == "" {
+		return "", false
+	}
+	tagName, _, _ := strings.Cut(rawTag, ",")
+	if tagName == "" {
+		return "", false
+	}
+	if tagName == "-" {
+		return "", false
+	}
+	return tagName, true
+}
+
+func lookupStructMethod(current any, key string) (reflect.Value, bool, error) {
+	methodName, ok := luaStructMethodName(current, key)
+	if !ok {
+		return reflect.Value{}, false, nil
+	}
+	method := reflect.ValueOf(current).MethodByName(methodName)
+	if !method.IsValid() {
+		return reflect.Value{}, false, newBridgeImplementationError("host lua method %q maps to missing Go method %q", key, methodName)
+	}
+	if method.Type().NumIn() != 0 || method.Type().NumOut() < 1 {
+		return reflect.Value{}, false, newBridgeImplementationError("host lua method %q has unsupported signature", key)
+	}
+	return method, true, nil
+}
+
+func luaStructMethodName(current any, key string) (string, bool) {
+	mapper, ok := current.(LuaMethodMapper)
+	if !ok || mapper == nil {
+		return "", false
+	}
+	methodMap := mapper.LuaMethodMap()
+	if len(methodMap) == 0 {
+		return "", false
+	}
+	methodName, ok := methodMap[key]
+	if !ok || methodName == "" {
+		return "", false
+	}
+	return methodName, true
 }
 
 func assignableValue(sourceType reflect.Type, targetType reflect.Type, candidate any) (reflect.Value, error) {

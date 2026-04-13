@@ -8,6 +8,7 @@ import (
 	"vexlua/internal/runtime/closure"
 	"vexlua/internal/runtime/heap"
 	"vexlua/internal/runtime/host"
+	rtmeta "vexlua/internal/runtime/meta"
 	rproto "vexlua/internal/runtime/proto"
 	"vexlua/internal/runtime/state"
 	rtstring "vexlua/internal/runtime/string"
@@ -53,6 +54,7 @@ type Engine struct {
 	Strings  *rtstring.InternTable
 	Tables   *rttable.Store
 	Hosts    *host.Registry
+	Meta     *rtmeta.Registry
 	Protos   *rproto.Store
 	Closures *closure.Store
 	Upvalues *upvalue.Manager
@@ -60,6 +62,8 @@ type Engine struct {
 	assist   AllocationAssistant
 
 	threads map[uint64]*threadContext
+
+	hostObjectBridgeMetatable value.TValue
 }
 
 type AllocationAssistant interface {
@@ -88,16 +92,20 @@ func New() *Engine {
 	vmState := state.NewVMState(runtimeHeap)
 	strings := rtstring.NewInternTable(runtimeHeap, 0x9E3779B9)
 	hosts := host.NewRegistry(runtimeHeap)
+	meta := rtmeta.NewRegistry(runtimeHeap)
+	vmState.SetTypeMetatableStateBase(meta.SnapshotNativeAddress())
 	return &Engine{
-		Heap:     runtimeHeap,
-		Strings:  strings,
-		Tables:   rttable.NewStore(runtimeHeap),
-		Hosts:    hosts,
-		Protos:   protos,
-		Closures: closure.NewStore(runtimeHeap, protos),
-		Upvalues: upvalue.NewManager(runtimeHeap, vmState),
-		State:    vmState,
-		threads:  make(map[uint64]*threadContext),
+		Heap:                      runtimeHeap,
+		Strings:                   strings,
+		Tables:                    rttable.NewStore(runtimeHeap),
+		Hosts:                     hosts,
+		Meta:                      meta,
+		Protos:                    protos,
+		Closures:                  closure.NewStore(runtimeHeap, protos),
+		Upvalues:                  upvalue.NewManager(runtimeHeap, vmState),
+		State:                     vmState,
+		threads:                   make(map[uint64]*threadContext),
+		hostObjectBridgeMetatable: value.NilValue(),
 	}
 }
 
@@ -176,12 +184,20 @@ func (engine *Engine) RegisterHostObject(name string, target any, env value.TVal
 	if err != nil {
 		return host.HostObject{}, err
 	}
+	bridgeMetatable, err := engine.ensureHostObjectBridgeMetatable()
+	if err != nil {
+		_ = engine.Hosts.Release(handle)
+		return host.HostObject{}, err
+	}
 	wrapped, err := engine.Hosts.WrapObject(handle, env)
 	if err != nil {
 		_ = engine.Hosts.Release(handle)
 		return host.HostObject{}, err
 	}
 	if err := engine.Hosts.Release(handle); err != nil {
+		return host.HostObject{}, err
+	}
+	if _, err := engine.Hosts.SetWrapperMetatable(wrapped.Ref, bridgeMetatable); err != nil {
 		return host.HostObject{}, err
 	}
 	engine.retainRef(wrapped.Ref)
@@ -212,6 +228,76 @@ func (engine *Engine) RegisterHostFunction(name string, function any, env value.
 	return wrapped, nil
 }
 
+func (engine *Engine) ensureHostObjectBridgeMetatable() (value.TValue, error) {
+	if engine == nil {
+		return value.NilValue(), fmt.Errorf("engine cannot be nil")
+	}
+	if !engine.hostObjectBridgeMetatable.IsBoxedTag(value.TagNil) {
+		return engine.hostObjectBridgeMetatable, nil
+	}
+	indexBridge, err := engine.RegisterHostFunction("__host_object_index_bridge", func(target value.TValue, key any) (value.TValue, error) {
+		keyValue, err := host.FromHostValue(engine.Strings, key)
+		if err != nil {
+			return value.NilValue(), err
+		}
+		result, found, supported, err := engine.readHostIndexFallback(target, keyValue)
+		if err != nil {
+			return value.NilValue(), err
+		}
+		if !supported {
+			return value.NilValue(), indexBoundaryTypeError(target)
+		}
+		if !found {
+			return value.NilValue(), nil
+		}
+		return result, nil
+	}, value.NilValue())
+	if err != nil {
+		return value.NilValue(), err
+	}
+	newIndexBridge, err := engine.RegisterHostFunction("__host_object_newindex_bridge", func(target value.TValue, key any, newValue any) error {
+		keyValue, err := host.FromHostValue(engine.Strings, key)
+		if err != nil {
+			return err
+		}
+		slotValue, err := host.FromHostValue(engine.Strings, newValue)
+		if err != nil {
+			return err
+		}
+		supported, err := engine.writeHostIndexFallback(target, keyValue, slotValue)
+		if err != nil {
+			return err
+		}
+		if !supported {
+			return newIndexBoundaryTypeError(target)
+		}
+		return nil
+	}, value.NilValue())
+	if err != nil {
+		return value.NilValue(), err
+	}
+	metatable, err := engine.NewTable(0, 2)
+	if err != nil {
+		return value.NilValue(), err
+	}
+	indexKey, err := engine.Strings.Intern(metaIndexName)
+	if err != nil {
+		return value.NilValue(), err
+	}
+	newIndexKey, err := engine.Strings.Intern(metaNewIndexName)
+	if err != nil {
+		return value.NilValue(), err
+	}
+	if err := engine.Tables.Set(metatable.Ref, indexKey.Value, indexBridge.Value); err != nil {
+		return value.NilValue(), err
+	}
+	if err := engine.Tables.Set(metatable.Ref, newIndexKey.Value, newIndexBridge.Value); err != nil {
+		return value.NilValue(), err
+	}
+	engine.hostObjectBridgeMetatable = metatable.Value
+	return metatable.Value, nil
+}
+
 func (engine *Engine) SetGlobal(env value.TValue, name string, slotValue value.TValue) error {
 	before := engine.liveBytes()
 	key, err := engine.Strings.Intern(name)
@@ -222,6 +308,70 @@ func (engine *Engine) SetGlobal(env value.TValue, name string, slotValue value.T
 		return err
 	}
 	return engine.advanceGCAfterBoundary(before)
+}
+
+func (engine *Engine) SetValueMetatableBoundary(targetValue value.TValue, metatable value.TValue) error {
+	if !metatable.IsBoxedTag(value.TagNil) && !metatable.IsBoxedTag(value.TagTableRef) {
+		return fmt.Errorf("metatable must be table or nil, got %s", metatable)
+	}
+	if targetValue.IsBoxedTag(value.TagTableRef) {
+		ref, _ := targetValue.HeapRef()
+		return engine.Tables.SetMetatable(ref, metatable)
+	}
+	if targetValue.IsBoxedTag(value.TagHostObjectRef) {
+		ref, _ := targetValue.HeapRef()
+		_, err := engine.Hosts.SetWrapperMetatable(ref, metatable)
+		return err
+	}
+	kind, ok := rtmeta.KindForValue(targetValue)
+	if !ok {
+		return fmt.Errorf("cannot set metatable for %s", rtmeta.TypeName(targetValue))
+	}
+	previous, found := engine.Meta.Get(kind)
+	if found && previous.Bits() == metatable.Bits() {
+		return nil
+	}
+	engine.retainValue(metatable)
+	engine.Meta.Set(kind, metatable)
+	if found {
+		if err := engine.ReleaseValue(previous); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (engine *Engine) GetMetatableBoundary(targetValue value.TValue) (value.TValue, bool, error) {
+	if targetValue.IsBoxedTag(value.TagTableRef) {
+		ref, _ := targetValue.HeapRef()
+		object, err := engine.Tables.Object(ref)
+		if err != nil {
+			return value.NilValue(), false, err
+		}
+		if object.Metatable.IsBoxedTag(value.TagNil) {
+			return value.NilValue(), false, nil
+		}
+		return object.Metatable, true, nil
+	}
+	if targetValue.IsBoxedTag(value.TagHostObjectRef) {
+		ref, _ := targetValue.HeapRef()
+		header, _, _, err := engine.Hosts.ReadHostObject(ref)
+		if err != nil {
+			return value.NilValue(), false, err
+		}
+		if !header.Metatable.IsBoxedTag(value.TagNil) {
+			return header.Metatable, true, nil
+		}
+	}
+	kind, ok := rtmeta.KindForValue(targetValue)
+	if !ok {
+		return value.NilValue(), false, nil
+	}
+	metatable, found := engine.Meta.Get(kind)
+	if !found {
+		return value.NilValue(), false, nil
+	}
+	return metatable, true, nil
 }
 
 func (engine *Engine) GetGlobal(env value.TValue, name string) (value.TValue, bool, error) {

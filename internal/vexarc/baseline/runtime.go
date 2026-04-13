@@ -15,12 +15,13 @@ import (
 )
 
 type Runtime struct {
-	Engine      *interp.Engine
-	Cache       *codecache.Cache
-	compiled    map[value.HeapRef44]*CompiledCode
-	sharedStubs *stubManager
-	stubCounts  map[stubs.ID]uint64
-	deoptCount  uint64
+	Engine                       *interp.Engine
+	Cache                        *codecache.Cache
+	compiled                     map[value.HeapRef44]*CompiledCode
+	sharedStubs                  *stubManager
+	stubCounts                   map[stubs.ID]uint64
+	deoptCount                   uint64
+	megamorphicCallBoundaryCount uint64
 }
 
 func NewRuntime(engine *interp.Engine) *Runtime {
@@ -112,6 +113,13 @@ func (runtime *Runtime) SlowStubCount(id stubs.ID) uint64 {
 		return 0
 	}
 	return runtime.stubCounts[id]
+}
+
+func (runtime *Runtime) MegamorphicCallBoundaryCount() uint64 {
+	if runtime == nil {
+		return 0
+	}
+	return runtime.megamorphicCallBoundaryCount
 }
 
 func (runtime *Runtime) ensureStubManager() error {

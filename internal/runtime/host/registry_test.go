@@ -12,6 +12,8 @@ import (
 func TestHostWrapperAndDescriptorLayoutContract(t *testing.T) {
 	wrapper := newHostObjectHeader(11, 7, value.BoolValue(true), value.HeapOff64(0x1122334455667788))
 	wrapper.Flags = WrapperFlagCallable | WrapperFlagIndexable
+	wrapper.MetatableVersion = 9
+	wrapper.Metatable = value.NumberValue(42)
 	wrapperBuffer := make([]byte, hostObjectSize)
 	if err := writeWrapperHeader(wrapperBuffer, wrapper); err != nil {
 		t.Fatalf("write host wrapper: %v", err)
@@ -19,8 +21,8 @@ func TestHostWrapperAndDescriptorLayoutContract(t *testing.T) {
 	if got := binary.LittleEndian.Uint64(wrapperBuffer[hostHandleOffset : hostHandleOffset+8]); got != wrapper.HostHandle {
 		t.Fatalf("host handle = %d, want %d", got, wrapper.HostHandle)
 	}
-	if got := binary.LittleEndian.Uint32(wrapperBuffer[reservedDescriptorOff : reservedDescriptorOff+4]); got != 0 {
-		t.Fatalf("reserved descriptor = %#x, want 0", got)
+	if got := binary.LittleEndian.Uint32(wrapperBuffer[reservedDescriptorOff : reservedDescriptorOff+4]); got != wrapper.MetatableVersion {
+		t.Fatalf("wrapper metatable version = %d, want %d", got, wrapper.MetatableVersion)
 	}
 	if got := binary.LittleEndian.Uint32(wrapperBuffer[descriptorVersionOffset : descriptorVersionOffset+4]); got != wrapper.DescriptorVersion {
 		t.Fatalf("descriptor version = %d, want %d", got, wrapper.DescriptorVersion)
@@ -37,8 +39,8 @@ func TestHostWrapperAndDescriptorLayoutContract(t *testing.T) {
 	if got := value.HeapOff64(binary.LittleEndian.Uint64(wrapperBuffer[nativeMetaOffset : nativeMetaOffset+8])); got != wrapper.NativeMeta {
 		t.Fatalf("wrapper native meta = %#x, want %#x", uint64(got), uint64(wrapper.NativeMeta))
 	}
-	if got := binary.LittleEndian.Uint64(wrapperBuffer[reserved1Offset : reserved1Offset+8]); got != 0 {
-		t.Fatalf("reserved1 = %#x, want 0", got)
+	if got := value.Raw(binary.LittleEndian.Uint64(wrapperBuffer[reserved1Offset : reserved1Offset+8])); got != wrapper.Metatable.Bits() {
+		t.Fatalf("wrapper metatable bits = %#x, want %#x", uint64(got), uint64(wrapper.Metatable.Bits()))
 	}
 	descriptor := newNativeDescriptor(13, 5, 17, 19, 2, DescriptorFlagCallable|DescriptorFlagVariadic, DescriptorKindFunction)
 	descriptorBuffer := make([]byte, hostDescriptorSize)
@@ -284,6 +286,40 @@ func TestRegistryRefreshWrapperUpdatesCachedDescriptorVersion(t *testing.T) {
 	}
 	if refreshed.Flags != WrapperFlagIndexable|WrapperFlagWritable {
 		t.Fatalf("refreshed flags = %#x", uint32(refreshed.Flags))
+	}
+}
+
+func TestRegistrySetWrapperMetatablePersistsOnWrapper(t *testing.T) {
+	runtimeHeap := heap.MustNew(0, 0)
+	registry := NewRegistry(runtimeHeap)
+	handle, err := registry.RegisterObject("map", map[string]int{"x": 1})
+	if err != nil {
+		t.Fatalf("register object: %v", err)
+	}
+	wrapper, err := registry.WrapObject(handle, value.NilValue())
+	if err != nil {
+		t.Fatalf("wrap object: %v", err)
+	}
+	metatable := value.NumberValue(7)
+	updated, err := registry.SetWrapperMetatable(wrapper.Ref, metatable)
+	if err != nil {
+		t.Fatalf("set wrapper metatable: %v", err)
+	}
+	if updated.MetatableVersion == 0 {
+		t.Fatalf("updated wrapper metatable version = 0, want non-zero")
+	}
+	if updated.Metatable.Bits() != metatable.Bits() {
+		t.Fatalf("updated wrapper metatable = %#x, want %#x", uint64(updated.Metatable.Bits()), uint64(metatable.Bits()))
+	}
+	header, _, _, err := registry.ReadHostObject(wrapper.Ref)
+	if err != nil {
+		t.Fatalf("read wrapper: %v", err)
+	}
+	if header.MetatableVersion != updated.MetatableVersion {
+		t.Fatalf("stored wrapper metatable version = %d, want %d", header.MetatableVersion, updated.MetatableVersion)
+	}
+	if header.Metatable.Bits() != metatable.Bits() {
+		t.Fatalf("stored wrapper metatable = %#x, want %#x", uint64(header.Metatable.Bits()), uint64(metatable.Bits()))
 	}
 }
 

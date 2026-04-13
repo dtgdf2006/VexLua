@@ -34,12 +34,19 @@ const (
 	execCtxFlagNestedCallError
 	execCtxFlagGCMarkingBoundary
 	execCtxFlagGCSafepointBoundary
+	execCtxFlagResolvedHostCallBoundary
+	execCtxFlagMegamorphicCallBoundary
 )
 
 const (
 	builtinCallBlockFlagOpenArgs uint32 = 1 << iota
 	builtinCallBlockFlagOpenResults
 	builtinCallBlockFlagTForLoop
+)
+
+const (
+	hostCallProtocolDirect uint32 = iota
+	hostCallProtocolResolvedPrependCallee
 )
 
 const setListFieldsPerFlush = 50

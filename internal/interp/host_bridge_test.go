@@ -2,6 +2,7 @@ package interp
 
 import (
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"vexlua/internal/bytecode"
@@ -12,6 +13,23 @@ import (
 type hostCounter struct {
 	Value float64
 	Name  string
+}
+
+type hostTaggedCounter struct {
+	Value float64 `lua:"score"`
+	Name  string  `lua:"display-name"`
+}
+
+type hostTaggedMethodCounter struct {
+	Value float64
+}
+
+func (counter *hostTaggedMethodCounter) DoubleValue() float64 {
+	return counter.Value * 2
+}
+
+func (counter *hostTaggedMethodCounter) LuaMethodMap() map[string]string {
+	return map[string]string{"double-score": "DoubleValue"}
 }
 
 func TestHostObjectStructMapAndFunctionBridge(t *testing.T) {
@@ -141,6 +159,485 @@ func TestHostDescriptorVersionRefreshesOnBoundaryAccess(t *testing.T) {
 	}
 	if updated.DescriptorVersion != header.DescriptorVersion+1 {
 		t.Fatalf("wrapper descriptor version = %d, want %d", updated.DescriptorVersion, header.DescriptorVersion+1)
+	}
+}
+
+func TestHostObjectDefaultMetatableBridgeHandlesMetaBoundary(t *testing.T) {
+	engine := New()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	target := map[string]float64{"x": 5}
+	wrapper, err := engine.RegisterHostObject("bag", target, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	metatable, found, err := engine.GetMetatableBoundary(wrapper.Value)
+	if err != nil {
+		t.Fatalf("get wrapper metatable: %v", err)
+	}
+	if !found || !metatable.IsBoxedTag(value.TagTableRef) {
+		t.Fatalf("wrapper metatable = %s (found=%v), want bridge table", metatable, found)
+	}
+	xKey, err := engine.InternString("x")
+	if err != nil {
+		t.Fatalf("intern x key: %v", err)
+	}
+	result, found, err := engine.ReadIndexMetaBoundary(thread, wrapper.Value, xKey.Value)
+	if err != nil {
+		t.Fatalf("read meta boundary: %v", err)
+	}
+	if !found || result.Bits() != value.NumberValue(5).Bits() {
+		t.Fatalf("meta boundary result = %s (found=%v), want number(5)", result, found)
+	}
+	if err := engine.WriteIndexMetaBoundary(thread, wrapper.Value, xKey.Value, value.NumberValue(9)); err != nil {
+		t.Fatalf("write meta boundary: %v", err)
+	}
+	if got := target["x"]; got != 9 {
+		t.Fatalf("host target x = %v, want 9", got)
+	}
+}
+
+func TestHostObjectUsesPerObjectMetatableOnReadMetaBoundary(t *testing.T) {
+	engine := New()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	wrapper, err := engine.RegisterHostObject("counter", &hostCounter{Value: 41}, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	valueKey, err := engine.InternString("Value")
+	if err != nil {
+		t.Fatalf("intern value key: %v", err)
+	}
+	indexKey, err := engine.InternString("__index")
+	if err != nil {
+		t.Fatalf("intern __index key: %v", err)
+	}
+	fallback, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new fallback table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable: %v", err)
+	}
+	if err := engine.Tables.Set(fallback.Ref, valueKey.Value, value.NumberValue(99)); err != nil {
+		t.Fatalf("seed fallback value: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, indexKey.Value, fallback.Value); err != nil {
+		t.Fatalf("seed __index: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(wrapper.Value, metatable.Value); err != nil {
+		t.Fatalf("set wrapper metatable: %v", err)
+	}
+	got, found, err := engine.GetMetatableBoundary(wrapper.Value)
+	if err != nil {
+		t.Fatalf("get wrapper metatable: %v", err)
+	}
+	if !found || got.Bits() != metatable.Value.Bits() {
+		t.Fatalf("wrapper metatable = %s (found=%v), want %s", got, found, metatable.Value)
+	}
+	result, found, err := engine.ReadIndexMetaBoundary(thread, wrapper.Value, valueKey.Value)
+	if err != nil {
+		t.Fatalf("read meta boundary: %v", err)
+	}
+	if !found || result.Bits() != value.NumberValue(99).Bits() {
+		t.Fatalf("meta boundary result = %s (found=%v), want number(99)", result, found)
+	}
+	rawResult, found, err := engine.ReadIndexBoundary(wrapper.Value, valueKey.Value)
+	if err != nil {
+		t.Fatalf("read raw boundary: %v", err)
+	}
+	if !found || rawResult.Bits() != value.NumberValue(41).Bits() {
+		t.Fatalf("raw boundary result = %s (found=%v), want number(41)", rawResult, found)
+	}
+}
+
+func TestHostObjectUsesPerObjectMetatableOnWriteMetaBoundary(t *testing.T) {
+	engine := New()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	target := map[string]float64{"x": 1}
+	wrapper, err := engine.RegisterHostObject("bag", target, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	xKey, err := engine.InternString("x")
+	if err != nil {
+		t.Fatalf("intern x key: %v", err)
+	}
+	newIndexKey, err := engine.InternString("__newindex")
+	if err != nil {
+		t.Fatalf("intern __newindex key: %v", err)
+	}
+	sink, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new sink table: %v", err)
+	}
+	metatable, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new metatable: %v", err)
+	}
+	if err := engine.Tables.Set(metatable.Ref, newIndexKey.Value, sink.Value); err != nil {
+		t.Fatalf("seed __newindex: %v", err)
+	}
+	if err := engine.SetValueMetatableBoundary(wrapper.Value, metatable.Value); err != nil {
+		t.Fatalf("set wrapper metatable: %v", err)
+	}
+	if err := engine.WriteIndexMetaBoundary(thread, wrapper.Value, xKey.Value, value.NumberValue(77)); err != nil {
+		t.Fatalf("write meta boundary: %v", err)
+	}
+	if got := target["x"]; got != 1 {
+		t.Fatalf("host target x = %v, want 1", got)
+	}
+	stored, found, err := engine.Tables.Get(sink.Ref, xKey.Value)
+	if err != nil {
+		t.Fatalf("read sink table: %v", err)
+	}
+	if !found || stored.Bits() != value.NumberValue(77).Bits() {
+		t.Fatalf("sink x = %s (found=%v), want number(77)", stored, found)
+	}
+	if err := engine.WriteIndexBoundary(wrapper.Value, xKey.Value, value.NumberValue(55)); err != nil {
+		t.Fatalf("write raw boundary: %v", err)
+	}
+	if got := target["x"]; got != 55 {
+		t.Fatalf("host target x after raw boundary = %v, want 55", got)
+	}
+}
+
+func TestHostObjectNonStringKeyWithoutMetatableErrorsLikeUserdata(t *testing.T) {
+	engine := New()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	wrapper, err := engine.RegisterHostObject("bag", map[string]float64{"x": 1}, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	_, _, err = engine.ReadIndexMetaBoundary(thread, wrapper.Value, value.NumberValue(1))
+	if err == nil || err.Error() != "attempt to index a userdata value" {
+		t.Fatalf("read non-string key error = %v, want userdata index error", err)
+	}
+	if err := engine.WriteIndexMetaBoundary(thread, wrapper.Value, value.NumberValue(1), value.NumberValue(2)); err == nil || err.Error() != "attempt to index a userdata value" {
+		t.Fatalf("write non-string key error = %v, want userdata index error", err)
+	}
+}
+
+func TestHostObjectMissingGetterSetterWithoutMetatableErrorsLikeUserdata(t *testing.T) {
+	engine := New()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	wrapper, err := engine.RegisterHostObject("bag", map[string]float64{"x": 1}, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	key, err := engine.InternString("x")
+	if err != nil {
+		t.Fatalf("intern key: %v", err)
+	}
+	_, _, descriptor, err := engine.Hosts.ReadHostObject(wrapper.Ref)
+	if err != nil {
+		t.Fatalf("read host object: %v", err)
+	}
+	descriptor.Get = nil
+	descriptor.Set = nil
+	_, _, err = engine.ReadIndexMetaBoundary(thread, wrapper.Value, key.Value)
+	if err == nil || err.Error() != "attempt to index a userdata value" {
+		t.Fatalf("read missing getter error = %v, want userdata index error", err)
+	}
+	if err := engine.WriteIndexMetaBoundary(thread, wrapper.Value, key.Value, value.NumberValue(2)); err == nil || err.Error() != "attempt to index a userdata value" {
+		t.Fatalf("write missing setter error = %v, want userdata index error", err)
+	}
+}
+
+func TestHostObjectReflectBridgeInternalErrorsCollapseToUserdataError(t *testing.T) {
+	engine := New()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	var target *hostCounter
+	wrapper, err := engine.RegisterHostObject("counter", target, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	valueKey, err := engine.InternString("Value")
+	if err != nil {
+		t.Fatalf("intern value key: %v", err)
+	}
+	_, _, err = engine.ReadIndexMetaBoundary(thread, wrapper.Value, valueKey.Value)
+	if err == nil || err.Error() != "attempt to index a userdata value" {
+		t.Fatalf("read nil-pointer bridge error = %v, want userdata index error", err)
+	}
+
+	typedTarget := map[string]float64{"x": 1}
+	wrapper, err = engine.RegisterHostObject("bag", typedTarget, env.Value)
+	if err != nil {
+		t.Fatalf("register typed host object: %v", err)
+	}
+	xKey, err := engine.InternString("x")
+	if err != nil {
+		t.Fatalf("intern x key: %v", err)
+	}
+	badValue, err := engine.InternString("oops")
+	if err != nil {
+		t.Fatalf("intern bad value: %v", err)
+	}
+	if err := engine.WriteIndexMetaBoundary(thread, wrapper.Value, xKey.Value, badValue.Value); err == nil || err.Error() != "attempt to index a userdata value" {
+		t.Fatalf("write type-mismatch bridge error = %v, want userdata index error", err)
+	}
+}
+
+func TestHostObjectExplicitDescriptorErrorsCollapseToUserdataOnMetaBoundary(t *testing.T) {
+	engine := New()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	wrapper, err := engine.RegisterHostObject("bag", map[string]float64{"x": 1}, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	key, err := engine.InternString("x")
+	if err != nil {
+		t.Fatalf("intern key: %v", err)
+	}
+	_, _, descriptor, err := engine.Hosts.ReadHostObject(wrapper.Ref)
+	if err != nil {
+		t.Fatalf("read host object: %v", err)
+	}
+	descriptor.Get = func(target any, key any) (any, bool, error) {
+		return nil, false, fmt.Errorf("boom")
+	}
+	_, _, err = engine.ReadIndexMetaBoundary(thread, wrapper.Value, key.Value)
+	if err == nil || err.Error() != "attempt to index a userdata value" {
+		t.Fatalf("read explicit descriptor meta error = %v, want userdata index error", err)
+	}
+	descriptor.Set = func(target any, key any, newValue any) error {
+		return fmt.Errorf("boom-set")
+	}
+	if err := engine.WriteIndexMetaBoundary(thread, wrapper.Value, key.Value, value.NumberValue(2)); err == nil || err.Error() != "attempt to index a userdata value" {
+		t.Fatalf("write explicit descriptor meta error = %v, want userdata index error", err)
+	}
+}
+
+func TestHostObjectRawBoundaryStillPropagatesExplicitDescriptorErrors(t *testing.T) {
+	engine := New()
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	wrapper, err := engine.RegisterHostObject("bag", map[string]float64{"x": 1}, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	key, err := engine.InternString("x")
+	if err != nil {
+		t.Fatalf("intern key: %v", err)
+	}
+	_, _, descriptor, err := engine.Hosts.ReadHostObject(wrapper.Ref)
+	if err != nil {
+		t.Fatalf("read host object: %v", err)
+	}
+	descriptor.Get = func(target any, key any) (any, bool, error) {
+		return nil, false, fmt.Errorf("boom")
+	}
+	_, _, err = engine.ReadIndexBoundary(wrapper.Value, key.Value)
+	if err == nil || err.Error() != "boom" {
+		t.Fatalf("read raw descriptor error = %v, want boom", err)
+	}
+	descriptor.Set = func(target any, key any, newValue any) error {
+		return fmt.Errorf("boom-set")
+	}
+	if err := engine.WriteIndexBoundary(wrapper.Value, key.Value, value.NumberValue(2)); err == nil || err.Error() != "boom-set" {
+		t.Fatalf("write raw descriptor error = %v, want boom-set", err)
+	}
+}
+
+func TestHostObjectBridgeSupportsNumericMapKeys(t *testing.T) {
+	engine := New()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	target := map[float64]float64{1: 5}
+	wrapper, err := engine.RegisterHostObject("bag", target, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	result, found, err := engine.ReadIndexMetaBoundary(thread, wrapper.Value, value.NumberValue(1))
+	if err != nil {
+		t.Fatalf("read numeric key through meta boundary: %v", err)
+	}
+	if !found || result.Bits() != value.NumberValue(5).Bits() {
+		t.Fatalf("numeric meta boundary result = %s (found=%v), want number(5)", result, found)
+	}
+	if err := engine.WriteIndexMetaBoundary(thread, wrapper.Value, value.NumberValue(2), value.NumberValue(9)); err != nil {
+		t.Fatalf("write numeric key through meta boundary: %v", err)
+	}
+	if got := target[2]; got != 9 {
+		t.Fatalf("numeric host target value = %v, want 9", got)
+	}
+	rawResult, found, err := engine.ReadIndexBoundary(wrapper.Value, value.NumberValue(2))
+	if err != nil {
+		t.Fatalf("read numeric key through raw boundary: %v", err)
+	}
+	if !found || rawResult.Bits() != value.NumberValue(9).Bits() {
+		t.Fatalf("numeric raw boundary result = %s (found=%v), want number(9)", rawResult, found)
+	}
+}
+
+func TestHostObjectStructBridgeSupportsTaggedLuaFields(t *testing.T) {
+	engine := New()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	target := &hostTaggedCounter{Value: 41, Name: "demo"}
+	wrapper, err := engine.RegisterHostObject("counter", target, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	scoreKey, err := engine.InternString("score")
+	if err != nil {
+		t.Fatalf("intern score key: %v", err)
+	}
+	labelKey, err := engine.InternString("display-name")
+	if err != nil {
+		t.Fatalf("intern label key: %v", err)
+	}
+	result, found, err := engine.ReadIndexMetaBoundary(thread, wrapper.Value, scoreKey.Value)
+	if err != nil {
+		t.Fatalf("read tagged score: %v", err)
+	}
+	if !found || result.Bits() != value.NumberValue(41).Bits() {
+		t.Fatalf("tagged score result = %s (found=%v), want number(41)", result, found)
+	}
+	label, found, err := engine.ReadIndexMetaBoundary(thread, wrapper.Value, labelKey.Value)
+	if err != nil {
+		t.Fatalf("read tagged label: %v", err)
+	}
+	if !found || !label.IsBoxedTag(value.TagStringRef) {
+		t.Fatalf("tagged label result = %s (found=%v), want string", label, found)
+	}
+	labelRef, _ := label.HeapRef()
+	labelText, err := engine.Strings.Text(labelRef)
+	if err != nil {
+		t.Fatalf("read tagged label text: %v", err)
+	}
+	if labelText != "demo" {
+		t.Fatalf("tagged label text = %q, want demo", labelText)
+	}
+	if err := engine.WriteIndexMetaBoundary(thread, wrapper.Value, scoreKey.Value, value.NumberValue(42)); err != nil {
+		t.Fatalf("write tagged score: %v", err)
+	}
+	if target.Value != 42 {
+		t.Fatalf("tagged score should update struct field, got %v", target.Value)
+	}
+	rawResult, found, err := engine.ReadIndexBoundary(wrapper.Value, scoreKey.Value)
+	if err != nil {
+		t.Fatalf("read tagged score through raw boundary: %v", err)
+	}
+	if !found || rawResult.Bits() != value.NumberValue(42).Bits() {
+		t.Fatalf("raw tagged score result = %s (found=%v), want number(42)", rawResult, found)
+	}
+}
+
+func TestHostObjectStructBridgeSupportsTaggedLuaMethods(t *testing.T) {
+	engine := New()
+	thread, err := engine.NewThread(0, 0)
+	if err != nil {
+		t.Fatalf("new thread: %v", err)
+	}
+	env, err := engine.NewTable(0, 0)
+	if err != nil {
+		t.Fatalf("new env: %v", err)
+	}
+	target := &hostTaggedMethodCounter{Value: 21}
+	wrapper, err := engine.RegisterHostObject("counter", target, env.Value)
+	if err != nil {
+		t.Fatalf("register host object: %v", err)
+	}
+	taggedKey, err := engine.InternString("double-score")
+	if err != nil {
+		t.Fatalf("intern tagged method key: %v", err)
+	}
+	leakedKey, err := engine.InternString("DoubleValue")
+	if err != nil {
+		t.Fatalf("intern leaked method key: %v", err)
+	}
+	result, found, err := engine.ReadIndexMetaBoundary(thread, wrapper.Value, taggedKey.Value)
+	if err != nil {
+		t.Fatalf("read tagged method through meta boundary: %v", err)
+	}
+	if !found || result.Bits() != value.NumberValue(42).Bits() {
+		t.Fatalf("tagged method result = %s (found=%v), want number(42)", result, found)
+	}
+	rawResult, found, err := engine.ReadIndexBoundary(wrapper.Value, taggedKey.Value)
+	if err != nil {
+		t.Fatalf("read tagged method through raw boundary: %v", err)
+	}
+	if !found || rawResult.Bits() != value.NumberValue(42).Bits() {
+		t.Fatalf("raw tagged method result = %s (found=%v), want number(42)", rawResult, found)
+	}
+	leakedResult, found, err := engine.ReadIndexBoundary(wrapper.Value, leakedKey.Value)
+	if err != nil {
+		t.Fatalf("read leaked Go method name through raw boundary: %v", err)
+	}
+	if found || !leakedResult.IsBoxedTag(value.TagNil) {
+		t.Fatalf("raw leaked Go method name should be hidden, got %s (found=%v)", leakedResult, found)
+	}
+	leakedMeta, _, err := engine.ReadIndexMetaBoundary(thread, wrapper.Value, leakedKey.Value)
+	if err != nil {
+		t.Fatalf("read leaked Go method name through meta boundary: %v", err)
+	}
+	if !leakedMeta.IsBoxedTag(value.TagNil) {
+		t.Fatalf("meta leaked Go method name should resolve to nil, got %s", leakedMeta)
 	}
 }
 

@@ -263,6 +263,18 @@ func (store *Store) ReadFeedbackCell(ref value.HeapRef44, slot uint32) (feedback
 	return feedback.ReadCell(bytes)
 }
 
+func (store *Store) AllocFeedbackPayload(ref value.HeapRef44, size uint64) (value.HeapOff64, []byte, error) {
+	offset, _, err := store.objectBytes(ref)
+	if err != nil {
+		return 0, nil, err
+	}
+	allocation, err := store.heap.AllocPayload(size, heap.PayloadLayoutOpaque, offset)
+	if err != nil {
+		return 0, nil, err
+	}
+	return allocation.Offset, allocation.Bytes, nil
+}
+
 func (store *Store) WriteFeedbackCell(ref value.HeapRef44, slot uint32, cell feedback.Cell) error {
 	offset, objectBytes, err := store.objectBytes(ref)
 	if err != nil {
@@ -283,8 +295,18 @@ func (store *Store) WriteFeedbackCell(ref value.HeapRef44, slot uint32, cell fee
 	if err != nil {
 		return err
 	}
+	current, err := feedback.ReadCell(bytes)
+	if err != nil {
+		return err
+	}
 	if err := feedback.WriteCell(bytes, cell); err != nil {
 		return err
+	}
+	currentOffset := current.CallSidecarDataOffset()
+	if currentOffset != 0 && currentOffset != cell.CallSidecarDataOffset() {
+		if err := store.heap.FreeSpan(currentOffset); err != nil {
+			return err
+		}
 	}
 	return store.heap.RememberWeakOwnerByOffset(offset)
 }
