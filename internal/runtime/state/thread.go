@@ -403,6 +403,25 @@ func (thread *ThreadState) Register(frame *CallFrameHeader, index uint16) (value
 	return thread.ValueAtAddress(address)
 }
 
+func (thread *ThreadState) FrameWindow(frame *CallFrameHeader) ([]value.TValue, error) {
+	if thread == nil {
+		return nil, fmt.Errorf("thread cannot be nil")
+	}
+	if frame == nil {
+		return nil, fmt.Errorf("frame cannot be nil")
+	}
+	baseIndex, err := thread.slotIndex(uintptr(frame.RegsBase))
+	if err != nil {
+		return nil, err
+	}
+	count := int(frame.RegisterCount) + int(frame.SpillCount)
+	end := baseIndex + count
+	if end > len(thread.stack) {
+		return nil, fmt.Errorf("frame window [%d:%d] exceeds stack capacity %d", baseIndex, end, len(thread.stack))
+	}
+	return thread.stack[baseIndex:end], nil
+}
+
 func (thread *ThreadState) SetRegister(frame *CallFrameHeader, index uint16, slotValue value.TValue) error {
 	address, err := frame.RegisterAddress(index)
 	if err != nil {

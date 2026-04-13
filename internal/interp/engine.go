@@ -85,6 +85,7 @@ type activation struct {
 	callee value.HeapRef44
 	global value.TValue
 	hasEnv bool
+	slots  []value.TValue
 }
 
 type threadSnapshot struct {

@@ -84,6 +84,11 @@ func (engine *Engine) callLuaClosure(thread *state.ThreadState, closureRef value
 		global: env,
 		hasEnv: true,
 	}
+	activation.slots, err = thread.FrameWindow(frame)
+	if err != nil {
+		_, _ = thread.PopFrame()
+		return nil, err
+	}
 	ctx.activations = append(ctx.activations, activation)
 
 	for index := 0; index < int(proto.NumParams) && index < len(args); index++ {
@@ -166,6 +171,10 @@ func (engine *Engine) ResumeLuaFrame(thread *state.ThreadState, frame *state.Cal
 		callee: closureRef,
 		global: env,
 		hasEnv: true,
+	}
+	activation.slots, err = thread.FrameWindow(frame)
+	if err != nil {
+		return nil, err
 	}
 	ctx := engine.threadState(thread)
 	ctx.activations = append(ctx.activations, activation)
@@ -645,38 +654,26 @@ func (engine *Engine) registerValue(act *activation, index int) (value.TValue, e
 	if index < 0 {
 		return value.NilValue(), engine.activationRuntimeError(act, act.pc-1, bytecode.OP_MOVE, fmt.Sprintf("register %d is out of range", index))
 	}
-	if index < int(act.frame.RegisterCount) {
-		return act.thread.Register(act.frame, uint16(index))
-	}
-	spillIndex := index - int(act.frame.RegisterCount)
-	if spillIndex >= int(act.frame.SpillCount) {
+	if index >= len(act.slots) {
 		return value.NilValue(), engine.activationRuntimeError(act, act.pc-1, bytecode.OP_MOVE, fmt.Sprintf("register %d is out of range", index))
 	}
-	return act.thread.Spill(act.frame, uint16(spillIndex))
+	return act.slots[index], nil
 }
 
 func (engine *Engine) setRegister(act *activation, index int, slotValue value.TValue) error {
 	if index < 0 {
 		return engine.activationRuntimeError(act, act.pc-1, bytecode.OP_MOVE, fmt.Sprintf("register %d is out of range", index))
 	}
-	if index >= int(act.frame.RegisterCount) {
-		spillIndex := index - int(act.frame.RegisterCount)
-		if spillIndex >= int(act.frame.SpillCount) {
-			return engine.activationRuntimeError(act, act.pc-1, bytecode.OP_MOVE, fmt.Sprintf("register %d is out of range", index))
-		}
-		if uint32(index+1) > act.top {
-			if err := engine.setActivationTop(act, uint32(index+1)); err != nil {
-				return err
-			}
-		}
-		return act.thread.SetSpill(act.frame, uint16(spillIndex), slotValue)
+	if index >= len(act.slots) {
+		return engine.activationRuntimeError(act, act.pc-1, bytecode.OP_MOVE, fmt.Sprintf("register %d is out of range", index))
 	}
+	act.slots[index] = slotValue
 	if uint32(index+1) > act.top {
 		if err := engine.setActivationTop(act, uint32(index+1)); err != nil {
 			return err
 		}
 	}
-	return act.thread.SetRegister(act.frame, uint16(index), slotValue)
+	return nil
 }
 
 func (engine *Engine) setActivationTop(act *activation, top uint32) error {
