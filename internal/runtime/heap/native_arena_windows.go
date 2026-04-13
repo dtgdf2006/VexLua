@@ -87,9 +87,6 @@ func (arena *windowsNativeArena) ensureCommitted(size uint64) error {
 }
 
 func (arena *windowsNativeArena) close() error {
-	if arena == nil || arena.baseAddress == 0 {
-		return nil
-	}
 	result, _, callErr := procNativeVirtualFree.Call(arena.baseAddress, 0, nativeMemRelease)
 	if result == 0 {
 		return fmt.Errorf("VirtualFree failed: %v", callErr)

@@ -132,35 +132,255 @@ func TestExecutionModelSourceAudit(t *testing.T) {
 		}
 	})
 
-	t.Run("activation-struct-caches-hot-state-only", func(t *testing.T) {
+	t.Run("activation-shadow-state-absent", func(t *testing.T) {
 		text := readRepoFile(t, "internal", "interp", "engine.go")
-		block := sourceBlock(t, text, "type activation struct {", "type threadSnapshot struct {")
-		required := []string{"fn     *bytecode.Proto", "code   []bytecode.Instruction", "callee value.HeapRef44", "slots  []value.TValue"}
-		for _, needle := range required {
-			if !strings.Contains(block, needle) {
-				t.Fatalf("activation struct should cache hot state %q: %s", needle, block)
+		forbidden := []string{"type activation struct {", "type threadContext struct {", "type threadSnapshot struct {", "threads map[uint64]*threadContext"}
+		for _, needle := range forbidden {
+			if strings.Contains(text, needle) {
+				t.Fatalf("interpreter should not keep shadow execution state %q", needle)
 			}
 		}
-		forbidden := []string{"closureObject", "upvalueRefs", "registerBase", "baseAddress", "reservedSlots"}
+	})
+
+	t.Run("thread-state-current-frame-mirror-absent", func(t *testing.T) {
+		text := readRepoFile(t, "internal", "runtime", "state", "thread.go")
+		forbidden := []string{"currentFrame int", "thread.currentFrame =", "thread.currentFrame--", "thread.currentFrame++"}
 		for _, needle := range forbidden {
-			if strings.Contains(block, needle) {
-				t.Fatalf("activation struct should not cache broad derived state %q: %s", needle, block)
+			if strings.Contains(text, needle) {
+				t.Fatalf("thread state should not mirror native current frame via %q", needle)
+			}
+		}
+		required := []string{"nativeHeader.CurrentFrame", "func (thread *ThreadState) currentFrameIndex()"}
+		for _, needle := range required {
+			if !strings.Contains(text, needle) {
+				t.Fatalf("thread state should derive active frame from native header via %q", needle)
 			}
 		}
 	})
 
 	t.Run("feedback-path-stays-shared", func(t *testing.T) {
 		text := readRepoFile(t, "internal", "interp", "feedback.go")
-		forbidden := []string{"recordTableFeedback", "LayoutForProto("}
+		forbidden := []string{"LayoutForProto(", "activationProto(", "activationClosureRef(", "if act == nil", "act.callee", "act.feedbackLayout", "updateActivationFeedbackAtPC"}
 		for _, needle := range forbidden {
 			if strings.Contains(text, needle) {
 				t.Fatalf("feedback path should not depend on %q", needle)
 			}
 		}
-		required := []string{"UpdateTableFeedbackAtPC", "UpdateTableFeedbackAtSlot"}
+		required := []string{"UpdateTableFeedbackAtPC", "UpdateTableFeedbackAtSlot", "updateLayoutFeedbackAtPC", "layout *feedback.Layout", "closureRef value.HeapRef44"}
 		for _, needle := range required {
 			if !strings.Contains(text, needle) {
 				t.Fatalf("feedback path should expose shared helper %q", needle)
+			}
+		}
+	})
+
+	t.Run("frame-hot-helpers-stay-localized", func(t *testing.T) {
+		text := readRepoFile(t, "internal", "interp", "execute.go")
+		forbidden := []string{"func (engine *Engine) activationProto(", "func (engine *Engine) activationClosureRef(", "func (engine *Engine) activationRegisterBase(", "func (engine *Engine) setActivationTop(", "func (engine *Engine) activationEnv(", "func (engine *Engine) activationUpvalueRef(", "if frame == nil || index >= len(slots)", "if frame == nil {\n\t\treturn fmt.Errorf(\"frame cannot be nil\")"}
+		for _, needle := range forbidden {
+			if strings.Contains(text, needle) {
+				t.Fatalf("execute helpers should not regress to %q", needle)
+			}
+		}
+		required := []string{"func (engine *Engine) executeLuaFrame(", "func (engine *Engine) setFrameTop(", "func (engine *Engine) closureEnv(", "func (engine *Engine) closureUpvalueRef(", "func (engine *Engine) validateFrameConstBase("}
+		for _, needle := range required {
+			if !strings.Contains(text, needle) {
+				t.Fatalf("execute helpers should keep %q", needle)
+			}
+		}
+	})
+
+	t.Run("nil-receiver-noise-absent-in-gc-and-baseline-helpers", func(t *testing.T) {
+		collectorText := readRepoFile(t, "internal", "runtime", "gc", "collector.go")
+		for _, needle := range []string{"if collector == nil", "if collector == nil || collector.heap == nil", "gc collector requires a heap"} {
+			if strings.Contains(collectorText, needle) {
+				t.Fatalf("collector should not keep nil-receiver noise %q", needle)
+			}
+		}
+		tracerText := readRepoFile(t, "internal", "runtime", "gc", "object_trace.go")
+		for _, needle := range []string{"gc tracer requires a heap"} {
+			if strings.Contains(tracerText, needle) {
+				t.Fatalf("gc tracer should not keep dead defensive guard %q", needle)
+			}
+		}
+		scannerText := readRepoFile(t, "internal", "runtime", "gc", "root_scan.go")
+		for _, needle := range []string{"gc scanner requires a heap"} {
+			if strings.Contains(scannerText, needle) {
+				t.Fatalf("gc scanner should not keep dead defensive guard %q", needle)
+			}
+		}
+		gcControllerText := readRepoFile(t, "internal", "runtime", "heap", "gc_controller.go")
+		for _, needle := range []string{"if heap == nil || heap.gc == nil", "if controller == nil", "if heap == nil {"} {
+			if strings.Contains(gcControllerText, needle) {
+				t.Fatalf("gc controller should not keep nil-receiver noise %q", needle)
+			}
+		}
+		heapText := readRepoFile(t, "internal", "runtime", "heap", "heap.go")
+		for _, needle := range []string{"if heap == nil || heap.native == nil"} {
+			if strings.Contains(heapText, needle) {
+				t.Fatalf("heap helpers should not keep dead defensive guard %q", needle)
+			}
+		}
+		runtimeStubsText := readRepoFile(t, "internal", "vexarc", "baseline", "runtime_stubs.go")
+		for _, needle := range []string{"if compiled == nil || compiled.FeedbackLayout == nil", "if compiled == nil || compiled.Proto == nil", "if thread == nil {", "if callerFrame == nil {", "if frame == nil {\n\t\treturn 0, nil, fmt.Errorf(\"frame cannot be nil\")"} {
+			if strings.Contains(runtimeStubsText, needle) {
+				t.Fatalf("baseline helper should not keep dead defensive guard %q", needle)
+			}
+		}
+		typesText := readRepoFile(t, "internal", "vexarc", "baseline", "types.go")
+		for _, needle := range []string{"if code == nil", "if cache == nil"} {
+			if strings.Contains(typesText, needle) {
+				t.Fatalf("compiled code helpers should not keep dead defensive guard %q", needle)
+			}
+		}
+		stubManagerText := readRepoFile(t, "internal", "vexarc", "baseline", "stub_manager.go")
+		for _, needle := range []string{"if manager == nil", "if manager == nil || manager.cache == nil"} {
+			if strings.Contains(stubManagerText, needle) {
+				t.Fatalf("stub manager should not keep dead defensive guard %q", needle)
+			}
+		}
+		compilerText := readRepoFile(t, "internal", "vexarc", "baseline", "compiler.go")
+		for _, needle := range []string{"if state == nil || state.proto == nil", "if state.proto == nil", "baseline compiler requires an interpreter engine", "baseline compiler requires a code cache", "baseline compiler requires shared stubs"} {
+			if strings.Contains(compilerText, needle) {
+				t.Fatalf("compileState helpers should not keep dead defensive guard %q", needle)
+			}
+		}
+		offsetTableText := readRepoFile(t, "internal", "vexarc", "metadata", "offset_table.go")
+		for _, needle := range []string{"if set == nil", "if visit == nil", "if builder == nil", "if int(siteID) < 0", "if int(id) < 0"} {
+			if strings.Contains(offsetTableText, needle) {
+				t.Fatalf("metadata helpers should not keep dead defensive guard %q", needle)
+			}
+		}
+		assemblerText := readRepoFile(t, "internal", "vexarc", "amd64", "assembler.go")
+		for _, needle := range []string{"if label == nil"} {
+			if strings.Contains(assemblerText, needle) {
+				t.Fatalf("assembler should not keep dead defensive guard %q", needle)
+			}
+		}
+		threadText := readRepoFile(t, "internal", "runtime", "state", "thread.go")
+		for _, needle := range []string{"if vm == nil", "if thread == nil", "if thread == nil || thread.nativeHeader == nil", "vm state requires a heap"} {
+			if strings.Contains(threadText, needle) {
+				t.Fatalf("thread state should not keep dead defensive guard %q", needle)
+			}
+		}
+		layoutText := readRepoFile(t, "internal", "runtime", "feedback", "layout.go")
+		for _, needle := range []string{"if layout == nil", "if proto == nil"} {
+			if strings.Contains(layoutText, needle) {
+				t.Fatalf("feedback layout should not keep dead defensive guard %q", needle)
+			}
+		}
+		interpFeedbackText := readRepoFile(t, "internal", "interp", "feedback.go")
+		for _, needle := range []string{"if layout == nil"} {
+			if strings.Contains(interpFeedbackText, needle) {
+				t.Fatalf("interp feedback should not keep dead defensive guard %q", needle)
+			}
+		}
+		metaRegistryText := readRepoFile(t, "internal", "runtime", "meta", "registry.go")
+		for _, needle := range []string{"if registry == nil", "meta registry requires a heap"} {
+			if strings.Contains(metaRegistryText, needle) {
+				t.Fatalf("meta registry should not keep dead defensive guard %q", needle)
+			}
+		}
+		hostRegistryText := readRepoFile(t, "internal", "runtime", "host", "registry.go")
+		for _, needle := range []string{"host registry requires a heap", "entry cannot be nil"} {
+			if strings.Contains(hostRegistryText, needle) {
+				t.Fatalf("host registry should not keep dead defensive guard %q", needle)
+			}
+		}
+		nativeArenaText := readRepoFile(t, "internal", "runtime", "heap", "native_arena.go")
+		for _, needle := range []string{"if arena == nil || arena.impl == nil"} {
+			if strings.Contains(nativeArenaText, needle) {
+				t.Fatalf("native arena should not keep dead defensive guard %q", needle)
+			}
+		}
+		frontendCompileText := readRepoFile(t, "internal", "frontend", "compiler", "compile.go")
+		for _, needle := range []string{"if driver == nil", "if proto == nil"} {
+			if strings.Contains(frontendCompileText, needle) {
+				t.Fatalf("frontend compile driver should not keep dead defensive guard %q", needle)
+			}
+		}
+		protoStoreText := readRepoFile(t, "internal", "runtime", "proto", "store.go")
+		for _, needle := range []string{"if proto == nil", "proto store requires a heap"} {
+			if strings.Contains(protoStoreText, needle) {
+				t.Fatalf("proto store should not keep dead defensive guard %q", needle)
+			}
+		}
+		closureStoreText := readRepoFile(t, "internal", "runtime", "closure", "store.go")
+		for _, needle := range []string{"if proto == nil", "closure store requires a heap", "closure store requires a proto store"} {
+			if strings.Contains(closureStoreText, needle) {
+				t.Fatalf("closure store should not keep dead defensive guard %q", needle)
+			}
+		}
+		tableStoreText := readRepoFile(t, "internal", "runtime", "table", "store.go")
+		for _, needle := range []string{"table store requires a heap"} {
+			if strings.Contains(tableStoreText, needle) {
+				t.Fatalf("table store should not keep dead defensive guard %q", needle)
+			}
+		}
+		stringInternText := readRepoFile(t, "internal", "runtime", "string", "intern.go")
+		for _, needle := range []string{"intern table requires a heap"} {
+			if strings.Contains(stringInternText, needle) {
+				t.Fatalf("string intern should not keep dead defensive guard %q", needle)
+			}
+		}
+		upvalueManagerText := readRepoFile(t, "internal", "runtime", "upvalue", "manager.go")
+		for _, needle := range []string{"thread cannot be nil", "upvalue manager requires a heap", "upvalue manager requires vm state"} {
+			if strings.Contains(upvalueManagerText, needle) {
+				t.Fatalf("upvalue manager should not keep dead defensive guard %q", needle)
+			}
+		}
+		vmStateText := readRepoFile(t, "internal", "runtime", "state", "vm.go")
+		for _, needle := range []string{"if vm == nil"} {
+			if strings.Contains(vmStateText, needle) {
+				t.Fatalf("vm state should not keep dead defensive guard %q", needle)
+			}
+		}
+		livenessText := readRepoFile(t, "internal", "vexarc", "baseline", "liveness.go")
+		for _, needle := range []string{"if proto == nil", "if set == nil"} {
+			if strings.Contains(livenessText, needle) {
+				t.Fatalf("baseline liveness should not keep dead defensive guard %q", needle)
+			}
+		}
+		protoBuilderText := readRepoFile(t, "internal", "frontend", "compiler", "proto_builder.go")
+		for _, needle := range []string{"if builder == nil"} {
+			if strings.Contains(protoBuilderText, needle) {
+				t.Fatalf("proto builder should not keep dead defensive guard %q", needle)
+			}
+		}
+		interpEngineText := readRepoFile(t, "internal", "interp", "engine.go")
+		for _, needle := range []string{"if thread == nil", "if proto == nil"} {
+			if strings.Contains(interpEngineText, needle) {
+				t.Fatalf("interp engine should not keep dead defensive guard %q", needle)
+			}
+		}
+		interpExecuteText := readRepoFile(t, "internal", "interp", "execute.go")
+		for _, needle := range []string{"if thread == nil", "if frame == nil"} {
+			if strings.Contains(interpExecuteText, needle) {
+				t.Fatalf("interp execute should not keep dead defensive guard %q", needle)
+			}
+		}
+		allocationBoundaryText := readRepoFile(t, "internal", "interp", "allocation_boundary.go")
+		for _, needle := range []string{"if publish == nil", "if proto == nil"} {
+			if strings.Contains(allocationBoundaryText, needle) {
+				t.Fatalf("allocation boundary should not keep dead defensive guard %q", needle)
+			}
+		}
+		baselineRuntimeText := readRepoFile(t, "internal", "vexarc", "baseline", "runtime.go")
+		for _, needle := range []string{"if thread == nil", "if proto == nil", "baseline runtime requires an interpreter engine"} {
+			if strings.Contains(baselineRuntimeText, needle) {
+				t.Fatalf("baseline runtime should not keep dead defensive guard %q", needle)
+			}
+		}
+		bytecodeProtoText := readRepoFile(t, "internal", "bytecode", "proto.go")
+		for _, needle := range []string{"if proto == nil"} {
+			if strings.Contains(bytecodeProtoText, needle) {
+				t.Fatalf("bytecode proto helpers should not keep dead defensive guard %q", needle)
+			}
+		}
+		bytecodeIteratorText := readRepoFile(t, "internal", "bytecode", "iterator.go")
+		for _, needle := range []string{"if proto == nil"} {
+			if strings.Contains(bytecodeIteratorText, needle) {
+				t.Fatalf("bytecode iterator should not keep dead defensive guard %q", needle)
 			}
 		}
 	})

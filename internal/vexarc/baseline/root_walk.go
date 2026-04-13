@@ -8,18 +8,7 @@ import (
 )
 
 func (runtime *Runtime) WalkCompiledRoots(visit func(value.HeapRef44) error) error {
-	if runtime == nil || visit == nil {
-		return nil
-	}
 	for protoRef, compiled := range runtime.compiled {
-		if compiled == nil {
-			if protoRef != 0 {
-				if err := visit(protoRef); err != nil {
-					return err
-				}
-			}
-			continue
-		}
 		if compiled.ProtoRef == 0 {
 			compiled.ProtoRef = protoRef
 		}
@@ -31,9 +20,6 @@ func (runtime *Runtime) WalkCompiledRoots(visit func(value.HeapRef44) error) err
 }
 
 func (runtime *Runtime) WalkFrameRoots(thread *state.ThreadState, frame *state.CallFrameHeader, visit func(value.HeapRef44) error) (bool, error) {
-	if runtime == nil || thread == nil || frame == nil || visit == nil {
-		return false, nil
-	}
 	if !frame.Flags.Has(state.FrameFlagCompiled) {
 		return false, nil
 	}

@@ -34,9 +34,6 @@ func (engine *Engine) LengthBoundary(thread *state.ThreadState, slotValue value.
 	if !ok {
 		return value.NilValue(), lengthBoundaryTypeError(slotValue)
 	}
-	if thread == nil {
-		return value.NilValue(), fmt.Errorf("thread cannot be nil when calling %s", metaLenName)
-	}
 	results, err := engine.CallValueBoundary(thread, metamethod, []value.TValue{slotValue}, 1)
 	if err != nil {
 		return value.NilValue(), err

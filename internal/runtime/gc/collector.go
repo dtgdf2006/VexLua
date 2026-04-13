@@ -55,9 +55,6 @@ type SweepStats struct {
 }
 
 func NewCollector(runtimeHeap *heap.Heap, hosts *host.Registry, config Config) *Collector {
-	if runtimeHeap == nil {
-		panic("gc collector requires a heap")
-	}
 	collector := &Collector{
 		heap:         runtimeHeap,
 		scanner:      NewScanner(runtimeHeap),
@@ -81,85 +78,52 @@ func NewCollector(runtimeHeap *heap.Heap, hosts *host.Registry, config Config) *
 }
 
 func (collector *Collector) Heap() *heap.Heap {
-	if collector == nil {
-		return nil
-	}
 	return collector.heap
 }
 
 func (collector *Collector) Scanner() *Scanner {
-	if collector == nil {
-		return nil
-	}
 	return collector.scanner
 }
 
 func (collector *Collector) Tracer() *Tracer {
-	if collector == nil {
-		return nil
-	}
 	return collector.tracer
 }
 
 func (collector *Collector) Phase() heap.GCPhase {
-	if collector == nil || collector.heap == nil {
-		return heap.GCPhasePause
-	}
 	return collector.heap.GCPhase()
 }
 
 func (collector *Collector) SetPhase(phase heap.GCPhase) {
-	if collector == nil || collector.heap == nil {
-		return
-	}
 	collector.heap.SetGCPhase(phase)
 }
 
 func (collector *Collector) Threshold() uint64 {
-	if collector == nil || collector.heap == nil {
-		return 0
-	}
 	return collector.heap.GCThreshold()
 }
 
 func (collector *Collector) SetThreshold(threshold uint64) {
-	if collector == nil || collector.heap == nil {
-		return
-	}
 	collector.heap.SetGCThreshold(threshold)
 }
 
 func (collector *Collector) StepBudget() uint64 {
-	if collector == nil || collector.heap == nil {
-		return 0
-	}
 	return collector.heap.GCStepBudget()
 }
 
 func (collector *Collector) SetStepBudget(budget uint64) {
-	if collector == nil || collector.heap == nil {
-		return
-	}
 	collector.heap.SetGCStepBudget(budget)
 }
 
 func (collector *Collector) BindRuntime(vm *state.VMState, strings *rtstring.InternTable) {
-	if collector == nil {
-		return
-	}
 	collector.vm = vm
 	collector.strings = strings
 }
 
 func (collector *Collector) AllocationDebt() uint64 {
-	if collector == nil {
-		return 0
-	}
 	return collector.allocDebt
 }
 
 func (collector *Collector) AssistAllocation(bytes uint64) error {
-	if collector == nil || collector.heap == nil || collector.vm == nil || collector.strings == nil || bytes == 0 {
+	if collector.vm == nil || collector.strings == nil || bytes == 0 {
 		return nil
 	}
 	collector.allocDebt += bytes
@@ -189,7 +153,7 @@ func (collector *Collector) AssistAllocation(bytes uint64) error {
 }
 
 func (collector *Collector) AssistSafepoint() error {
-	if collector == nil || collector.heap == nil || collector.vm == nil || collector.strings == nil {
+	if collector.vm == nil || collector.strings == nil {
 		return nil
 	}
 	if collector.Phase() == heap.GCPhasePause && !collector.heap.GCTargetReached() {
@@ -205,16 +169,10 @@ func (collector *Collector) AssistSafepoint() error {
 }
 
 func (collector *Collector) QueueLengths() heap.GCQueueLengths {
-	if collector == nil || collector.heap == nil {
-		return heap.GCQueueLengths{}
-	}
 	return collector.heap.GCQueueLengths()
 }
 
 func (collector *Collector) BeginMarkPhase() {
-	if collector == nil || collector.heap == nil {
-		return
-	}
 	collector.clearWeakRefs()
 	collector.resetPrepareState()
 	collector.resetSweepState()
@@ -223,9 +181,6 @@ func (collector *Collector) BeginMarkPhase() {
 }
 
 func (collector *Collector) StartCollection() error {
-	if collector == nil || collector.heap == nil {
-		return fmt.Errorf("collector is not initialized")
-	}
 	collector.beginPreparePhase()
 	for {
 		done, err := collector.resetObjectMarksStep(0)
@@ -241,9 +196,6 @@ func (collector *Collector) StartCollection() error {
 }
 
 func (collector *Collector) SeedRoots(vm *state.VMState, extra ...RootSource) error {
-	if collector == nil || collector.scanner == nil || collector.heap == nil {
-		return fmt.Errorf("collector is not initialized")
-	}
 	sources := make([]RootSource, 0, len(collector.defaultRoots)+len(extra)+2)
 	if collector.tracer != nil && collector.tracer.hosts != nil {
 		sources = append(sources, HostRegistryRoots(collector.tracer.hosts))
@@ -257,9 +209,6 @@ func (collector *Collector) SeedRoots(vm *state.VMState, extra ...RootSource) er
 }
 
 func (collector *Collector) Propagate() error {
-	if collector == nil || collector.heap == nil || collector.tracer == nil {
-		return fmt.Errorf("collector is not initialized")
-	}
 	for {
 		gray := collector.heap.DrainGrayQueue()
 		if len(gray) == 0 {
@@ -274,9 +223,6 @@ func (collector *Collector) Propagate() error {
 }
 
 func (collector *Collector) RunAtomic(vm *state.VMState, extra ...RootSource) error {
-	if collector == nil || collector.heap == nil {
-		return fmt.Errorf("collector is not initialized")
-	}
 	collector.heap.SetGCPhase(heap.GCPhaseAtomic)
 	if err := collector.SeedRoots(vm, extra...); err != nil {
 		return err
@@ -317,9 +263,6 @@ func (collector *Collector) RunFullMark(vm *state.VMState, extra ...RootSource) 
 }
 
 func (collector *Collector) RunSweepStrings(table *rtstring.InternTable) (int, error) {
-	if collector == nil || collector.heap == nil {
-		return 0, fmt.Errorf("collector is not initialized")
-	}
 	if collector.heap.GCPhase() != heap.GCPhaseSweepStrings {
 		return 0, fmt.Errorf("collector phase %d is not sweep strings", collector.heap.GCPhase())
 	}
@@ -336,9 +279,6 @@ func (collector *Collector) RunSweepStrings(table *rtstring.InternTable) (int, e
 }
 
 func (collector *Collector) RunSweepObjects() (SweepStats, error) {
-	if collector == nil || collector.heap == nil {
-		return SweepStats{}, fmt.Errorf("collector is not initialized")
-	}
 	if collector.heap.GCPhase() != heap.GCPhaseSweepObjects {
 		return SweepStats{}, fmt.Errorf("collector phase %d is not sweep objects", collector.heap.GCPhase())
 	}
@@ -359,16 +299,13 @@ func (collector *Collector) RunSweepObjects() (SweepStats, error) {
 }
 
 func (collector *Collector) WeakRefsSnapshot() []WeakRef {
-	if collector == nil || len(collector.weakRefs) == 0 {
+	if len(collector.weakRefs) == 0 {
 		return nil
 	}
 	return append([]WeakRef(nil), collector.weakRefs...)
 }
 
 func (collector *Collector) clearWeakRefs() {
-	if collector == nil {
-		return
-	}
 	collector.weakRefs = collector.weakRefs[:0]
 	if collector.weakRefSet != nil {
 		clear(collector.weakRefSet)
@@ -376,18 +313,12 @@ func (collector *Collector) clearWeakRefs() {
 }
 
 func (collector *Collector) resetPrepareState() {
-	if collector == nil {
-		return
-	}
 	collector.prepareCursor = 0
 	collector.prepareLimit = 0
 	collector.preparing = false
 }
 
 func (collector *Collector) resetSweepState() {
-	if collector == nil {
-		return
-	}
 	collector.sweepCursor = 0
 	collector.sweepLimit = 0
 	collector.sweeping = false
@@ -414,7 +345,7 @@ func (collector *Collector) snapshotSweepPayloads() error {
 }
 
 func (collector *Collector) markSweepPayloads(owner value.HeapOff64) {
-	if collector == nil || owner == 0 || collector.sweepPayloads == nil {
+	if owner == 0 || collector.sweepPayloads == nil {
 		return
 	}
 	offsets := collector.sweepPayloads[owner]
@@ -431,7 +362,7 @@ func (collector *Collector) markSweepPayloads(owner value.HeapOff64) {
 }
 
 func (collector *Collector) sweepPayloadMarked(offset value.HeapOff64) bool {
-	if collector == nil || collector.sweepPending == nil {
+	if collector.sweepPending == nil {
 		return false
 	}
 	_, ok := collector.sweepPending[offset]
@@ -439,7 +370,7 @@ func (collector *Collector) sweepPayloadMarked(offset value.HeapOff64) bool {
 }
 
 func (collector *Collector) clearSweepPayload(offset value.HeapOff64) {
-	if collector == nil || collector.sweepPending == nil {
+	if collector.sweepPending == nil {
 		return
 	}
 	delete(collector.sweepPending, offset)
@@ -456,9 +387,6 @@ func (collector *Collector) beginPreparePhase() {
 }
 
 func (collector *Collector) resetObjectMarksStep(budget uint64) (bool, error) {
-	if collector == nil || collector.heap == nil {
-		return false, fmt.Errorf("collector is not initialized")
-	}
 	if !collector.preparing {
 		collector.beginPreparePhase()
 	}
@@ -651,9 +579,6 @@ func (collector *Collector) beginSweepPhase() error {
 }
 
 func (collector *Collector) sweepSpansStep(budget uint64) (bool, error) {
-	if collector == nil || collector.heap == nil {
-		return false, fmt.Errorf("collector is not initialized")
-	}
 	if !collector.sweeping {
 		if err := collector.beginSweepPhase(); err != nil {
 			return false, err
@@ -787,7 +712,7 @@ func (collector *Collector) finalizeHostWrapper(offset value.HeapOff64) error {
 }
 
 func (collector *Collector) stepOnce() error {
-	if collector == nil || collector.heap == nil || collector.vm == nil {
+	if collector.vm == nil {
 		return fmt.Errorf("collector runtime is not bound")
 	}
 	switch collector.Phase() {
@@ -832,9 +757,6 @@ func (collector *Collector) stepOnce() error {
 }
 
 func (collector *Collector) deadWhite() value.MarkBits {
-	if collector == nil || collector.heap == nil {
-		return value.MarkWhite0
-	}
 	switch collector.heap.GCPhase() {
 	case heap.GCPhaseSweepStrings, heap.GCPhaseSweepObjects, heap.GCPhaseFinalize:
 		return otherWhite(collector.heap.CurrentWhite())

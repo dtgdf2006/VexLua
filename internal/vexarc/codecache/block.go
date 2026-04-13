@@ -7,16 +7,10 @@ type Block struct {
 }
 
 func (block *Block) Address() uintptr {
-	if block == nil {
-		return 0
-	}
 	return block.addr
 }
 
 func (block *Block) Size() uintptr {
-	if block == nil {
-		return 0
-	}
 	return block.size
 }
 

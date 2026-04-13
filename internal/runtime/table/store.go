@@ -39,9 +39,6 @@ type Store struct {
 const maxLenSearchIndex = uint32(^uint32(0) >> 1)
 
 func NewStore(runtimeHeap *heap.Heap) *Store {
-	if runtimeHeap == nil {
-		panic("table store requires a heap")
-	}
 	return &Store{heap: runtimeHeap}
 }
 

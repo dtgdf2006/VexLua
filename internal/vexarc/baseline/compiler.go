@@ -24,15 +24,6 @@ type Compiler struct {
 }
 
 func NewCompiler(engine *interp.Engine, cache *codecache.Cache, manager *stubManager) *Compiler {
-	if engine == nil {
-		panic("baseline compiler requires an interpreter engine")
-	}
-	if cache == nil {
-		panic("baseline compiler requires a code cache")
-	}
-	if manager == nil {
-		panic("baseline compiler requires shared stubs")
-	}
 	deoptEntry, err := manager.DeoptEntry()
 	if err != nil {
 		panic(err)
@@ -201,9 +192,6 @@ func (state *compileState) dispositionForInstruction(offset int, instruction byt
 }
 
 func (state *compileState) validateStructure() error {
-	if state.proto == nil {
-		return fmt.Errorf("proto cannot be nil")
-	}
 	if err := bytecode.ValidateProto(state.proto); err != nil {
 		return err
 	}
@@ -693,7 +681,7 @@ func (state *compileState) emitMoveStackImm64(base amd64.Register, disp int32, v
 }
 
 func (state *compileState) isSetListExtraArgument(offset int) bool {
-	if state == nil || state.proto == nil || offset <= 0 || offset >= len(state.proto.Code) {
+	if offset <= 0 || offset >= len(state.proto.Code) {
 		return false
 	}
 	previous := state.proto.Code[offset-1]
@@ -701,7 +689,7 @@ func (state *compileState) isSetListExtraArgument(offset int) bool {
 }
 
 func (state *compileState) isClosureCapturePayload(offset int) bool {
-	if state == nil || state.proto == nil || offset <= 0 || offset >= len(state.proto.Code) {
+	if offset <= 0 || offset >= len(state.proto.Code) {
 		return false
 	}
 	for pc := offset - 1; pc >= 0; pc-- {

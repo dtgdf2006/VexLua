@@ -85,9 +85,6 @@ func (assembler *Assembler) NewLabel() *Label {
 }
 
 func (assembler *Assembler) Bind(label *Label) error {
-	if label == nil {
-		return fmt.Errorf("label cannot be nil")
-	}
 	if label.bound {
 		return fmt.Errorf("label already bound")
 	}
@@ -330,9 +327,6 @@ func (assembler *Assembler) XorpsXmmXmm(dst XMMRegister, src XMMRegister) {
 func (assembler *Assembler) emitLabelPatch(label *Label) {
 	patch := assembler.buffer.Pos()
 	assembler.buffer.emitUint32(0)
-	if label == nil {
-		return
-	}
 	if label.bound {
 		rel := int32(label.pos - (patch + 4))
 		binary.LittleEndian.PutUint32(assembler.buffer.bytes[patch:patch+4], uint32(rel))

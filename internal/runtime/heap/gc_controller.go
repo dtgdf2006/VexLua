@@ -54,23 +54,14 @@ func newGCController(pageSize uint64) *GCController {
 }
 
 func (heap *Heap) GCController() *GCController {
-	if heap == nil {
-		return nil
-	}
 	return heap.gc
 }
 
 func (heap *Heap) GCPhase() GCPhase {
-	if heap == nil || heap.gc == nil {
-		return GCPhasePause
-	}
 	return heap.gc.phase
 }
 
 func (heap *Heap) SetGCPhase(phase GCPhase) {
-	if heap == nil || heap.gc == nil {
-		return
-	}
 	heap.gc.phase = phase
 	if phase == GCPhasePause {
 		heap.gc.ResetQueues()
@@ -87,59 +78,35 @@ func (heap *Heap) SetGCPhase(phase GCPhase) {
 }
 
 func (heap *Heap) GCThreshold() uint64 {
-	if heap == nil || heap.gc == nil {
-		return 0
-	}
 	return heap.gc.threshold
 }
 
 func (heap *Heap) SetGCThreshold(threshold uint64) {
-	if heap == nil || heap.gc == nil {
-		return
-	}
 	heap.gc.threshold = threshold
 	heap.gc.rearmThreshold()
 }
 
 func (heap *Heap) GCStepBudget() uint64 {
-	if heap == nil || heap.gc == nil {
-		return 0
-	}
 	return heap.gc.stepBudget
 }
 
 func (heap *Heap) SetGCStepBudget(budget uint64) {
-	if heap == nil || heap.gc == nil {
-		return
-	}
 	heap.gc.stepBudget = budget
 }
 
 func (heap *Heap) LiveBytes() uint64 {
-	if heap == nil || heap.gc == nil {
-		return 0
-	}
 	return heap.gc.liveBytes
 }
 
 func (heap *Heap) NextGCTrigger() uint64 {
-	if heap == nil || heap.gc == nil {
-		return 0
-	}
 	return heap.gc.nextTrigger
 }
 
 func (heap *Heap) RearmGCThreshold() {
-	if heap == nil || heap.gc == nil {
-		return
-	}
 	heap.gc.rearmThreshold()
 }
 
 func (heap *Heap) GCTargetReached() bool {
-	if heap == nil || heap.gc == nil {
-		return false
-	}
 	if heap.gc.threshold == 0 {
 		return false
 	}
@@ -147,16 +114,10 @@ func (heap *Heap) GCTargetReached() bool {
 }
 
 func (heap *Heap) CurrentWhite() value.MarkBits {
-	if heap == nil || heap.gc == nil {
-		return value.MarkWhite0
-	}
 	return heap.gc.currentWhite
 }
 
 func (heap *Heap) SetCurrentWhite(mark value.MarkBits) error {
-	if heap == nil || heap.gc == nil {
-		return nil
-	}
 	if mark != value.MarkWhite0 && mark != value.MarkWhite1 {
 		return fmt.Errorf("current white must be white0 or white1, got %#x", uint8(mark))
 	}
@@ -165,9 +126,6 @@ func (heap *Heap) SetCurrentWhite(mark value.MarkBits) error {
 }
 
 func (heap *Heap) FlipCurrentWhite() {
-	if heap == nil || heap.gc == nil {
-		return
-	}
 	if heap.gc.currentWhite == value.MarkWhite1 {
 		heap.gc.currentWhite = value.MarkWhite0
 		return
@@ -176,9 +134,6 @@ func (heap *Heap) FlipCurrentWhite() {
 }
 
 func (heap *Heap) GCQueueLengths() GCQueueLengths {
-	if heap == nil || heap.gc == nil {
-		return GCQueueLengths{}
-	}
 	return GCQueueLengths{
 		Gray:       len(heap.gc.gray),
 		GrayAgain:  len(heap.gc.grayAgain),
@@ -189,16 +144,10 @@ func (heap *Heap) GCQueueLengths() GCQueueLengths {
 }
 
 func (heap *Heap) ResetGCQueues() {
-	if heap == nil || heap.gc == nil {
-		return
-	}
 	heap.gc.ResetQueues()
 }
 
 func (controller *GCController) ResetQueues() {
-	if controller == nil {
-		return
-	}
 	controller.gray = controller.gray[:0]
 	controller.grayAgain = controller.grayAgain[:0]
 	controller.weak = controller.weak[:0]
@@ -207,21 +156,21 @@ func (controller *GCController) ResetQueues() {
 }
 
 func (heap *Heap) EnqueueGray(ref value.HeapRef44) {
-	if heap == nil || heap.gc == nil || ref == 0 {
+	if ref == 0 {
 		return
 	}
 	heap.gc.gray = append(heap.gc.gray, ref)
 }
 
 func (heap *Heap) EnqueueWeak(ref value.HeapRef44) {
-	if heap == nil || heap.gc == nil || ref == 0 {
+	if ref == 0 {
 		return
 	}
 	heap.gc.weak = appendUniqueRef(heap.gc.weak, ref)
 }
 
 func (heap *Heap) EnqueueFinalize(ref value.HeapRef44) {
-	if heap == nil || heap.gc == nil || ref == 0 {
+	if ref == 0 {
 		return
 	}
 	heap.gc.finalize = appendUniqueRef(heap.gc.finalize, ref)
@@ -294,14 +243,14 @@ func (heap *Heap) WriteBarrierValueByOffset(parentOffset value.HeapOff64, slotVa
 }
 
 func (heap *Heap) RememberWeakOwner(ref value.HeapRef44) {
-	if heap == nil || heap.gc == nil || ref == 0 || heap.gc.phase == GCPhasePause {
+	if ref == 0 || heap.gc.phase == GCPhasePause {
 		return
 	}
 	heap.gc.weak = appendUniqueRef(heap.gc.weak, ref)
 }
 
 func (heap *Heap) RememberWeakOwnerByOffset(offset value.HeapOff64) error {
-	if heap == nil || heap.gc == nil || offset == 0 || heap.gc.phase == GCPhasePause {
+	if offset == 0 || heap.gc.phase == GCPhasePause {
 		return nil
 	}
 	ref, err := heap.refForOffset(offset)
@@ -313,7 +262,7 @@ func (heap *Heap) RememberWeakOwnerByOffset(offset value.HeapOff64) error {
 }
 
 func (heap *Heap) writeBarrier(parentOffset value.HeapOff64, parentRef value.HeapRef44, childRef value.HeapRef44) error {
-	if heap == nil || heap.gc == nil || (heap.gc.phase != GCPhaseMark && heap.gc.phase != GCPhaseAtomic) {
+	if heap.gc.phase != GCPhaseMark && heap.gc.phase != GCPhaseAtomic {
 		return nil
 	}
 	parentHeader, err := heap.HeaderAtOffset(parentOffset)
@@ -356,9 +305,6 @@ func (heap *Heap) refForOffset(offset value.HeapOff64) (value.HeapRef44, error) 
 }
 
 func cloneRefs(heap *Heap, selectQueue func(*GCController) []value.HeapRef44) []value.HeapRef44 {
-	if heap == nil || heap.gc == nil || selectQueue == nil {
-		return nil
-	}
 	queue := selectQueue(heap.gc)
 	if len(queue) == 0 {
 		return nil
@@ -367,11 +313,8 @@ func cloneRefs(heap *Heap, selectQueue func(*GCController) []value.HeapRef44) []
 }
 
 func drainRefs(heap *Heap, selectQueue func(*GCController) *[]value.HeapRef44) []value.HeapRef44 {
-	if heap == nil || heap.gc == nil || selectQueue == nil {
-		return nil
-	}
 	queue := selectQueue(heap.gc)
-	if queue == nil || len(*queue) == 0 {
+	if len(*queue) == 0 {
 		return nil
 	}
 	drained := append([]value.HeapRef44(nil), (*queue)...)
@@ -380,9 +323,6 @@ func drainRefs(heap *Heap, selectQueue func(*GCController) *[]value.HeapRef44) [
 }
 
 func (controller *GCController) rearmThreshold() {
-	if controller == nil {
-		return
-	}
 	if controller.threshold == 0 {
 		controller.nextTrigger = 0
 		return

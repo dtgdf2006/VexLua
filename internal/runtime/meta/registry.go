@@ -37,9 +37,6 @@ type Registry struct {
 }
 
 func NewRegistry(runtimeHeap *heap.Heap) *Registry {
-	if runtimeHeap == nil {
-		panic("meta registry requires a heap")
-	}
 	allocation, err := runtimeHeap.AllocPayload(uint64(RegistryEntrySize*KindCount), heap.PayloadLayoutOpaque, 0)
 	if err != nil {
 		panic(err)
@@ -61,16 +58,10 @@ func NewRegistry(runtimeHeap *heap.Heap) *Registry {
 }
 
 func (registry *Registry) SnapshotOffset() value.HeapOff64 {
-	if registry == nil {
-		return 0
-	}
 	return registry.snapshotOffset
 }
 
 func (registry *Registry) SnapshotNativeAddress() uintptr {
-	if registry == nil {
-		return 0
-	}
 	return registry.snapshotNativeBase
 }
 
@@ -123,9 +114,6 @@ func TypeName(slotValue value.TValue) string {
 }
 
 func (registry *Registry) Get(kind Kind) (value.TValue, bool) {
-	if registry == nil {
-		return value.NilValue(), false
-	}
 	index, ok := registry.entryIndex(kind)
 	if !ok {
 		return value.NilValue(), false
@@ -138,9 +126,6 @@ func (registry *Registry) Get(kind Kind) (value.TValue, bool) {
 }
 
 func (registry *Registry) Version(kind Kind) uint32 {
-	if registry == nil {
-		return 0
-	}
 	index, ok := registry.entryIndex(kind)
 	if !ok {
 		return 0
@@ -149,9 +134,6 @@ func (registry *Registry) Version(kind Kind) uint32 {
 }
 
 func (registry *Registry) Set(kind Kind, metatable value.TValue) {
-	if registry == nil {
-		return
-	}
 	index, ok := registry.entryIndex(kind)
 	if !ok {
 		return
@@ -176,7 +158,7 @@ func (registry *Registry) entryIndex(kind Kind) (int, bool) {
 }
 
 func (registry *Registry) entryVersion(index int) uint32 {
-	if registry == nil || index < 0 || index >= KindCount || len(registry.snapshotBytes) < (index+1)*RegistryEntrySize {
+	if index < 0 || index >= KindCount {
 		return 0
 	}
 	base := index * RegistryEntrySize
@@ -184,7 +166,7 @@ func (registry *Registry) entryVersion(index int) uint32 {
 }
 
 func (registry *Registry) entryMetatable(index int) value.TValue {
-	if registry == nil || index < 0 || index >= KindCount || len(registry.snapshotBytes) < (index+1)*RegistryEntrySize {
+	if index < 0 || index >= KindCount {
 		return value.NilValue()
 	}
 	base := index * RegistryEntrySize
@@ -192,7 +174,7 @@ func (registry *Registry) entryMetatable(index int) value.TValue {
 }
 
 func (registry *Registry) writeSnapshotEntry(index int, version uint32, metatable value.TValue) {
-	if registry == nil || index < 0 || index >= KindCount || len(registry.snapshotBytes) < (index+1)*RegistryEntrySize {
+	if index < 0 || index >= KindCount {
 		return
 	}
 	base := index * RegistryEntrySize

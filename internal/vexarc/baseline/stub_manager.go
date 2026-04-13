@@ -18,9 +18,6 @@ type stubManager struct {
 }
 
 func newStubManager(cache *codecache.Cache) (*stubManager, error) {
-	if cache == nil {
-		return nil, fmt.Errorf("stub manager requires a code cache")
-	}
 	manager := &stubManager{
 		cache:      cache,
 		stubBlocks: make(map[stubs.ID]*codecache.Block),
@@ -219,9 +216,6 @@ func newStubManager(cache *codecache.Cache) (*stubManager, error) {
 }
 
 func (manager *stubManager) Release() error {
-	if manager == nil || manager.cache == nil {
-		return nil
-	}
 	var firstErr error
 	for id, block := range manager.stubBlocks {
 		if err := manager.cache.Release(block); err != nil && firstErr == nil {
@@ -257,27 +251,21 @@ func (manager *stubManager) Release() error {
 }
 
 func (manager *stubManager) StubEntry(id stubs.ID) (uintptr, error) {
-	if manager == nil {
-		return 0, fmt.Errorf("stub manager is nil")
-	}
 	block, ok := manager.stubBlocks[id]
-	if !ok || block == nil {
+	if !ok {
 		return 0, fmt.Errorf("unknown stub entry %d", id)
 	}
 	return block.Address(), nil
 }
 
 func (manager *stubManager) DeoptEntry() (uintptr, error) {
-	if manager == nil || manager.deoptBlock == nil {
+	if manager.deoptBlock == nil {
 		return 0, fmt.Errorf("deopt entry is not installed")
 	}
 	return manager.deoptBlock.Address(), nil
 }
 
 func (manager *stubManager) InstallNativeBuiltin(body []byte) (uintptr, error) {
-	if manager == nil || manager.cache == nil {
-		return 0, fmt.Errorf("stub manager is not initialized")
-	}
 	bodyBlock, entryBlock, err := manager.installManagedNativeBuiltin(body)
 	if err != nil {
 		return 0, err

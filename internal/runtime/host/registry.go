@@ -60,9 +60,6 @@ type HostFunction struct {
 }
 
 func NewRegistry(runtimeHeap *heap.Heap) *Registry {
-	if runtimeHeap == nil {
-		panic("host registry requires a heap")
-	}
 	return &Registry{
 		heap:          runtimeHeap,
 		nextHandle:    1,
@@ -297,13 +294,10 @@ func (registry *Registry) Release(handle Handle) error {
 }
 
 func (registry *Registry) WalkDescriptorRefs(visit func(value.HeapRef44) error) error {
-	if registry == nil || visit == nil {
-		return nil
-	}
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
 	for _, entry := range registry.entries {
-		if entry == nil || entry.nativeMeta == 0 {
+		if entry.nativeMeta == 0 {
 			continue
 		}
 		address, err := registry.heap.AddressForOffset(entry.nativeMeta)
@@ -474,16 +468,10 @@ func (registry *Registry) allocNativeDescriptorLocked(kind DescriptorKind, arity
 }
 
 func (registry *Registry) readEntryNativeDescriptor(entry *entry) (NativeDescriptor, error) {
-	if entry == nil {
-		return NativeDescriptor{}, fmt.Errorf("entry cannot be nil")
-	}
 	return registry.ReadNativeDescriptor(entry.nativeMeta)
 }
 
 func (registry *Registry) readEntryNativeDescriptorLocked(entry *entry) (NativeDescriptor, error) {
-	if entry == nil {
-		return NativeDescriptor{}, fmt.Errorf("entry cannot be nil")
-	}
 	bytes, err := registry.heap.Resolve(entry.nativeMeta, hostDescriptorSize)
 	if err != nil {
 		return NativeDescriptor{}, err
@@ -492,9 +480,6 @@ func (registry *Registry) readEntryNativeDescriptorLocked(entry *entry) (NativeD
 }
 
 func (registry *Registry) writeEntryNativeDescriptorLocked(entry *entry, native NativeDescriptor) error {
-	if entry == nil {
-		return fmt.Errorf("entry cannot be nil")
-	}
 	bytes, err := registry.heap.Resolve(entry.nativeMeta, hostDescriptorSize)
 	if err != nil {
 		return err

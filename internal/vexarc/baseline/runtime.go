@@ -25,9 +25,6 @@ type Runtime struct {
 }
 
 func NewRuntime(engine *interp.Engine) *Runtime {
-	if engine == nil {
-		panic("baseline runtime requires an interpreter engine")
-	}
 	return &Runtime{
 		Engine:     engine,
 		Cache:      codecache.New(),
@@ -52,9 +49,6 @@ func (runtime *Runtime) Close() error {
 }
 
 func (runtime *Runtime) Compile(proto *bytecode.Proto) (*CompiledCode, error) {
-	if proto == nil {
-		return nil, fmt.Errorf("proto cannot be nil")
-	}
 	handle, err := runtime.Engine.Protos.Intern(proto)
 	if err != nil {
 		return nil, err
@@ -102,23 +96,14 @@ func (runtime *Runtime) CompileRef(protoRef value.HeapRef44) (*CompiledCode, err
 }
 
 func (runtime *Runtime) DeoptCount() uint64 {
-	if runtime == nil {
-		return 0
-	}
 	return runtime.deoptCount
 }
 
 func (runtime *Runtime) SlowStubCount(id stubs.ID) uint64 {
-	if runtime == nil {
-		return 0
-	}
 	return runtime.stubCounts[id]
 }
 
 func (runtime *Runtime) MegamorphicCallBoundaryCount() uint64 {
-	if runtime == nil {
-		return 0
-	}
 	return runtime.megamorphicCallBoundaryCount
 }
 
@@ -135,9 +120,6 @@ func (runtime *Runtime) ensureStubManager() error {
 }
 
 func (runtime *Runtime) Call(thread *state.ThreadState, callee value.TValue, args []value.TValue, nresults int) ([]value.TValue, error) {
-	if thread == nil {
-		return nil, fmt.Errorf("thread cannot be nil")
-	}
 	if !callee.IsBoxedTag(value.TagLuaClosureRef) {
 		return runtime.Engine.Call(thread, callee, args, nresults)
 	}
@@ -314,13 +296,7 @@ func (runtime *Runtime) callCompiled(thread *state.ThreadState, closureRef value
 }
 
 func (runtime *Runtime) resumeCompiledFrame(thread *state.ThreadState, frame *state.CallFrameHeader, closureRef value.HeapRef44, compiled *CompiledCode, entry uintptr, nresults int) ([]value.TValue, error) {
-	if thread == nil {
-		return nil, fmt.Errorf("thread cannot be nil")
-	}
-	if frame == nil {
-		return nil, fmt.Errorf("frame cannot be nil")
-	}
-	if compiled == nil || !compiled.Supported {
+	if !compiled.Supported {
 		return nil, fmt.Errorf("compiled frame requires supported compiled code")
 	}
 	ctx := executionContext{}
@@ -385,7 +361,7 @@ func (runtime *Runtime) resumeCompiledFrame(thread *state.ThreadState, frame *st
 }
 
 func (runtime *Runtime) handleGCMarkingBoundary(thread *state.ThreadState, frame *state.CallFrameHeader, closureRef value.HeapRef44, compiled *CompiledCode, ctx *executionContext, stubID stubs.ID, _ int) (uintptr, bool, []value.TValue, error) {
-	if ctx == nil || ctx.Flags&execCtxFlagGCMarkingBoundary == 0 {
+	if ctx.Flags&execCtxFlagGCMarkingBoundary == 0 {
 		return 0, false, nil, fmt.Errorf("gc marking boundary is not pending")
 	}
 	ctx.Flags &^= execCtxFlagGCMarkingBoundary
@@ -418,7 +394,7 @@ func (runtime *Runtime) handleGCMarkingBoundary(thread *state.ThreadState, frame
 }
 
 func (runtime *Runtime) handleGCSafepointBoundary(thread *state.ThreadState, frame *state.CallFrameHeader, _ value.HeapRef44, compiled *CompiledCode, ctx *executionContext, stubID stubs.ID, _ int) (uintptr, bool, []value.TValue, error) {
-	if ctx == nil || ctx.Flags&execCtxFlagGCSafepointBoundary == 0 {
+	if ctx.Flags&execCtxFlagGCSafepointBoundary == 0 {
 		return 0, false, nil, fmt.Errorf("gc safepoint boundary is not pending")
 	}
 	alternateResume := ctx.Flags&execCtxFlagAlternateResume != 0
@@ -536,9 +512,6 @@ func collectThreadResults(thread *state.ThreadState, base uintptr, count int) ([
 }
 
 func clearFrameSlots(thread *state.ThreadState, frame *state.CallFrameHeader) {
-	if thread == nil || frame == nil {
-		return
-	}
 	registerBase, err := thread.SlotIndexForAddress(uintptr(frame.RegsBase))
 	if err != nil {
 		return

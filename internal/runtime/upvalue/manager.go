@@ -14,19 +14,10 @@ type Manager struct {
 }
 
 func NewManager(runtimeHeap *heap.Heap, vm *state.VMState) *Manager {
-	if runtimeHeap == nil {
-		panic("upvalue manager requires a heap")
-	}
-	if vm == nil {
-		panic("upvalue manager requires vm state")
-	}
 	return &Manager{heap: runtimeHeap, vm: vm}
 }
 
 func (manager *Manager) FindOrCreateOpen(thread *state.ThreadState, slotAddress uintptr) (Handle, error) {
-	if thread == nil {
-		return Handle{}, fmt.Errorf("thread cannot be nil")
-	}
 	if _, err := thread.ValueAtAddress(slotAddress); err != nil {
 		return Handle{}, err
 	}
@@ -83,9 +74,6 @@ func (manager *Manager) FindOrCreateOpen(thread *state.ThreadState, slotAddress 
 }
 
 func (manager *Manager) OpenHead(thread *state.ThreadState) value.HeapRef44 {
-	if thread == nil {
-		return 0
-	}
 	return thread.OpenUpvalueHead()
 }
 
@@ -94,9 +82,6 @@ func (manager *Manager) CloseAtOrAbove(thread *state.ThreadState, level uintptr)
 }
 
 func (manager *Manager) CloseInRange(thread *state.ThreadState, lower uintptr, upper uintptr) ([]Handle, error) {
-	if thread == nil {
-		return nil, fmt.Errorf("thread cannot be nil")
-	}
 	if lower >= upper {
 		return nil, nil
 	}

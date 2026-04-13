@@ -39,23 +39,14 @@ type VMStateHeader struct {
 }
 
 func (vm *VMState) NativePointer() unsafe.Pointer {
-	if vm == nil {
-		return nil
-	}
 	return unsafe.Pointer(vm.nativeHeader)
 }
 
 func (vm *VMState) SyncActiveThread(thread *ThreadState) {
-	if vm == nil {
-		return
-	}
 	vm.syncHeader(thread)
 }
 
 func (vm *VMState) SetTypeMetatableStateBase(base uintptr) {
-	if vm == nil {
-		return
-	}
 	vm.typeMetaBase = base
 	if vm.nativeHeader != nil {
 		vm.nativeHeader.TypeMetatableStateBase = uint64(base)
@@ -63,9 +54,6 @@ func (vm *VMState) SetTypeMetatableStateBase(base uintptr) {
 }
 
 func (vm *VMState) syncHeader(thread *ThreadState) {
-	if vm == nil || vm.nativeHeader == nil {
-		return
-	}
 	vm.nativeHeader.HeapBase = uint64(vm.HeapBase)
 	vm.nativeHeader.ThreadCount = uint32(len(vm.threads))
 	vm.nativeHeader.Flags = 0

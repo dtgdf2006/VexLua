@@ -35,9 +35,6 @@ func allocExecutable(code []byte) (*Block, error) {
 }
 
 func freeExecutable(block *Block) error {
-	if block == nil || block.addr == 0 {
-		return nil
-	}
 	result, _, callErr := procVirtualFree.Call(block.addr, 0, memRelease)
 	if result == 0 {
 		return fmt.Errorf("VirtualFree failed: %v", callErr)

@@ -84,9 +84,6 @@ func (heap *Heap) Base() uintptr {
 }
 
 func (heap *Heap) NativeBase() uintptr {
-	if heap == nil || heap.native == nil {
-		return 0
-	}
 	return heap.native.Base()
 }
 

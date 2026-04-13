@@ -21,9 +21,6 @@ func allocExecutable(code []byte) (*Block, error) {
 }
 
 func freeExecutable(block *Block) error {
-	if block == nil || block.addr == 0 {
-		return nil
-	}
 	if err := syscall.Munmap(block.mmap); err != nil {
 		return fmt.Errorf("munmap failed: %w", err)
 	}

@@ -103,9 +103,6 @@ type Store struct {
 }
 
 func NewStore(runtimeHeap *heap.Heap) *Store {
-	if runtimeHeap == nil {
-		panic("proto store requires a heap")
-	}
 	return &Store{
 		heap:    runtimeHeap,
 		byProto: make(map[*bytecode.Proto]value.HeapRef44),
@@ -114,9 +111,6 @@ func NewStore(runtimeHeap *heap.Heap) *Store {
 }
 
 func (store *Store) Intern(proto *bytecode.Proto) (Handle, error) {
-	if proto == nil {
-		return Handle{}, fmt.Errorf("proto cannot be nil")
-	}
 	if handle, ok := store.cachedHandle(proto); ok {
 		return handle, nil
 	}
@@ -157,9 +151,6 @@ func (store *Store) Resolve(ref value.HeapRef44) (*bytecode.Proto, error) {
 }
 
 func (store *Store) WalkRefs(visit func(value.HeapRef44) error) error {
-	if store == nil || visit == nil {
-		return nil
-	}
 	for ref, proto := range store.byRef {
 		if ref == 0 {
 			continue
@@ -188,7 +179,7 @@ func (store *Store) cachedHandle(proto *bytecode.Proto) (Handle, bool) {
 }
 
 func (store *Store) isLiveCachedRef(proto *bytecode.Proto, ref value.HeapRef44) bool {
-	if proto == nil || ref == 0 {
+	if ref == 0 {
 		return false
 	}
 	if current := store.byRef[ref]; current != proto {
@@ -199,12 +190,10 @@ func (store *Store) isLiveCachedRef(proto *bytecode.Proto, ref value.HeapRef44) 
 }
 
 func (store *Store) dropCachedRef(proto *bytecode.Proto, ref value.HeapRef44) {
-	if proto != nil {
-		if currentRef, ok := store.byProto[proto]; ok && currentRef == ref {
-			delete(store.byProto, proto)
-		}
+	if currentRef, ok := store.byProto[proto]; ok && currentRef == ref {
+		delete(store.byProto, proto)
 	}
-	if currentProto, ok := store.byRef[ref]; ok && (proto == nil || currentProto == proto) {
+	if currentProto, ok := store.byRef[ref]; ok && currentProto == proto {
 		delete(store.byRef, ref)
 	}
 }
@@ -581,9 +570,6 @@ func (store *Store) objectBytes(ref value.HeapRef44) (value.HeapOff64, Object, [
 }
 
 func (store *Store) ensureConstantData(proto *bytecode.Proto, strings *rtstring.InternTable) (Object, value.HeapOff64, error) {
-	if proto == nil {
-		return Object{}, 0, fmt.Errorf("proto cannot be nil")
-	}
 	handle, err := store.Intern(proto)
 	if err != nil {
 		return Object{}, 0, err
@@ -789,9 +775,6 @@ type closureSiteRecord struct {
 }
 
 func buildClosureSites(proto *bytecode.Proto) ([]closureSiteRecord, error) {
-	if proto == nil {
-		return nil, fmt.Errorf("proto cannot be nil")
-	}
 	sites := make([]closureSiteRecord, 0)
 	for pc, instruction := range proto.Code {
 		if instruction.Opcode() != bytecode.OP_CLOSURE {

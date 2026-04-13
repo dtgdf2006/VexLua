@@ -30,41 +30,30 @@ type Layout struct {
 	pcToIndex []int32
 }
 
-// coldLayoutCache is only for compile-time and other cold-path preparation.
-// Runtime feedback updates should use SlotInfoForProtoPC instead of consulting
-// this cache on every access.
-var coldLayoutCache sync.Map
+// layoutCache stores immutable per-proto slot layouts for both cold-path
+// preparation and runtime PC-to-slot lookups.
+var layoutCache sync.Map
 
-// LayoutForProto is a cold-path helper for compilation and feedback-vector
-// allocation. Hot runtime feedback updates must not depend on this cache.
+// LayoutForProto returns the shared immutable slot layout for a proto.
 func LayoutForProto(proto *bytecode.Proto) *Layout {
-	if proto == nil {
-		return &Layout{}
-	}
-	if cached, ok := coldLayoutCache.Load(proto); ok {
+	if cached, ok := layoutCache.Load(proto); ok {
 		return cached.(*Layout)
 	}
 	layout := buildLayout(proto)
-	actual, _ := coldLayoutCache.LoadOrStore(proto, layout)
+	actual, _ := layoutCache.LoadOrStore(proto, layout)
 	return actual.(*Layout)
 }
 
 func (layout *Layout) SlotCount() uint32 {
-	if layout == nil {
-		return 0
-	}
 	return uint32(len(layout.slots))
 }
 
 func (layout *Layout) Slots() []Slot {
-	if layout == nil {
-		return nil
-	}
 	return append([]Slot(nil), layout.slots...)
 }
 
 func (layout *Layout) SlotAtPC(pc int) (Slot, uint32, bool) {
-	if layout == nil || pc < 0 || pc >= len(layout.pcToIndex) {
+	if pc < 0 || pc >= len(layout.pcToIndex) {
 		return Slot{}, 0, false
 	}
 	index := layout.pcToIndex[pc]
@@ -76,9 +65,6 @@ func (layout *Layout) SlotAtPC(pc int) (Slot, uint32, bool) {
 
 func buildLayout(proto *bytecode.Proto) *Layout {
 	layout := &Layout{}
-	if proto == nil {
-		return layout
-	}
 	layout.pcToIndex = make([]int32, len(proto.Code))
 	for index := range layout.pcToIndex {
 		layout.pcToIndex[index] = -1

@@ -110,9 +110,6 @@ func (builder *ProtoBuilder) EmitAsBx(opcode bytecode.Opcode, a int, sbx int, li
 
 // Snapshot returns the current bytecode.Proto image without validation.
 func (builder *ProtoBuilder) Snapshot() *bytecode.Proto {
-	if builder == nil {
-		return nil
-	}
 	proto := &bytecode.Proto{
 		Source:       builder.source,
 		LineDefined:  builder.lineDefined,

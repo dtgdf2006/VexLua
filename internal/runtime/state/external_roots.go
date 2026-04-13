@@ -15,7 +15,7 @@ func NewExternalRootTable() *ExternalRootTable {
 }
 
 func (table *ExternalRootTable) RetainRef(ref value.HeapRef44) bool {
-	if table == nil || ref == 0 {
+	if ref == 0 {
 		return false
 	}
 	table.refs[ref]++
@@ -31,7 +31,7 @@ func (table *ExternalRootTable) RetainValue(slotValue value.TValue) bool {
 }
 
 func (table *ExternalRootTable) ReleaseRef(ref value.HeapRef44) error {
-	if table == nil || ref == 0 {
+	if ref == 0 {
 		return nil
 	}
 	count, ok := table.refs[ref]
@@ -55,9 +55,6 @@ func (table *ExternalRootTable) ReleaseValue(slotValue value.TValue) error {
 }
 
 func (table *ExternalRootTable) WalkRefs(visit func(value.HeapRef44) error) error {
-	if table == nil || visit == nil {
-		return nil
-	}
 	for ref := range table.refs {
 		if ref == 0 {
 			continue
@@ -70,22 +67,16 @@ func (table *ExternalRootTable) WalkRefs(visit func(value.HeapRef44) error) erro
 }
 
 func (table *ExternalRootTable) RefCount(ref value.HeapRef44) uint32 {
-	if table == nil || ref == 0 {
+	if ref == 0 {
 		return 0
 	}
 	return table.refs[ref]
 }
 
 func (table *ExternalRootTable) Len() int {
-	if table == nil {
-		return 0
-	}
 	return len(table.refs)
 }
 
 func (table *ExternalRootTable) Clear() {
-	if table == nil {
-		return
-	}
 	clear(table.refs)
 }

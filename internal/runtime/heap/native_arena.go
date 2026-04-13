@@ -68,16 +68,10 @@ func sliceFromAddress(address uintptr, size uint64) ([]byte, error) {
 }
 
 func (arena *reservedNativeArena) Base() uintptr {
-	if arena == nil || arena.impl == nil {
-		return 0
-	}
 	return arena.impl.base()
 }
 
 func (arena *reservedNativeArena) EnsureCommitted(size uint64) error {
-	if arena == nil || arena.impl == nil {
-		return fmt.Errorf("native arena is not initialized")
-	}
 	if size == 0 {
 		return nil
 	}
@@ -88,9 +82,6 @@ func (arena *reservedNativeArena) EnsureCommitted(size uint64) error {
 }
 
 func (arena *reservedNativeArena) Bytes(offset uint64, size uint64) ([]byte, error) {
-	if arena == nil || arena.impl == nil {
-		return nil, fmt.Errorf("native arena is not initialized")
-	}
 	if size == 0 {
 		return []byte{}, nil
 	}

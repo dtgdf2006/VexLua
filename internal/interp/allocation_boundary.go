@@ -1,8 +1,6 @@
 package interp
 
 import (
-	"fmt"
-
 	"vexlua/internal/bytecode"
 	"vexlua/internal/runtime/state"
 	"vexlua/internal/runtime/upvalue"
@@ -10,9 +8,6 @@ import (
 )
 
 func (engine *Engine) NewTableBoundary(arrayCap uint32, hashCap uint32, publish func(value.TValue) error) error {
-	if publish == nil {
-		return fmt.Errorf("newtable boundary requires publish callback")
-	}
 	before := engine.liveBytes()
 	handle, err := engine.Tables.New(arrayCap, hashCap)
 	if err != nil {
@@ -25,9 +20,6 @@ func (engine *Engine) NewTableBoundary(arrayCap uint32, hashCap uint32, publish 
 }
 
 func (engine *Engine) ConcatValuesBoundary(thread *state.ThreadState, values []value.TValue, publish func(value.TValue) error) error {
-	if publish == nil {
-		return fmt.Errorf("concat boundary requires publish callback")
-	}
 	before := engine.liveBytes()
 	result, err := engine.ConcatBoundary(thread, values)
 	if err != nil {
@@ -64,12 +56,6 @@ func (engine *Engine) CloseUpvaluesInRangeBoundary(thread *state.ThreadState, lo
 }
 
 func (engine *Engine) NewClosureBoundary(proto *bytecode.Proto, env value.TValue, upvalues []value.HeapRef44, publish func(value.TValue) error) error {
-	if proto == nil {
-		return fmt.Errorf("closure boundary requires child proto")
-	}
-	if publish == nil {
-		return fmt.Errorf("closure boundary requires publish callback")
-	}
 	before := engine.liveBytes()
 	handle, err := engine.Closures.NewLuaClosure(proto, env, upvalues)
 	if err != nil {

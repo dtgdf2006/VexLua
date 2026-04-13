@@ -614,9 +614,6 @@ func (runtime *Runtime) handleTailCallStub(thread *state.ThreadState, frame *sta
 }
 
 func (runtime *Runtime) matchCallFeedbackCell(closureRef value.HeapRef44, compiled *CompiledCode, bytecodePC int, kind feedback.SlotKind, callee value.TValue, args []value.TValue) (value.TValue, []value.TValue, bool, error) {
-	if compiled == nil || compiled.FeedbackLayout == nil {
-		return value.NilValue(), nil, false, nil
-	}
 	slot, slotIndex, ok := compiled.FeedbackLayout.SlotAtPC(bytecodePC)
 	if !ok || slot.Kind != kind {
 		return value.NilValue(), nil, false, nil
@@ -654,9 +651,6 @@ func (runtime *Runtime) callResolvedBoundary(thread *state.ThreadState, resolved
 }
 
 func (runtime *Runtime) updateResolvedCallFeedback(closureRef value.HeapRef44, compiled *CompiledCode, site metadata.ContinuationSite, kind feedback.SlotKind, callee value.TValue, resolvedCallee value.TValue) {
-	if compiled == nil || compiled.Proto == nil {
-		return
-	}
 	runtime.Engine.UpdateCallFeedbackAtPC(closureRef, compiled.Proto, int(site.BytecodePC), kind, callee, resolvedCallee)
 }
 
@@ -696,13 +690,7 @@ func (runtime *Runtime) loopContinuationEntry(compiled *CompiledCode, site metad
 }
 
 func (runtime *Runtime) finishNestedCompiledCall(thread *state.ThreadState, callerFrame *state.CallFrameHeader, ctx *executionContext) ([]value.TValue, error) {
-	if thread == nil {
-		return nil, fmt.Errorf("thread cannot be nil")
-	}
-	if callerFrame == nil {
-		return nil, fmt.Errorf("caller frame cannot be nil")
-	}
-	if ctx == nil || ctx.Flags&execCtxFlagNestedCallPending == 0 {
+	if ctx.Flags&execCtxFlagNestedCallPending == 0 {
 		return nil, fmt.Errorf("nested compiled call state is not pending")
 	}
 	activeFrame := thread.CurrentFrame()
@@ -794,7 +782,7 @@ func (runtime *Runtime) finishResolvedHostCall(thread *state.ThreadState, frame 
 }
 
 func takeResolvedHostCallFromContext(ctx *executionContext) (value.TValue, bool, error) {
-	if ctx == nil || ctx.Flags&execCtxFlagResolvedHostCallBoundary == 0 {
+	if ctx.Flags&execCtxFlagResolvedHostCallBoundary == 0 {
 		return value.NilValue(), false, fmt.Errorf("resolved host call boundary is not pending")
 	}
 	raw := value.Raw(uint64(ctx.Reserved0) | uint64(ctx.Reserved1)<<32)
@@ -812,9 +800,6 @@ func takeResolvedHostCallFromContext(ctx *executionContext) (value.TValue, bool,
 }
 
 func (runtime *Runtime) compiledFrameState(frame *state.CallFrameHeader) (value.HeapRef44, *CompiledCode, error) {
-	if frame == nil {
-		return 0, nil, fmt.Errorf("frame cannot be nil")
-	}
 	closureRef, ok := frame.Closure.HeapRef()
 	if !ok {
 		return 0, nil, fmt.Errorf("frame closure is not a heap reference: %s", frame.Closure)
@@ -834,9 +819,6 @@ func (runtime *Runtime) compiledFrameState(frame *state.CallFrameHeader) (value.
 }
 
 func advanceFrameTopForSlot(frame *state.CallFrameHeader, slot int) error {
-	if frame == nil {
-		return fmt.Errorf("frame cannot be nil")
-	}
 	if slot < 0 {
 		return fmt.Errorf("slot %d is invalid", slot)
 	}
@@ -872,9 +854,6 @@ func (runtime *Runtime) collectFrameCallArguments(thread *state.ThreadState, fra
 }
 
 func (runtime *Runtime) constantOperandValue(compiled *CompiledCode, index int) (value.TValue, error) {
-	if compiled == nil || compiled.Proto == nil {
-		return value.NilValue(), fmt.Errorf("compiled proto is not available")
-	}
 	return runtime.Engine.Protos.ConstantValue(compiled.Proto, index, runtime.Engine.Strings)
 }
 

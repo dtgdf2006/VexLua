@@ -52,9 +52,6 @@ func (engine *Engine) ReadIndexMetaBoundary(thread *state.ThreadState, targetVal
 			return value.NilValue(), false, indexBoundaryTypeError(currentTarget)
 		}
 		if isCallableBoundaryValue(metamethod) {
-			if thread == nil {
-				return value.NilValue(), false, fmt.Errorf("thread cannot be nil when calling %s", metaIndexName)
-			}
 			results, err := engine.CallValueBoundary(thread, metamethod, []value.TValue{currentTarget, key}, 1)
 			if err != nil {
 				return value.NilValue(), false, err
@@ -107,9 +104,6 @@ func (engine *Engine) WriteIndexMetaBoundary(thread *state.ThreadState, targetVa
 			return newIndexBoundaryTypeError(currentTarget)
 		}
 		if isCallableBoundaryValue(metamethod) {
-			if thread == nil {
-				return fmt.Errorf("thread cannot be nil when calling %s", metaNewIndexName)
-			}
 			_, err := engine.CallValueBoundary(thread, metamethod, []value.TValue{currentTarget, key, slotValue}, 0)
 			return err
 		}

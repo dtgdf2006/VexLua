@@ -98,29 +98,17 @@ type ClosureTemplate struct {
 }
 
 func (proto *Proto) InstructionCount() int {
-	if proto == nil {
-		return 0
-	}
 	return len(proto.Code)
 }
 
 func (proto *Proto) ConstantCount() int {
-	if proto == nil {
-		return 0
-	}
 	return len(proto.Constants)
 }
 
 func (proto *Proto) NewClosureTemplate() ClosureTemplate {
-	if proto == nil {
-		return ClosureTemplate{}
-	}
 	return ClosureTemplate{Proto: proto, UpvalueCount: int(proto.NumUpvalues)}
 }
 
 func (proto *Proto) Iterator() *Iterator {
-	if proto == nil {
-		return NewIterator(nil)
-	}
 	return NewIterator(proto.Code)
 }

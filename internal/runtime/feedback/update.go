@@ -8,21 +8,7 @@ import (
 )
 
 func SlotInfoForProtoPC(proto *bytecode.Proto, pc int) (Slot, uint32, bool) {
-	if proto == nil || pc < 0 || pc >= len(proto.Code) {
-		return Slot{}, 0, false
-	}
-	var slotIndex uint32
-	for bytecodePC, instruction := range proto.Code {
-		kind, ok := slotKindForOpcode(instruction.Opcode())
-		if !ok {
-			continue
-		}
-		if bytecodePC == pc {
-			return Slot{PC: bytecodePC, Kind: kind}, slotIndex, true
-		}
-		slotIndex++
-	}
-	return Slot{}, 0, false
+	return LayoutForProto(proto).SlotAtPC(pc)
 }
 
 func AccessKindForFastAccess(kind rttable.FastAccessKind) AccessKind {

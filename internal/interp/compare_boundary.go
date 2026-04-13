@@ -233,9 +233,6 @@ func (engine *Engine) hostObjectMetatableValue(ref value.HeapRef44) (value.TValu
 }
 
 func (engine *Engine) invokeCompareMetamethod(thread *state.ThreadState, metamethod value.TValue, left value.TValue, right value.TValue, metamethodName string) (bool, error) {
-	if thread == nil {
-		return false, fmt.Errorf("thread cannot be nil when calling %s", metamethodName)
-	}
 	results, err := engine.CallValueBoundary(thread, metamethod, []value.TValue{left, right}, 1)
 	if err != nil {
 		return false, err

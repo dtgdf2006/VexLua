@@ -119,16 +119,10 @@ func (heap *Heap) WalkSpans(visit func(offset value.HeapOff64, metadata SpanMeta
 }
 
 func (heap *Heap) SpanCount() int {
-	if heap == nil {
-		return 0
-	}
 	return len(heap.spanOrder)
 }
 
 func (heap *Heap) WalkSpansChunk(cursor int, limit int, budget uint64, visit func(offset value.HeapOff64, metadata SpanMetadata) error) (int, bool, error) {
-	if heap == nil || visit == nil {
-		return 0, true, nil
-	}
 	if cursor < 0 {
 		cursor = 0
 	}

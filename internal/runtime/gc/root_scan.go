@@ -35,16 +35,10 @@ type Scanner struct {
 }
 
 func NewScanner(runtimeHeap *heap.Heap) *Scanner {
-	if runtimeHeap == nil {
-		panic("gc scanner requires a heap")
-	}
 	return &Scanner{heap: runtimeHeap}
 }
 
 func (scanner *Scanner) BindCompiledRuntime(runtime *baseline.Runtime) {
-	if scanner == nil {
-		return
-	}
 	scanner.compiled = runtime
 }
 
@@ -81,12 +75,6 @@ func (scanner *Scanner) WalkVMState(vm *state.VMState, visit VisitFunc) error {
 }
 
 func (scanner *Scanner) WalkThread(thread *state.ThreadState, visit VisitFunc) error {
-	if thread == nil {
-		return fmt.Errorf("thread cannot be nil")
-	}
-	if visit == nil {
-		return nil
-	}
 	for frame := thread.CurrentFrame(); frame != nil; {
 		if err := scanner.WalkFrame(thread, frame, visit); err != nil {
 			return err
@@ -107,20 +95,11 @@ func (scanner *Scanner) WalkFrame(thread *state.ThreadState, frame *state.CallFr
 	return scanner.walkFrame(thread, frame, uint32(frame.Top), visit)
 }
 
-func (scanner *Scanner) WalkActivationFrame(thread *state.ThreadState, frame *state.CallFrameHeader, top uint32, visit VisitFunc) error {
+func (scanner *Scanner) WalkFrameWithTop(thread *state.ThreadState, frame *state.CallFrameHeader, top uint32, visit VisitFunc) error {
 	return scanner.walkFrame(thread, frame, top, visit)
 }
 
 func (scanner *Scanner) walkFrame(thread *state.ThreadState, frame *state.CallFrameHeader, top uint32, visit VisitFunc) error {
-	if thread == nil {
-		return fmt.Errorf("thread cannot be nil")
-	}
-	if frame == nil {
-		return fmt.Errorf("frame cannot be nil")
-	}
-	if visit == nil {
-		return nil
-	}
 	if scanner.compiled != nil {
 		handled, err := scanner.compiled.WalkFrameRoots(thread, frame, visit)
 		if err != nil {
@@ -181,13 +160,13 @@ func (scanner *Scanner) walkFrame(thread *state.ThreadState, frame *state.CallFr
 	return nil
 }
 
-func (scanner *Scanner) InterpreterActivationRoots(engine *interp.Engine) RootSource {
+func (scanner *Scanner) InterpreterFrameRoots(engine *interp.Engine) RootSource {
 	return RootSourceFunc(func(visit VisitFunc) error {
 		if engine == nil {
 			return nil
 		}
-		return engine.WalkActivationFrames(func(thread *state.ThreadState, frame *state.CallFrameHeader, top uint32) error {
-			return scanner.WalkActivationFrame(thread, frame, top, visit)
+		return engine.WalkThreadFrames(func(thread *state.ThreadState, frame *state.CallFrameHeader, top uint32) error {
+			return scanner.WalkFrameWithTop(thread, frame, top, visit)
 		})
 	})
 }
@@ -240,9 +219,6 @@ func Values(values ...value.TValue) RootSource {
 }
 
 func visitTValue(slotValue value.TValue, visit VisitFunc) error {
-	if visit == nil {
-		return nil
-	}
 	ref, ok := slotValue.HeapRef()
 	if !ok || ref == 0 {
 		return nil
@@ -251,9 +227,6 @@ func visitTValue(slotValue value.TValue, visit VisitFunc) error {
 }
 
 func (scanner *Scanner) walkOpenUpvalues(thread *state.ThreadState, visit VisitFunc) error {
-	if visit == nil {
-		return nil
-	}
 	seen := make(map[value.HeapRef44]struct{})
 	for current := thread.OpenUpvalueHead(); current != 0; {
 		if _, ok := seen[current]; ok {

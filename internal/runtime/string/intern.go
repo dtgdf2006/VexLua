@@ -22,9 +22,6 @@ type InternTable struct {
 }
 
 func NewInternTable(runtimeHeap *heap.Heap, seed uint32) *InternTable {
-	if runtimeHeap == nil {
-		panic("intern table requires a heap")
-	}
 	return &InternTable{
 		heap: runtimeHeap,
 		seed: seed,
@@ -83,9 +80,6 @@ func (table *InternTable) Lookup(text string) (Handle, bool, error) {
 }
 
 func (table *InternTable) WalkRefs(visit func(value.HeapRef44) error) error {
-	if table == nil || visit == nil {
-		return nil
-	}
 	for _, ref := range table.refs {
 		if ref == 0 {
 			continue
@@ -98,9 +92,6 @@ func (table *InternTable) WalkRefs(visit func(value.HeapRef44) error) error {
 }
 
 func (table *InternTable) SweepDead(isDead func(value.HeapRef44) (bool, error)) (int, error) {
-	if table == nil {
-		return 0, nil
-	}
 	if isDead == nil {
 		return 0, fmt.Errorf("dead predicate cannot be nil")
 	}

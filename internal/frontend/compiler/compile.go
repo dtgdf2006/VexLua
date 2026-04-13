@@ -45,9 +45,6 @@ func DefaultDriver() *Driver {
 
 // Compile drives Parse -> Bind -> Emit and validates the final proto.
 func (driver *Driver) Compile(name string, src []byte) (*bytecode.Proto, error) {
-	if driver == nil {
-		driver = &Driver{}
-	}
 	if driver.Parser == nil {
 		return nil, lexer.Errorf(lexer.PhaseParse, lexer.Span{}, "source frontend parser stage is not implemented")
 	}
@@ -68,9 +65,6 @@ func (driver *Driver) Compile(name string, src []byte) (*bytecode.Proto, error) 
 	proto, err := driver.Emitter.EmitChunk(bound)
 	if err != nil {
 		return nil, err
-	}
-	if proto == nil {
-		return nil, lexer.Errorf(lexer.PhaseEmit, lexer.Span{}, "source frontend emitter returned nil proto")
 	}
 	if err := bytecode.ValidateProto(proto); err != nil {
 		return nil, err

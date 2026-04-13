@@ -38,9 +38,6 @@ type Tracer struct {
 }
 
 func NewTracer(runtimeHeap *heap.Heap, hosts *host.Registry) *Tracer {
-	if runtimeHeap == nil {
-		panic("gc tracer requires a heap")
-	}
 	return &Tracer{heap: runtimeHeap, hosts: hosts}
 }
 

@@ -210,7 +210,7 @@ func TestScannerWalksStoreAndExternalRoots(t *testing.T) {
 	}
 }
 
-func TestInterpreterActivationRootsFollowLiveTop(t *testing.T) {
+func TestInterpreterFrameRootsFollowLiveTop(t *testing.T) {
 	engine := interp.New()
 	thread, err := engine.NewThread(32, 4)
 	if err != nil {
@@ -220,8 +220,8 @@ func TestInterpreterActivationRootsFollowLiveTop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new env: %v", err)
 	}
-	liveRoot := mustIntern(t, engine.Strings, "activation-live-root")
-	deadRoot := mustIntern(t, engine.Strings, "activation-dead-root")
+	liveRoot := mustIntern(t, engine.Strings, "frame-live-root")
+	deadRoot := mustIntern(t, engine.Strings, "frame-dead-root")
 	scanner := NewScanner(engine.Heap)
 	visited := make(map[value.HeapRef44]struct{})
 	var scanErr error
@@ -235,7 +235,7 @@ func TestInterpreterActivationRootsFollowLiveTop(t *testing.T) {
 			scanErr = err
 			return
 		}
-		scanErr = scanner.InterpreterActivationRoots(engine).WalkRoots(func(ref value.HeapRef44) error {
+		scanErr = scanner.InterpreterFrameRoots(engine).WalkRoots(func(ref value.HeapRef44) error {
 			visited[ref] = struct{}{}
 			return nil
 		})
@@ -247,11 +247,11 @@ func TestInterpreterActivationRootsFollowLiveTop(t *testing.T) {
 		t.Fatalf("set global probe: %v", err)
 	}
 	proto := &bytecode.Proto{
-		Source:       "@activation-roots.lua",
+		Source:       "@frame-roots.lua",
 		MaxStackSize: 3,
 		Constants: []bytecode.Constant{
 			bytecode.StringConstant("probe"),
-			bytecode.StringConstant("activation-live-root"),
+			bytecode.StringConstant("frame-live-root"),
 		},
 		Code: []bytecode.Instruction{
 			bytecode.CreateABx(bytecode.OP_GETGLOBAL, 0, 0),
@@ -268,15 +268,15 @@ func TestInterpreterActivationRootsFollowLiveTop(t *testing.T) {
 		t.Fatalf("call closure: %v", err)
 	}
 	if scanErr != nil {
-		t.Fatalf("scan activation roots: %v", scanErr)
+		t.Fatalf("scan frame roots: %v", scanErr)
 	}
 	for _, ref := range []value.HeapRef44{closureHandle.Ref, hostFunc.Ref, liveRoot.Ref} {
 		if _, ok := visited[ref]; !ok {
-			t.Fatalf("missing activation root %#x", uint64(ref))
+			t.Fatalf("missing frame root %#x", uint64(ref))
 		}
 	}
 	if _, ok := visited[deadRoot.Ref]; ok {
-		t.Fatalf("unexpected activation root %#x", uint64(deadRoot.Ref))
+		t.Fatalf("unexpected frame root %#x", uint64(deadRoot.Ref))
 	}
 }
 

@@ -25,9 +25,6 @@ type livenessTransfer struct {
 }
 
 func analyzeLiveSlotSets(proto *bytecode.Proto) ([]metadata.LiveSlotSet, error) {
-	if proto == nil {
-		return nil, fmt.Errorf("proto cannot be nil")
-	}
 	slotCount := livenessSlotCount(proto)
 	liveIn := make([]liveRegisterSet, len(proto.Code)+1)
 	for index := range liveIn {
@@ -87,7 +84,7 @@ func transferLiveRegisters(proto *bytecode.Proto, pc int, liveIn []liveRegisterS
 }
 
 func instructionSuccessors(proto *bytecode.Proto, pc int) ([]int, error) {
-	if proto == nil || pc < 0 || pc >= len(proto.Code) {
+	if pc < 0 || pc >= len(proto.Code) {
 		return nil, fmt.Errorf("liveness pc %d is out of range", pc)
 	}
 	instruction := proto.Code[pc]
@@ -241,7 +238,7 @@ func instructionTransfer(proto *bytecode.Proto, pc int) (livenessTransfer, error
 }
 
 func livenessSlotCount(proto *bytecode.Proto) int {
-	if proto == nil || proto.MaxStackSize == 0 {
+	if proto.MaxStackSize == 0 {
 		return 1
 	}
 	return int(proto.MaxStackSize)
@@ -265,7 +262,7 @@ func (set liveRegisterSet) clone() liveRegisterSet {
 }
 
 func (set *liveRegisterSet) add(slot int) {
-	if set == nil || slot < 0 {
+	if slot < 0 {
 		return
 	}
 	word := slot / 64
@@ -279,7 +276,7 @@ func (set *liveRegisterSet) add(slot int) {
 }
 
 func (set *liveRegisterSet) addRange(start int, end int) {
-	if set == nil || start < 0 || end < start {
+	if start < 0 || end < start {
 		return
 	}
 	for slot := start; slot <= end; slot++ {
@@ -288,7 +285,7 @@ func (set *liveRegisterSet) addRange(start int, end int) {
 }
 
 func (set *liveRegisterSet) removeRange(start int, end int) {
-	if set == nil || start < 0 || end < start {
+	if start < 0 || end < start {
 		return
 	}
 	for slot := start; slot <= end; slot++ {
@@ -302,7 +299,7 @@ func (set *liveRegisterSet) removeRange(start int, end int) {
 }
 
 func (set *liveRegisterSet) setDynamicTopStart(start int) {
-	if set == nil || start < 0 {
+	if start < 0 {
 		return
 	}
 	if set.dynamicTopStart < 0 || start < set.dynamicTopStart {
@@ -311,9 +308,6 @@ func (set *liveRegisterSet) setDynamicTopStart(start int) {
 }
 
 func (set *liveRegisterSet) unionFrom(other liveRegisterSet) {
-	if set == nil {
-		return
-	}
 	if len(other.words) > len(set.words) {
 		grown := make([]uint64, len(other.words))
 		copy(grown, set.words)

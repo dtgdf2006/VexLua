@@ -10,61 +10,42 @@ import (
 	"vexlua/internal/runtime/value"
 )
 
-func (engine *Engine) recordGetFeedback(act *activation, pc int, kind feedback.SlotKind, tableValue value.TValue, key value.TValue) {
-	engine.recordActivationTableFeedback(act, pc, kind, tableValue, key, value.NilValue(), false)
+func (engine *Engine) recordGetFeedback(layout *feedback.Layout, closureRef value.HeapRef44, pc int, kind feedback.SlotKind, tableValue value.TValue, key value.TValue) {
+	engine.recordTableSlotFeedback(layout, closureRef, pc, kind, tableValue, key, value.NilValue(), false)
 }
 
-func (engine *Engine) recordSetFeedback(act *activation, pc int, kind feedback.SlotKind, tableValue value.TValue, key value.TValue, slotValue value.TValue) {
-	engine.recordActivationTableFeedback(act, pc, kind, tableValue, key, slotValue, true)
+func (engine *Engine) recordSetFeedback(layout *feedback.Layout, closureRef value.HeapRef44, pc int, kind feedback.SlotKind, tableValue value.TValue, key value.TValue, slotValue value.TValue) {
+	engine.recordTableSlotFeedback(layout, closureRef, pc, kind, tableValue, key, slotValue, true)
 }
 
-func (engine *Engine) recordCallFeedback(act *activation, pc int, kind feedback.SlotKind, callee value.TValue) {
-	if act == nil {
-		return
-	}
+func (engine *Engine) recordCallFeedback(layout *feedback.Layout, closureRef value.HeapRef44, pc int, kind feedback.SlotKind, callee value.TValue) {
 	resolvedCallee, _, err := engine.ResolveCallBoundary(callee, nil)
 	if err != nil {
 		return
 	}
-	closureRef, err := engine.activationClosureRef(act)
-	if err != nil {
-		return
-	}
-	proto, err := engine.activationProto(act)
-	if err != nil {
-		return
-	}
-	engine.UpdateCallFeedbackAtPC(closureRef, proto, pc, kind, callee, resolvedCallee)
+	engine.updateLayoutFeedbackAtPC(layout, pc, kind, func(slotIndex uint32) {
+		engine.UpdateCallFeedbackAtSlot(closureRef, kind, slotIndex, callee, resolvedCallee)
+	})
 }
 
-func (engine *Engine) recordUpvalueFeedback(act *activation, pc int, kind feedback.SlotKind, upvalueRef value.HeapRef44, observed value.TValue) {
-	if act == nil {
-		return
-	}
-	closureRef, err := engine.activationClosureRef(act)
-	if err != nil {
-		return
-	}
-	proto, err := engine.activationProto(act)
-	if err != nil {
-		return
-	}
-	engine.UpdateUpvalueFeedbackAtPC(closureRef, proto, pc, kind, upvalueRef, observed)
+func (engine *Engine) recordUpvalueFeedback(layout *feedback.Layout, closureRef value.HeapRef44, pc int, kind feedback.SlotKind, upvalueRef value.HeapRef44, observed value.TValue) {
+	engine.updateLayoutFeedbackAtPC(layout, pc, kind, func(slotIndex uint32) {
+		engine.UpdateUpvalueFeedbackAtSlot(closureRef, kind, slotIndex, upvalueRef, observed)
+	})
 }
 
-func (engine *Engine) recordActivationTableFeedback(act *activation, pc int, kind feedback.SlotKind, tableValue value.TValue, key value.TValue, slotValue value.TValue, isStore bool) {
-	if act == nil {
+func (engine *Engine) recordTableSlotFeedback(layout *feedback.Layout, closureRef value.HeapRef44, pc int, kind feedback.SlotKind, tableValue value.TValue, key value.TValue, slotValue value.TValue, isStore bool) {
+	engine.updateLayoutFeedbackAtPC(layout, pc, kind, func(slotIndex uint32) {
+		engine.UpdateTableFeedbackAtSlot(closureRef, kind, slotIndex, tableValue, key, slotValue, isStore)
+	})
+}
+
+func (engine *Engine) updateLayoutFeedbackAtPC(layout *feedback.Layout, pc int, kind feedback.SlotKind, apply func(slotIndex uint32)) {
+	slot, slotIndex, ok := layout.SlotAtPC(pc)
+	if !ok || slot.Kind != kind {
 		return
 	}
-	closureRef, err := engine.activationClosureRef(act)
-	if err != nil {
-		return
-	}
-	proto, err := engine.activationProto(act)
-	if err != nil {
-		return
-	}
-	engine.UpdateTableFeedbackAtPC(closureRef, proto, pc, kind, tableValue, key, slotValue, isStore)
+	apply(slotIndex)
 }
 
 func (engine *Engine) UpdateTableFeedbackAtPC(closureRef value.HeapRef44, proto *bytecode.Proto, pc int, kind feedback.SlotKind, tableValue value.TValue, key value.TValue, slotValue value.TValue, isStore bool) {
@@ -211,7 +192,7 @@ func (engine *Engine) describeFeedbackAccess(tableValue value.TValue, key value.
 }
 
 func (engine *Engine) readCallPolymorphicEntries(offset value.HeapOff64) ([]feedback.CallPolymorphicEntry, error) {
-	if engine == nil || engine.Heap == nil || offset == 0 {
+	if offset == 0 {
 		return nil, fmt.Errorf("call polymorphic offset cannot be zero")
 	}
 	bytes, err := engine.Heap.Resolve(offset, feedback.CallPolymorphicDataSize)
@@ -226,7 +207,7 @@ func (engine *Engine) readCallPolymorphicEntries(offset value.HeapOff64) ([]feed
 }
 
 func (engine *Engine) writeCallPolymorphicEntries(offset value.HeapOff64, entries []feedback.CallPolymorphicEntry) error {
-	if engine == nil || engine.Heap == nil || offset == 0 {
+	if offset == 0 {
 		return fmt.Errorf("call polymorphic offset cannot be zero")
 	}
 	if len(entries) != feedback.CallPolymorphicEntryCount {
@@ -240,7 +221,7 @@ func (engine *Engine) writeCallPolymorphicEntries(offset value.HeapOff64, entrie
 }
 
 func (engine *Engine) readCallMegamorphicEntries(offset value.HeapOff64) ([]feedback.CallPolymorphicEntry, error) {
-	if engine == nil || engine.Heap == nil || offset == 0 {
+	if offset == 0 {
 		return nil, fmt.Errorf("call megamorphic offset cannot be zero")
 	}
 	bytes, err := engine.Heap.Resolve(offset, feedback.CallMegamorphicDataSize)
@@ -262,7 +243,7 @@ func (engine *Engine) readCallMegamorphicEntries(offset value.HeapOff64) ([]feed
 }
 
 func (engine *Engine) writeCallMegamorphicEntries(offset value.HeapOff64, entries []feedback.CallPolymorphicEntry) error {
-	if engine == nil || engine.Heap == nil || offset == 0 {
+	if offset == 0 {
 		return fmt.Errorf("call megamorphic offset cannot be zero")
 	}
 	if len(entries) > feedback.CallMegamorphicEntryCount {

@@ -72,9 +72,6 @@ type CompiledCode struct {
 }
 
 func (code *CompiledCode) WalkRoots(visit func(value.HeapRef44) error) error {
-	if code == nil || visit == nil {
-		return nil
-	}
 	if code.ProtoRef == 0 {
 		return code.Metadata.WalkHeapRefs(visit)
 	}
@@ -85,7 +82,7 @@ func (code *CompiledCode) WalkRoots(visit func(value.HeapRef44) error) error {
 }
 
 func (code *CompiledCode) EntryAtBytecode(bytecodeOffset int) (uintptr, error) {
-	if code == nil || !code.Supported || code.Block == nil {
+	if !code.Supported || code.Block == nil {
 		return 0, fmt.Errorf("compiled code is not executable")
 	}
 	offset, ok := code.Metadata.CodeOffset(bytecodeOffset)
@@ -96,9 +93,6 @@ func (code *CompiledCode) EntryAtBytecode(bytecodeOffset int) (uintptr, error) {
 }
 
 func (code *CompiledCode) ContinuationSite(siteID uint32) (metadata.ContinuationSite, error) {
-	if code == nil {
-		return metadata.ContinuationSite{}, fmt.Errorf("compiled code is nil")
-	}
 	site, ok := code.Metadata.ContinuationSite(siteID)
 	if !ok {
 		return metadata.ContinuationSite{}, fmt.Errorf("unknown continuation site %d", siteID)
@@ -107,7 +101,7 @@ func (code *CompiledCode) ContinuationSite(siteID uint32) (metadata.Continuation
 }
 
 func (code *CompiledCode) EntryAtSite(site metadata.ContinuationSite, alternate bool) (uintptr, error) {
-	if code == nil || !code.Supported || code.Block == nil {
+	if !code.Supported || code.Block == nil {
 		return 0, fmt.Errorf("compiled code is not executable")
 	}
 	offset := site.ResumeCodeOffset
@@ -121,7 +115,7 @@ func (code *CompiledCode) EntryAtSite(site metadata.ContinuationSite, alternate 
 }
 
 func (code *CompiledCode) Release(cache *codecache.Cache) error {
-	if cache == nil || code == nil || code.Block == nil {
+	if code.Block == nil {
 		return nil
 	}
 	err := cache.Release(code.Block)

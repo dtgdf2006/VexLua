@@ -63,9 +63,6 @@ func (arena *linuxNativeArena) ensureCommitted(size uint64) error {
 }
 
 func (arena *linuxNativeArena) close() error {
-	if arena == nil || arena.mapping == nil {
-		return nil
-	}
 	if err := syscall.Munmap(arena.mapping); err != nil {
 		return fmt.Errorf("munmap failed: %w", err)
 	}

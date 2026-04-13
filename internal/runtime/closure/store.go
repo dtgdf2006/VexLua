@@ -17,19 +17,10 @@ type Store struct {
 }
 
 func NewStore(runtimeHeap *heap.Heap, protos *rproto.Store) *Store {
-	if runtimeHeap == nil {
-		panic("closure store requires a heap")
-	}
-	if protos == nil {
-		panic("closure store requires a proto store")
-	}
 	return &Store{heap: runtimeHeap, protos: protos}
 }
 
 func (store *Store) NewLuaClosure(proto *bytecode.Proto, env value.TValue, upvalues []value.HeapRef44) (Handle, error) {
-	if proto == nil {
-		return Handle{}, fmt.Errorf("proto cannot be nil")
-	}
 	if int(proto.NumUpvalues) != len(upvalues) {
 		return Handle{}, fmt.Errorf("proto expects %d upvalues, got %d", proto.NumUpvalues, len(upvalues))
 	}
@@ -166,7 +157,7 @@ func (store *Store) UpvalueRefs(ref value.HeapRef44) ([]value.HeapRef44, error) 
 }
 
 func (store *Store) EnsureFeedbackVector(ref value.HeapRef44, layout *feedback.Layout) (uintptr, error) {
-	if layout == nil || layout.SlotCount() == 0 {
+	if layout.SlotCount() == 0 {
 		return 0, nil
 	}
 	offset, objectBytes, err := store.objectBytes(ref)

@@ -32,7 +32,7 @@ func NewLiveSlotSet(registerCount int) LiveSlotSet {
 }
 
 func (set *LiveSlotSet) AddRegister(index int) {
-	if set == nil || index < 0 {
+	if index < 0 {
 		return
 	}
 	word := index / 64
@@ -46,7 +46,7 @@ func (set *LiveSlotSet) AddRegister(index int) {
 }
 
 func (set *LiveSlotSet) AddRange(start int, end int) {
-	if set == nil || start < 0 || end < start {
+	if start < 0 || end < start {
 		return
 	}
 	for index := start; index <= end; index++ {
@@ -55,7 +55,7 @@ func (set *LiveSlotSet) AddRange(start int, end int) {
 }
 
 func (set *LiveSlotSet) SetDynamicTopStart(start int) {
-	if set == nil || start < 0 {
+	if start < 0 {
 		return
 	}
 	if set.DynamicTopStart == NoLiveSlotSet || uint32(start) < set.DynamicTopStart {
@@ -73,7 +73,7 @@ func (set LiveSlotSet) Clone() LiveSlotSet {
 
 func (set LiveSlotSet) HasStaticRegister(index uint32) bool {
 	word := int(index / 64)
-	if word < 0 || word >= len(set.RegisterWords) {
+	if word >= len(set.RegisterWords) {
 		return false
 	}
 	bit := uint(index % 64)
@@ -85,9 +85,6 @@ func (set LiveSlotSet) HasDynamicRange() bool {
 }
 
 func (set LiveSlotSet) WalkRegisters(frameTop uint32, visit func(uint32) error) error {
-	if visit == nil {
-		return nil
-	}
 	for wordIndex, word := range set.RegisterWords {
 		remaining := word
 		for remaining != 0 {
@@ -299,11 +296,7 @@ func (metadata *CodeMetadata) AddHeapRef(ref value.HeapRef44) {
 }
 
 func (metadata *CodeMetadata) Finalize(builder *OffsetTableBuilder) {
-	if builder == nil {
-		metadata.OffsetTable = nil
-	} else {
-		metadata.OffsetTable = builder.Bytes()
-	}
+	metadata.OffsetTable = builder.Bytes()
 	for index := range metadata.Sites {
 		site := &metadata.Sites[index]
 		site.ResumeCodeOffset = metadata.lookupCodeOffset(site.ResumePC)
@@ -323,7 +316,7 @@ func (metadata CodeMetadata) CodeOffset(bytecodeOffset int) (uint32, bool) {
 }
 
 func (metadata CodeMetadata) ContinuationSite(siteID uint32) (ContinuationSite, bool) {
-	if int(siteID) < 0 || int(siteID) >= len(metadata.Sites) {
+	if int(siteID) >= len(metadata.Sites) {
 		return ContinuationSite{}, false
 	}
 	return metadata.Sites[siteID], true
@@ -345,20 +338,14 @@ func (metadata CodeMetadata) LiveSlotSetAtBytecode(bytecodeOffset int) (LiveSlot
 	if !ok {
 		return LiveSlotSet{}, false
 	}
-	if int(id) < 0 || int(id) >= len(metadata.LiveSlotSets) {
+	if int(id) >= len(metadata.LiveSlotSets) {
 		return LiveSlotSet{}, false
 	}
 	return metadata.LiveSlotSets[id].Clone(), true
 }
 
 func (metadata CodeMetadata) WalkHeapRefs(visit func(value.HeapRef44) error) error {
-	if visit == nil {
-		return nil
-	}
 	for _, ref := range metadata.HeapRefs {
-		if ref == 0 {
-			continue
-		}
 		if err := visit(ref); err != nil {
 			return err
 		}

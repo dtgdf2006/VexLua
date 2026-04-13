@@ -122,9 +122,6 @@ func (engine *Engine) callConcatMetamethod(thread *state.ThreadState, left value
 	if !ok {
 		return value.NilValue(), false, nil
 	}
-	if thread == nil {
-		return value.NilValue(), false, fmt.Errorf("thread cannot be nil when calling %s", metaConcatName)
-	}
 	results, err := engine.CallValueBoundary(thread, metamethod, []value.TValue{left, right}, 1)
 	if err != nil {
 		return value.NilValue(), false, err

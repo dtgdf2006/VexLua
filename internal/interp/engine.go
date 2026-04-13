@@ -61,33 +61,12 @@ type Engine struct {
 	State    *state.VMState
 	assist   AllocationAssistant
 
-	threads map[uint64]*threadContext
-
 	hostObjectBridgeMetatable value.TValue
 }
 
 type AllocationAssistant interface {
 	AssistAllocation(bytes uint64) error
 	AssistSafepoint() error
-}
-
-type threadContext struct {
-	activations []*activation
-}
-
-type activation struct {
-	thread *state.ThreadState
-	frame  *state.CallFrameHeader
-	top    uint32
-	pc     int
-	fn     *bytecode.Proto
-	code   []bytecode.Instruction
-	callee value.HeapRef44
-	slots  []value.TValue
-}
-
-type threadSnapshot struct {
-	activations int
 }
 
 func New() *Engine {
@@ -108,34 +87,26 @@ func New() *Engine {
 		Closures:                  closure.NewStore(runtimeHeap, protos),
 		Upvalues:                  upvalue.NewManager(runtimeHeap, vmState),
 		State:                     vmState,
-		threads:                   make(map[uint64]*threadContext),
 		hostObjectBridgeMetatable: value.NilValue(),
 	}
 }
 
 func (engine *Engine) SetAllocationAssistant(assist AllocationAssistant) {
-	if engine == nil {
-		return
-	}
 	engine.assist = assist
 }
 
 func (engine *Engine) AdvanceGCSafepoint() error {
-	if engine == nil || engine.assist == nil {
+	if engine.assist == nil {
 		return nil
 	}
 	return engine.assist.AssistSafepoint()
 }
 
 func (engine *Engine) Close() error {
-	if engine == nil {
-		return nil
-	}
 	if engine.State != nil {
 		engine.State.Close()
 		engine.State = nil
 	}
-	engine.threads = nil
 	return nil
 }
 
@@ -233,9 +204,6 @@ func (engine *Engine) RegisterHostFunction(name string, function any, env value.
 }
 
 func (engine *Engine) ensureHostObjectBridgeMetatable() (value.TValue, error) {
-	if engine == nil {
-		return value.NilValue(), fmt.Errorf("engine cannot be nil")
-	}
 	if !engine.hostObjectBridgeMetatable.IsBoxedTag(value.TagNil) {
 		return engine.hostObjectBridgeMetatable, nil
 	}
@@ -398,11 +366,8 @@ func (engine *Engine) GetGlobal(env value.TValue, name string) (value.TValue, bo
 }
 
 func (engine *Engine) Call(thread *state.ThreadState, callee value.TValue, args []value.TValue, nresults int) ([]value.TValue, error) {
-	if thread == nil {
-		return nil, fmt.Errorf("thread cannot be nil")
-	}
 	before := engine.liveBytes()
-	snapshot := engine.snapshot(thread)
+	snapshot := thread.CurrentFrameAddress()
 	results, err := engine.callValue(thread, callee, args, nresults)
 	if err != nil {
 		engine.restoreSnapshot(thread, snapshot)
@@ -416,11 +381,8 @@ func (engine *Engine) Call(thread *state.ThreadState, callee value.TValue, args 
 }
 
 func (engine *Engine) ProtectedCall(thread *state.ThreadState, callee value.TValue, args []value.TValue, nresults int) (outcome Outcome) {
-	if thread == nil {
-		return Outcome{Status: StatusError, Err: fmt.Errorf("thread cannot be nil")}
-	}
 	before := engine.liveBytes()
-	snapshot := engine.snapshot(thread)
+	snapshot := thread.CurrentFrameAddress()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			engine.restoreSnapshot(thread, snapshot)
@@ -447,9 +409,6 @@ func (engine *Engine) RetainValue(slotValue value.TValue) {
 }
 
 func (engine *Engine) ReleaseValue(slotValue value.TValue) error {
-	if engine == nil || engine.State == nil || engine.State.ExternalRoots() == nil {
-		return nil
-	}
 	return engine.State.ExternalRoots().ReleaseValue(slotValue)
 }
 
@@ -463,9 +422,6 @@ func (engine *Engine) ReleaseValues(values []value.TValue) error {
 }
 
 func (engine *Engine) ReleaseRef(ref value.HeapRef44) error {
-	if engine == nil || engine.State == nil || engine.State.ExternalRoots() == nil {
-		return nil
-	}
 	return engine.State.ExternalRoots().ReleaseRef(ref)
 }
 
@@ -473,51 +429,27 @@ func (engine *Engine) callValue(thread *state.ThreadState, callee value.TValue, 
 	return engine.CallValueBoundary(thread, callee, args, nresults)
 }
 
-func (engine *Engine) threadState(thread *state.ThreadState) *threadContext {
-	ctx, ok := engine.threads[thread.ID]
-	if ok {
-		return ctx
-	}
-	ctx = &threadContext{}
-	engine.threads[thread.ID] = ctx
-	return ctx
-}
-
-func (engine *Engine) snapshot(thread *state.ThreadState) threadSnapshot {
-	ctx := engine.threadState(thread)
-	return threadSnapshot{
-		activations: len(ctx.activations),
-	}
-}
-
-func (engine *Engine) restoreSnapshot(thread *state.ThreadState, snapshot threadSnapshot) {
-	ctx := engine.threadState(thread)
-	for len(ctx.activations) > snapshot.activations {
-		act := ctx.activations[len(ctx.activations)-1]
-		if act != nil && act.frame != nil {
-			closeLimit := activationBaseAddress(act) + uintptr(act.frame.RegisterCount)*value.TValueSize
-			_, _ = engine.Upvalues.CloseInRange(thread, activationBaseAddress(act), closeLimit)
+func (engine *Engine) restoreSnapshot(thread *state.ThreadState, snapshot uintptr) {
+	for {
+		frame := thread.CurrentFrame()
+		if frame == nil || thread.CurrentFrameAddress() == snapshot {
+			return
 		}
+		baseAddress := uintptr(frame.RegsBase)
+		closeLimit := baseAddress + uintptr(frame.RegisterCount)*value.TValueSize
+		_, _ = engine.Upvalues.CloseInRange(thread, baseAddress, closeLimit)
 		_, _ = thread.PopFrame()
-		ctx.activations = ctx.activations[:len(ctx.activations)-1]
-		if registerBase, err := thread.SlotIndexForAddress(activationBaseAddress(act)); err == nil {
-			engine.clearSlots(thread, registerBase, activationReservedSlots(act))
+		if registerBase, err := thread.SlotIndexForAddress(baseAddress); err == nil {
+			engine.clearSlots(thread, registerBase, frameReservedSlots(frame))
 		}
 	}
 }
 
-func activationBaseAddress(act *activation) uintptr {
-	if act == nil || act.frame == nil {
-		return 0
-	}
-	return uintptr(act.frame.RegsBase)
-}
-
-func activationReservedSlots(act *activation) uint32 {
-	if act == nil || act.frame == nil || act.frame.RegisterCount == 0 {
+func frameReservedSlots(frame *state.CallFrameHeader) uint32 {
+	if frame.RegisterCount == 0 {
 		return 1
 	}
-	return uint32(act.frame.RegisterCount) + uint32(act.frame.SpillCount)
+	return uint32(frame.RegisterCount) + uint32(frame.SpillCount)
 }
 
 func (engine *Engine) clearSlots(thread *state.ThreadState, start uint32, count uint32) {
@@ -531,16 +463,10 @@ func (engine *Engine) clearSlots(thread *state.ThreadState, start uint32, count 
 }
 
 func (engine *Engine) retainRef(ref value.HeapRef44) {
-	if engine == nil || engine.State == nil || engine.State.ExternalRoots() == nil {
-		return
-	}
 	engine.State.ExternalRoots().RetainRef(ref)
 }
 
 func (engine *Engine) retainValue(slotValue value.TValue) {
-	if engine == nil || engine.State == nil || engine.State.ExternalRoots() == nil {
-		return
-	}
 	engine.State.ExternalRoots().RetainValue(slotValue)
 }
 
@@ -551,14 +477,11 @@ func (engine *Engine) retainValues(values []value.TValue) {
 }
 
 func (engine *Engine) liveBytes() uint64 {
-	if engine == nil || engine.Heap == nil {
-		return 0
-	}
 	return engine.Heap.LiveBytes()
 }
 
 func (engine *Engine) advanceGCAfterBoundary(before uint64) error {
-	if engine == nil || engine.assist == nil || engine.Heap == nil {
+	if engine.assist == nil {
 		return nil
 	}
 	after := engine.Heap.LiveBytes()
@@ -569,8 +492,5 @@ func (engine *Engine) advanceGCAfterBoundary(before uint64) error {
 }
 
 func runtimeError(proto *bytecode.Proto, pc int, opcode bytecode.Opcode, reason string) error {
-	if proto == nil {
-		return &RuntimeError{PC: pc, Opcode: opcode, Reason: reason}
-	}
 	return &RuntimeError{Proto: proto.Source, PC: pc, Opcode: opcode, Reason: reason}
 }

@@ -56,15 +56,11 @@ type ThreadState struct {
 	frameArena   []byte
 	stack        []value.TValue
 	frames       []CallFrameHeader
-	currentFrame int
 	pinner       runtime.Pinner
 	closed       bool
 }
 
 func NewVMState(runtimeHeap *heap.Heap) *VMState {
-	if runtimeHeap == nil {
-		panic("vm state requires a heap")
-	}
 	nativeArena, nativePtr := allocAlignedArena(VMStateHeaderSize, value.ObjectAlignment)
 	header := (*VMStateHeader)(nativePtr)
 	*header = VMStateHeader{HeapBase: uint64(runtimeHeap.Base())}
@@ -105,7 +101,6 @@ func (vm *VMState) NewThread(stackSlots uint32, frameCapacity uint32) (*ThreadSt
 		frameArena:   frameArena,
 		stack:        stack,
 		frames:       frames,
-		currentFrame: -1,
 	}
 	thread.pinner.Pin(&thread.nativeArena[0])
 	thread.pinner.Pin(&thread.stackArena[0])
@@ -126,7 +121,7 @@ func (vm *VMState) NewThread(stackSlots uint32, frameCapacity uint32) (*ThreadSt
 }
 
 func (vm *VMState) Close() {
-	if vm == nil || vm.closed {
+	if vm.closed {
 		return
 	}
 	vm.closed = true
@@ -137,9 +132,7 @@ func (vm *VMState) Close() {
 	}
 	vm.threads = nil
 	vm.threadByID = nil
-	if vm.externalRoots != nil {
-		vm.externalRoots.Clear()
-	}
+	vm.externalRoots.Clear()
 	vm.externalRoots = nil
 	vm.nativeHeader = nil
 	vm.nativeArena = nil
@@ -147,22 +140,20 @@ func (vm *VMState) Close() {
 }
 
 func (thread *ThreadState) Close() {
-	if thread == nil || thread.closed {
+	if thread.closed {
 		return
 	}
 	thread.closed = true
 	runtime.SetFinalizer(thread, nil)
-	if thread.VM != nil {
-		delete(thread.VM.threadByID, thread.ID)
-		for index, candidate := range thread.VM.threads {
-			if candidate == thread {
-				thread.VM.threads = append(thread.VM.threads[:index], thread.VM.threads[index+1:]...)
-				break
-			}
+	delete(thread.VM.threadByID, thread.ID)
+	for index, candidate := range thread.VM.threads {
+		if candidate == thread {
+			thread.VM.threads = append(thread.VM.threads[:index], thread.VM.threads[index+1:]...)
+			break
 		}
-		if thread.VM.nativeHeader != nil && thread.VM.nativeHeader.ActiveThreadStateBase == uint64(uintptr(unsafe.Pointer(thread.nativeHeader))) {
-			thread.VM.syncHeader(nil)
-		}
+	}
+	if thread.VM.nativeHeader != nil && thread.VM.nativeHeader.ActiveThreadStateBase == uint64(uintptr(unsafe.Pointer(thread.nativeHeader))) {
+		thread.VM.syncHeader(nil)
 	}
 	thread.nativeHeader = nil
 	thread.nativeArena = nil
@@ -174,23 +165,14 @@ func (thread *ThreadState) Close() {
 }
 
 func (vm *VMState) ThreadByID(id uint64) *ThreadState {
-	if vm == nil {
-		return nil
-	}
 	return vm.threadByID[id]
 }
 
 func (vm *VMState) Threads() []*ThreadState {
-	if vm == nil {
-		return nil
-	}
 	return append([]*ThreadState(nil), vm.threads...)
 }
 
 func (vm *VMState) ExternalRoots() *ExternalRootTable {
-	if vm == nil {
-		return nil
-	}
 	return vm.externalRoots
 }
 
@@ -203,31 +185,26 @@ func (thread *ThreadState) FrameCapacity() uint32 {
 }
 
 func (thread *ThreadState) NativePointer() unsafe.Pointer {
-	if thread == nil {
-		return nil
-	}
 	return unsafe.Pointer(thread.nativeHeader)
 }
 
 func (thread *ThreadState) OpenUpvalueHead() value.HeapRef44 {
-	if thread == nil || thread.nativeHeader == nil {
-		return 0
-	}
 	return value.HeapRef44(thread.nativeHeader.OpenUpvalueHead)
 }
 
 func (thread *ThreadState) SetOpenUpvalueHead(ref value.HeapRef44) {
-	if thread == nil || thread.nativeHeader == nil {
-		return
-	}
 	thread.nativeHeader.OpenUpvalueHead = uint64(ref)
 }
 
 func (thread *ThreadState) NextRegisterBase() (uint32, error) {
-	if thread.currentFrame < 0 {
+	currentFrame, err := thread.currentFrameIndex()
+	if err != nil {
+		return 0, err
+	}
+	if currentFrame < 0 {
 		return 0, nil
 	}
-	current := &thread.frames[thread.currentFrame]
+	current := &thread.frames[currentFrame]
 	baseIndex, err := thread.slotIndex(uintptr(current.RegsBase))
 	if err != nil {
 		return 0, err
@@ -289,35 +266,44 @@ func (thread *ThreadState) FrameAtAddress(address uintptr) (*CallFrameHeader, er
 	return &thread.frames[index], nil
 }
 
-func (thread *ThreadState) CurrentFrame() *CallFrameHeader {
-	if thread.currentFrame < 0 {
-		return nil
-	}
-	return &thread.frames[thread.currentFrame]
-}
-
-func (thread *ThreadState) SyncCurrentFrameFromNative() error {
-	if thread == nil || thread.nativeHeader == nil {
-		return nil
-	}
+func (thread *ThreadState) currentFrameIndex() (int, error) {
 	if thread.nativeHeader.CurrentFrame == 0 {
-		thread.currentFrame = -1
-		return nil
+		return -1, nil
 	}
 	address := uintptr(thread.nativeHeader.CurrentFrame)
 	if address < thread.frameBase {
-		return fmt.Errorf("native current frame %#x is outside thread frame region", address)
+		return -1, fmt.Errorf("native current frame %#x is outside thread frame region", address)
 	}
 	delta := address - thread.frameBase
 	if delta%CallFrameHeaderSize != 0 {
-		return fmt.Errorf("native current frame %#x is not frame aligned", address)
+		return -1, fmt.Errorf("native current frame %#x is not frame aligned", address)
 	}
 	index := int(delta / CallFrameHeaderSize)
 	if index < 0 || index >= len(thread.frames) {
-		return fmt.Errorf("native current frame %#x is outside thread frame capacity", address)
+		return -1, fmt.Errorf("native current frame %#x is outside thread frame capacity", address)
 	}
-	thread.currentFrame = index
-	return nil
+	return index, nil
+}
+
+func (thread *ThreadState) CurrentFrame() *CallFrameHeader {
+	index, err := thread.currentFrameIndex()
+	if err != nil || index < 0 {
+		return nil
+	}
+	return &thread.frames[index]
+}
+
+func (thread *ThreadState) CurrentFrameAddress() uintptr {
+	index, err := thread.currentFrameIndex()
+	if err != nil || index < 0 {
+		return 0
+	}
+	return uintptr(thread.nativeHeader.CurrentFrame)
+}
+
+func (thread *ThreadState) SyncCurrentFrameFromNative() error {
+	_, err := thread.currentFrameIndex()
+	return err
 }
 
 func (thread *ThreadState) PreviousFrame() (*CallFrameHeader, error) {
@@ -329,7 +315,11 @@ func (thread *ThreadState) PreviousFrame() (*CallFrameHeader, error) {
 }
 
 func (thread *ThreadState) PushFrame(spec FrameSpec) (*CallFrameHeader, error) {
-	if thread.currentFrame+1 >= len(thread.frames) {
+	currentFrame, err := thread.currentFrameIndex()
+	if err != nil {
+		return nil, err
+	}
+	if currentFrame+1 >= len(thread.frames) {
 		return nil, fmt.Errorf("thread frame capacity %d is exhausted", len(thread.frames))
 	}
 	if uint32(spec.RegisterBase)+uint32(spec.RegisterCount)+uint32(spec.SpillCount) > uint32(len(thread.stack)) {
@@ -343,7 +333,7 @@ func (thread *ThreadState) PushFrame(spec FrameSpec) (*CallFrameHeader, error) {
 	if spec.VarargBase != 0 || spec.VarargCount > 0 {
 		flags |= FrameFlagHasVararg
 	}
-	frameIndex := thread.currentFrame + 1
+	frameIndex := currentFrame + 1
 	frame := CallFrameHeader{
 		Closure:       spec.Closure,
 		Proto:         spec.Proto,
@@ -360,8 +350,8 @@ func (thread *ThreadState) PushFrame(spec FrameSpec) (*CallFrameHeader, error) {
 		Top:           spec.Top,
 		ResultCap:     spec.ResultCap,
 	}
-	if thread.currentFrame >= 0 {
-		previousAddress, err := thread.FrameAddress(thread.currentFrame)
+	if currentFrame >= 0 {
+		previousAddress, err := thread.FrameAddress(currentFrame)
 		if err != nil {
 			return nil, err
 		}
@@ -371,26 +361,25 @@ func (thread *ThreadState) PushFrame(spec FrameSpec) (*CallFrameHeader, error) {
 		return nil, err
 	}
 	thread.frames[frameIndex] = frame
-	thread.currentFrame = frameIndex
-	if thread.nativeHeader != nil {
-		thread.nativeHeader.CurrentFrame = uint64(thread.frameBase + uintptr(frameIndex)*CallFrameHeaderSize)
-	}
+	thread.nativeHeader.CurrentFrame = uint64(thread.frameBase + uintptr(frameIndex)*CallFrameHeaderSize)
 	return &thread.frames[frameIndex], nil
 }
 
 func (thread *ThreadState) PopFrame() (*CallFrameHeader, error) {
-	if thread.currentFrame < 0 {
+	currentFrame, err := thread.currentFrameIndex()
+	if err != nil {
+		return nil, err
+	}
+	if currentFrame < 0 {
 		return nil, fmt.Errorf("thread has no active frame")
 	}
-	frame := thread.frames[thread.currentFrame]
-	thread.frames[thread.currentFrame] = CallFrameHeader{}
-	thread.currentFrame--
-	if thread.nativeHeader != nil {
-		if thread.currentFrame < 0 {
-			thread.nativeHeader.CurrentFrame = 0
-		} else {
-			thread.nativeHeader.CurrentFrame = uint64(thread.frameBase + uintptr(thread.currentFrame)*CallFrameHeaderSize)
-		}
+	frame := thread.frames[currentFrame]
+	thread.frames[currentFrame] = CallFrameHeader{}
+	previousFrame := currentFrame - 1
+	if previousFrame < 0 {
+		thread.nativeHeader.CurrentFrame = 0
+	} else {
+		thread.nativeHeader.CurrentFrame = uint64(thread.frameBase + uintptr(previousFrame)*CallFrameHeaderSize)
 	}
 	return &frame, nil
 }
@@ -404,12 +393,6 @@ func (thread *ThreadState) Register(frame *CallFrameHeader, index uint16) (value
 }
 
 func (thread *ThreadState) FrameWindow(frame *CallFrameHeader) ([]value.TValue, error) {
-	if thread == nil {
-		return nil, fmt.Errorf("thread cannot be nil")
-	}
-	if frame == nil {
-		return nil, fmt.Errorf("frame cannot be nil")
-	}
 	baseIndex, err := thread.slotIndex(uintptr(frame.RegsBase))
 	if err != nil {
 		return nil, err
@@ -462,18 +445,13 @@ func (thread *ThreadState) slotIndex(address uintptr) (int, error) {
 }
 
 func (thread *ThreadState) syncNativeHeader() {
-	if thread == nil || thread.nativeHeader == nil {
-		return
-	}
 	thread.nativeHeader.StackBase = uint64(thread.stackBase)
 	thread.nativeHeader.StackEnd = uint64(thread.stackBase + uintptr(len(thread.stack))*value.TValueSize)
 	thread.nativeHeader.FrameBase = uint64(thread.frameBase)
 	thread.nativeHeader.FrameEnd = uint64(thread.frameBase + uintptr(len(thread.frames))*CallFrameHeaderSize)
-	if thread.currentFrame < 0 {
+	if _, err := thread.currentFrameIndex(); err != nil {
 		thread.nativeHeader.CurrentFrame = 0
-		return
 	}
-	thread.nativeHeader.CurrentFrame = uint64(thread.frameBase + uintptr(thread.currentFrame)*CallFrameHeaderSize)
 }
 
 func allocAlignedArena(size int, alignment uintptr) ([]byte, unsafe.Pointer) {

@@ -12,9 +12,6 @@ func NewIterator(code []Instruction) *Iterator {
 }
 
 func NewProtoIterator(proto *Proto) *Iterator {
-	if proto == nil {
-		return NewIterator(nil)
-	}
 	return NewIterator(proto.Code)
 }
 
