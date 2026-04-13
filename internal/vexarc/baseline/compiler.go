@@ -542,7 +542,7 @@ func (state *compileState) emitReturnInstruction(offset int, instruction bytecod
 		if instruction.A() != 0 {
 			state.assembler.AddRegImm32(amd64.RegR8, slotDisp(instruction.A()))
 		}
-		emitCopySlots(state.assembler, amd64.RegR10, amd64.RegR8, amd64.RegRCX)
+		emitCopySlotsBackward(state.assembler, amd64.RegR10, amd64.RegR8, amd64.RegRCX)
 		state.assembler.XorRegReg(amd64.RegRAX, amd64.RegRAX)
 		state.assembler.Ret()
 

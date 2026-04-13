@@ -29,6 +29,20 @@ func validateProto(proto *Proto) error {
 	if len(proto.LineInfo) > 0 && len(proto.LineInfo) != len(proto.Code) {
 		return &ValidationError{PC: -1, Reason: "line info size does not match code size"}
 	}
+	for index, local := range proto.LocVars {
+		if local.StartPC < 0 {
+			return &ValidationError{PC: -1, Reason: fmt.Sprintf("locvar %d has negative start pc: %d", index, local.StartPC)}
+		}
+		if local.EndPC < 0 {
+			return &ValidationError{PC: -1, Reason: fmt.Sprintf("locvar %d has negative end pc: %d", index, local.EndPC)}
+		}
+		if local.StartPC > local.EndPC {
+			return &ValidationError{PC: -1, Reason: fmt.Sprintf("locvar %d has start pc %d after end pc %d", index, local.StartPC, local.EndPC)}
+		}
+		if local.StartPC > len(proto.Code) || local.EndPC > len(proto.Code) {
+			return &ValidationError{PC: -1, Reason: fmt.Sprintf("locvar %d range [%d,%d) exceeds code size %d", index, local.StartPC, local.EndPC, len(proto.Code))}
+		}
+	}
 	if len(proto.UpvalueNames) > 0 && len(proto.UpvalueNames) != int(proto.NumUpvalues) {
 		return &ValidationError{PC: -1, Reason: "upvalue name count does not match num upvalues"}
 	}

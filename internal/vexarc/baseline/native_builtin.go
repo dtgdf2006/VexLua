@@ -2607,6 +2607,28 @@ func emitCopySlots(assembler *amd64.Assembler, dstReg amd64.Register, srcReg amd
 	_ = assembler.Bind(done)
 }
 
+func emitCopySlotsBackward(assembler *amd64.Assembler, dstReg amd64.Register, srcReg amd64.Register, countReg amd64.Register) {
+	loop := assembler.NewLabel()
+	done := assembler.NewLabel()
+	assembler.CmpRegImm32(countReg, 0)
+	assembler.Jcc(amd64.CondEqual, done)
+	assembler.MoveRegReg(amd64.RegRAX, countReg)
+	assembler.AddRegImm32(amd64.RegRAX, -1)
+	assembler.ShiftLeftRegImm8(amd64.RegRAX, 3)
+	assembler.AddRegReg(srcReg, amd64.RegRAX)
+	assembler.AddRegReg(dstReg, amd64.RegRAX)
+	_ = assembler.Bind(loop)
+	assembler.MoveRegMem64(amd64.RegRAX, srcReg, 0)
+	assembler.MoveMemReg64(dstReg, 0, amd64.RegRAX)
+	assembler.AddRegImm32(countReg, -1)
+	assembler.CmpRegImm32(countReg, 0)
+	assembler.Jcc(amd64.CondEqual, done)
+	assembler.AddRegImm32(srcReg, -int32(value.TValueSize))
+	assembler.AddRegImm32(dstReg, -int32(value.TValueSize))
+	assembler.Jmp(loop)
+	_ = assembler.Bind(done)
+}
+
 func emitCopyCallArguments(assembler *amd64.Assembler, dstReg amd64.Register, srcBaseReg amd64.Register, srcIndexReg amd64.Register, countReg amd64.Register, addrScratchReg amd64.Register) {
 	loop := assembler.NewLabel()
 	done := assembler.NewLabel()

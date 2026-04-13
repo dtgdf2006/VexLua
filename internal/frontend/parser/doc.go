@@ -1,2 +1,2 @@
-// Package parser contains the future Lua source parser.
+// Package parser contains the Phase 2 Lua source parser skeleton.
 package parser

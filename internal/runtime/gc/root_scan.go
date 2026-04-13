@@ -136,10 +136,15 @@ func (scanner *Scanner) walkFrame(thread *state.ThreadState, frame *state.CallFr
 	if err := visitTValue(frame.Proto, visit); err != nil {
 		return err
 	}
-	if top > uint32(frame.RegisterCount) {
-		return fmt.Errorf("frame top %d exceeds register_count %d", top, frame.RegisterCount)
+	capacity := uint32(frame.RegisterCount) + uint32(frame.SpillCount)
+	if top > capacity {
+		return fmt.Errorf("frame top %d exceeds slot capacity %d", top, capacity)
 	}
-	for index := uint32(0); index < top; index++ {
+	registerTop := top
+	if registerTop > uint32(frame.RegisterCount) {
+		registerTop = uint32(frame.RegisterCount)
+	}
+	for index := uint32(0); index < registerTop; index++ {
 		slotValue, err := thread.Register(frame, uint16(index))
 		if err != nil {
 			return err

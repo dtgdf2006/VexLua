@@ -1,2 +1,2 @@
-// Package compiler contains the future Lua 5.1 source-to-bytecode compiler.
+// Package compiler contains the Lua 5.1 frontend binder, lowering, and bytecode contracts.
 package compiler

@@ -14,7 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"vexlua/internal/bytecode"
 	"vexlua/internal/frontend/chunk"
+	frontendcompiler "vexlua/internal/frontend/compiler"
 	"vexlua/internal/interp"
 	"vexlua/internal/runtime/host"
 	"vexlua/internal/runtime/state"
@@ -133,6 +135,7 @@ var lua51NamedTypeErrorPattern = regexp.MustCompile(`^(attempt to .+?) (?:global
 
 type lua51DiffHarness struct {
 	luaPath           string
+	luacPath          string
 	compileScriptPath string
 	evalScriptPath    string
 	engine            *interp.Engine
@@ -144,10 +147,11 @@ type lua51DiffHarness struct {
 func newLua51DiffHarness(t *testing.T) *lua51DiffHarness {
 	t.Helper()
 
-	luaPath, err := exec.LookPath("lua5.1")
+	luaPath, err := lookPathAny("lua5.1", "lua")
 	if err != nil {
 		t.Skip("lua5.1 not found on PATH")
 	}
+	luacPath, _ := lookPathAny("luac5.1", "luac")
 
 	workDir := t.TempDir()
 	compileScriptPath := filepath.Join(workDir, "compile.lua")
@@ -177,6 +181,7 @@ func newLua51DiffHarness(t *testing.T) *lua51DiffHarness {
 
 	h := &lua51DiffHarness{
 		luaPath:           luaPath,
+		luacPath:          luacPath,
 		compileScriptPath: compileScriptPath,
 		evalScriptPath:    evalScriptPath,
 		engine:            engine,
@@ -339,12 +344,18 @@ func (h *lua51DiffHarness) assertSourceMatches(t *testing.T, name string, source
 	if !reference.ok {
 		t.Fatalf("reference Lua 5.1 returned error for %s: %s", name, reference.err)
 	}
-	current := h.runCurrentChunk(t, name, chunkBytes)
-	if current.err != "" {
-		t.Fatalf("current VM returned error for %s: %s", name, current.err)
+	chunkHarness := newLua51DiffHarness(t)
+	chunkCurrent := chunkHarness.runCurrentChunk(t, name, chunkBytes)
+	if chunkCurrent.err != "" {
+		t.Fatalf("current VM returned error for %s from reference chunk: %s", name, chunkCurrent.err)
 	}
-	expected := h.referenceValuesAsTValues(t, reference.values)
-	assertTValueSliceEqual(t, current.values, expected)
+	sourceHarness := newLua51DiffHarness(t)
+	sourceCurrent := sourceHarness.runCurrentSource(t, name, source)
+	if sourceCurrent.err != "" {
+		t.Fatalf("current VM returned error for %s from source compile: %s", name, sourceCurrent.err)
+	}
+	assertTValueSliceEqual(t, chunkCurrent.values, chunkHarness.referenceValuesAsTValues(t, reference.values))
+	assertTValueSliceEqual(t, sourceCurrent.values, sourceHarness.referenceValuesAsTValues(t, reference.values))
 }
 
 func (h *lua51DiffHarness) assertSourceBothError(t *testing.T, name string, source string) {
@@ -354,11 +365,18 @@ func (h *lua51DiffHarness) assertSourceBothError(t *testing.T, name string, sour
 	if reference.ok {
 		t.Fatalf("reference Lua 5.1 unexpectedly succeeded for %s with %d values", name, len(reference.values))
 	}
-	current := h.runCurrentChunk(t, name, chunkBytes)
-	if current.err == "" {
+	chunkHarness := newLua51DiffHarness(t)
+	chunkCurrent := chunkHarness.runCurrentChunk(t, name, chunkBytes)
+	if chunkCurrent.err == "" {
 		t.Fatalf("current VM unexpectedly succeeded for %s; reference error: %s", name, reference.err)
 	}
-	assertNormalizedLua51ErrorEqual(t, reference.err, current.err)
+	sourceHarness := newLua51DiffHarness(t)
+	sourceCurrent := sourceHarness.runCurrentSource(t, name, source)
+	if sourceCurrent.err == "" {
+		t.Fatalf("current source compile unexpectedly succeeded for %s; reference error: %s", name, reference.err)
+	}
+	assertNormalizedLua51ErrorEqual(t, reference.err, chunkCurrent.err)
+	assertNormalizedLua51ErrorEqual(t, reference.err, sourceCurrent.err)
 }
 
 func assertNormalizedLua51ErrorEqual(t *testing.T, referenceErr string, currentErr string) {
@@ -415,18 +433,11 @@ func stripLua51ErrorLocationPrefix(text string) (string, bool) {
 func (h *lua51DiffHarness) compileAndRunReference(t *testing.T, name string, source string) (lua51Outcome, []byte) {
 	t.Helper()
 
-	caseDir := t.TempDir()
-	sourcePath := filepath.Join(caseDir, strings.TrimPrefix(strings.TrimPrefix(name, "@"), "="))
-	if filepath.Ext(sourcePath) == "" {
-		sourcePath += ".lua"
-	}
-	chunkPath := sourcePath + ".luac"
-	resultPath := sourcePath + ".result"
+	sourcePath, chunkPath, resultPath := h.newCasePaths(t, name)
 	if err := os.WriteFile(sourcePath, []byte(source), 0o600); err != nil {
 		t.Fatalf("write source %s: %v", name, err)
 	}
-
-	h.runLuaScript(t, h.compileScriptPath, sourcePath, chunkPath, name)
+	h.compileReferenceChunkFile(t, sourcePath, chunkPath, name)
 	h.runLuaScript(t, h.evalScriptPath, sourcePath, resultPath, name)
 
 	chunkBytes, err := os.ReadFile(chunkPath)
@@ -442,6 +453,109 @@ func (h *lua51DiffHarness) compileAndRunReference(t *testing.T, name string, sou
 		t.Fatalf("parse lua5.1 result for %s: %v", name, err)
 	}
 	return outcome, chunkBytes
+}
+
+func (h *lua51DiffHarness) compileReferenceProto(t *testing.T, name string, source string) *bytecode.Proto {
+	t.Helper()
+	chunkBytes := h.compileReferenceChunkBytes(t, name, source)
+	proto, err := chunk.Load(name, chunkBytes)
+	if err != nil {
+		t.Fatalf("chunk.Load reference proto %s: %v", name, err)
+	}
+	return proto
+}
+
+func (h *lua51DiffHarness) compileReferenceChunkBytes(t *testing.T, name string, source string) []byte {
+	t.Helper()
+	sourcePath, chunkPath, _ := h.newCasePaths(t, name)
+	if err := os.WriteFile(sourcePath, []byte(source), 0o600); err != nil {
+		t.Fatalf("write source %s: %v", name, err)
+	}
+	h.compileReferenceChunkFile(t, sourcePath, chunkPath, name)
+
+	chunkBytes, err := os.ReadFile(chunkPath)
+	if err != nil {
+		t.Fatalf("read compiled chunk %s: %v", name, err)
+	}
+	return chunkBytes
+}
+
+func (h *lua51DiffHarness) compileCurrentProto(t *testing.T, name string, source string) *bytecode.Proto {
+	t.Helper()
+	proto, err := frontendcompiler.Compile(name, []byte(source))
+	if err != nil {
+		t.Fatalf("frontend compiler failed for %s: %v", name, err)
+	}
+	return proto
+}
+
+func (h *lua51DiffHarness) runCurrentSource(t *testing.T, name string, source string) currentOutcome {
+	t.Helper()
+	proto, err := frontendcompiler.Compile(name, []byte(source))
+	if err != nil {
+		return currentOutcome{err: err.Error()}
+	}
+	closure, err := h.engine.NewClosure(proto, h.env, nil)
+	if err != nil {
+		return currentOutcome{err: err.Error()}
+	}
+	results, err := h.runtime.Call(h.thread, closure.Value, nil, -1)
+	if err != nil {
+		return currentOutcome{err: err.Error()}
+	}
+	copied := make([]value.TValue, len(results))
+	copy(copied, results)
+	return currentOutcome{values: copied}
+}
+
+func (h *lua51DiffHarness) compileReferenceChunkFile(t *testing.T, sourcePath string, chunkPath string, name string) {
+	t.Helper()
+	if h.luacPath != "" {
+		h.runLuac(t, sourcePath, chunkPath)
+		return
+	}
+	h.runLuaScript(t, h.compileScriptPath, sourcePath, chunkPath, name)
+}
+
+func (h *lua51DiffHarness) newCasePaths(t *testing.T, name string) (string, string, string) {
+	t.Helper()
+	caseDir := t.TempDir()
+	sourcePath := filepath.Join(caseDir, strings.TrimPrefix(strings.TrimPrefix(name, "@"), "="))
+	if filepath.Ext(sourcePath) == "" {
+		sourcePath += ".lua"
+	}
+	chunkPath := sourcePath + ".luac"
+	resultPath := sourcePath + ".result"
+	return sourcePath, chunkPath, resultPath
+}
+
+func (h *lua51DiffHarness) runLuac(t *testing.T, sourcePath string, chunkPath string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, h.luacPath, "-o", chunkPath, sourcePath)
+	output, err := command.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf("luac5.1 timed out compiling %s", filepath.Base(sourcePath))
+	}
+	if err != nil {
+		t.Fatalf("luac5.1 failed compiling %s: %v\n%s", filepath.Base(sourcePath), err, strings.TrimSpace(string(output)))
+	}
+}
+
+func lookPathAny(names ...string) (string, error) {
+	var lastErr error
+	for _, name := range names {
+		path, err := exec.LookPath(name)
+		if err == nil {
+			return path, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no executable names provided")
+	}
+	return "", lastErr
 }
 
 func (h *lua51DiffHarness) runLuaScript(t *testing.T, scriptPath string, args ...string) {

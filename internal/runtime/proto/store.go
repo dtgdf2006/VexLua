@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	ObjectSize            = 0x60
+	ObjectSize            = 0x80
 	InstructionCountOff   = 0x10
 	ConstantCountOff      = 0x14
 	ProtoCountOff         = 0x18
@@ -30,10 +30,16 @@ const (
 	LineInfoDataOff       = 0x48
 	ConstBasePtrOff       = 0x50
 	CompiledEntryOff      = 0x58
+	LocVarCountOff        = 0x60
+	UpvalueNameCountOff   = 0x64
+	LocVarDataOff         = 0x68
+	UpvalueNameDataOff    = 0x70
 	CaptureDescriptorSize = 0x04
 	ClosureSiteSize       = 0x10
 	CaptureKindLocal      = 1
 	CaptureKindUpvalue    = 2
+	locVarRecordSize      = 0x10
+	debugNameRecordSize   = 0x08
 )
 
 const (
@@ -72,6 +78,10 @@ type Object struct {
 	LineInfoData     value.HeapOff64
 	ConstBasePtr     uint64
 	CompiledEntry    uint64
+	LocVarCount      uint32
+	UpvalueNameCount uint32
+	LocVarData       value.HeapOff64
+	UpvalueNameData  value.HeapOff64
 }
 
 type CaptureDescriptor struct {
@@ -291,6 +301,8 @@ func NewObject(proto *bytecode.Proto) Object {
 		SourceHash:       rtstring.HashString(proto.Source, 0),
 		LineDefined:      uint32(proto.LineDefined),
 		LastLineDefined:  uint32(proto.LastLineDef),
+		LocVarCount:      uint32(len(proto.LocVars)),
+		UpvalueNameCount: uint32(len(proto.UpvalueNames)),
 	}
 }
 
@@ -325,6 +337,10 @@ func ReadObject(buffer []byte) (Object, error) {
 		LineInfoData:     value.HeapOff64(binary.LittleEndian.Uint64(buffer[LineInfoDataOff : LineInfoDataOff+8])),
 		ConstBasePtr:     binary.LittleEndian.Uint64(buffer[ConstBasePtrOff : ConstBasePtrOff+8]),
 		CompiledEntry:    binary.LittleEndian.Uint64(buffer[CompiledEntryOff : CompiledEntryOff+8]),
+		LocVarCount:      binary.LittleEndian.Uint32(buffer[LocVarCountOff : LocVarCountOff+4]),
+		UpvalueNameCount: binary.LittleEndian.Uint32(buffer[UpvalueNameCountOff : UpvalueNameCountOff+4]),
+		LocVarData:       value.HeapOff64(binary.LittleEndian.Uint64(buffer[LocVarDataOff : LocVarDataOff+8])),
+		UpvalueNameData:  value.HeapOff64(binary.LittleEndian.Uint64(buffer[UpvalueNameDataOff : UpvalueNameDataOff+8])),
 	}, nil
 }
 
@@ -356,6 +372,10 @@ func WriteObject(buffer []byte, object Object) error {
 	binary.LittleEndian.PutUint64(buffer[LineInfoDataOff:LineInfoDataOff+8], uint64(object.LineInfoData))
 	binary.LittleEndian.PutUint64(buffer[ConstBasePtrOff:ConstBasePtrOff+8], object.ConstBasePtr)
 	binary.LittleEndian.PutUint64(buffer[CompiledEntryOff:CompiledEntryOff+8], object.CompiledEntry)
+	binary.LittleEndian.PutUint32(buffer[LocVarCountOff:LocVarCountOff+4], object.LocVarCount)
+	binary.LittleEndian.PutUint32(buffer[UpvalueNameCountOff:UpvalueNameCountOff+4], object.UpvalueNameCount)
+	binary.LittleEndian.PutUint64(buffer[LocVarDataOff:LocVarDataOff+8], uint64(object.LocVarData))
+	binary.LittleEndian.PutUint64(buffer[UpvalueNameDataOff:UpvalueNameDataOff+8], uint64(object.UpvalueNameData))
 	return nil
 }
 
@@ -416,6 +436,58 @@ func (store *Store) LineInfo(ref value.HeapRef44) ([]int, error) {
 	return lines, nil
 }
 
+func (store *Store) LocVars(ref value.HeapRef44) ([]bytecode.LocVar, error) {
+	object, err := store.Object(ref)
+	if err != nil {
+		return nil, err
+	}
+	if object.LocVarCount == 0 || object.LocVarData == 0 {
+		return nil, nil
+	}
+	recordBytes, err := store.heap.Resolve(object.LocVarData, uint64(object.LocVarCount)*locVarRecordSize)
+	if err != nil {
+		return nil, err
+	}
+	locals := make([]bytecode.LocVar, object.LocVarCount)
+	for index := range locals {
+		start := index * locVarRecordSize
+		name, err := store.readDebugName(object.LocVarData, recordBytes[start:start+debugNameRecordSize])
+		if err != nil {
+			return nil, err
+		}
+		locals[index] = bytecode.LocVar{
+			Name:    name,
+			StartPC: int(int32(binary.LittleEndian.Uint32(recordBytes[start+8 : start+12]))),
+			EndPC:   int(int32(binary.LittleEndian.Uint32(recordBytes[start+12 : start+16]))),
+		}
+	}
+	return locals, nil
+}
+
+func (store *Store) UpvalueNames(ref value.HeapRef44) ([]string, error) {
+	object, err := store.Object(ref)
+	if err != nil {
+		return nil, err
+	}
+	if object.UpvalueNameCount == 0 || object.UpvalueNameData == 0 {
+		return nil, nil
+	}
+	recordBytes, err := store.heap.Resolve(object.UpvalueNameData, uint64(object.UpvalueNameCount)*debugNameRecordSize)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, object.UpvalueNameCount)
+	for index := range names {
+		start := index * debugNameRecordSize
+		name, err := store.readDebugName(object.UpvalueNameData, recordBytes[start:start+debugNameRecordSize])
+		if err != nil {
+			return nil, err
+		}
+		names[index] = name
+	}
+	return names, nil
+}
+
 func (store *Store) ClosureSite(ref value.HeapRef44, pc int) (ClosureSite, []CaptureDescriptor, bool, error) {
 	object, err := store.Object(ref)
 	if err != nil {
@@ -467,11 +539,21 @@ func (store *Store) buildObject(owner value.HeapOff64, proto *bytecode.Proto, ob
 	if err != nil {
 		return Object{}, err
 	}
+	locVarData, err := store.allocLocVarData(owner, proto.LocVars)
+	if err != nil {
+		return Object{}, err
+	}
+	upvalueNameData, err := store.allocUpvalueNameData(owner, proto.UpvalueNames)
+	if err != nil {
+		return Object{}, err
+	}
 	object.ClosureSiteCount = uint32(len(closureSites))
 	object.CodeData = codeData
 	object.ChildProtoData = childData
 	object.ClosureSiteData = closureSiteData
 	object.LineInfoData = lineInfoData
+	object.LocVarData = locVarData
+	object.UpvalueNameData = upvalueNameData
 	return object, nil
 }
 
@@ -589,6 +671,52 @@ func (store *Store) allocLineInfoData(owner value.HeapOff64, lines []int) (value
 	}
 	for index, line := range lines {
 		binary.LittleEndian.PutUint32(allocation.Bytes[index*4:(index+1)*4], uint32(int32(line)))
+	}
+	return allocation.Offset, nil
+}
+
+func (store *Store) allocLocVarData(owner value.HeapOff64, locals []bytecode.LocVar) (value.HeapOff64, error) {
+	if len(locals) == 0 {
+		return 0, nil
+	}
+	totalSize := len(locals) * locVarRecordSize
+	for _, local := range locals {
+		totalSize += len(local.Name)
+	}
+	allocation, err := store.heap.AllocPayload(uint64(totalSize), heap.PayloadLayoutOpaque, owner)
+	if err != nil {
+		return 0, err
+	}
+	nameCursor := uint32(len(locals) * locVarRecordSize)
+	for index, local := range locals {
+		start := index * locVarRecordSize
+		writeDebugNameRecord(allocation.Bytes[start:start+debugNameRecordSize], nameCursor, uint32(len(local.Name)))
+		binary.LittleEndian.PutUint32(allocation.Bytes[start+8:start+12], uint32(int32(local.StartPC)))
+		binary.LittleEndian.PutUint32(allocation.Bytes[start+12:start+16], uint32(int32(local.EndPC)))
+		copy(allocation.Bytes[nameCursor:nameCursor+uint32(len(local.Name))], local.Name)
+		nameCursor += uint32(len(local.Name))
+	}
+	return allocation.Offset, nil
+}
+
+func (store *Store) allocUpvalueNameData(owner value.HeapOff64, names []string) (value.HeapOff64, error) {
+	if len(names) == 0 {
+		return 0, nil
+	}
+	totalSize := len(names) * debugNameRecordSize
+	for _, name := range names {
+		totalSize += len(name)
+	}
+	allocation, err := store.heap.AllocPayload(uint64(totalSize), heap.PayloadLayoutOpaque, owner)
+	if err != nil {
+		return 0, err
+	}
+	nameCursor := uint32(len(names) * debugNameRecordSize)
+	for index, name := range names {
+		start := index * debugNameRecordSize
+		writeDebugNameRecord(allocation.Bytes[start:start+debugNameRecordSize], nameCursor, uint32(len(name)))
+		copy(allocation.Bytes[nameCursor:nameCursor+uint32(len(name))], name)
+		nameCursor += uint32(len(name))
 	}
 	return allocation.Offset, nil
 }
@@ -730,6 +858,24 @@ func writeCaptureDescriptor(buffer []byte, capture CaptureDescriptor) {
 	buffer[0] = byte(capture.Kind)
 	buffer[1] = 0
 	binary.LittleEndian.PutUint16(buffer[2:4], capture.Index)
+}
+
+func writeDebugNameRecord(buffer []byte, offset uint32, length uint32) {
+	binary.LittleEndian.PutUint32(buffer[0:4], offset)
+	binary.LittleEndian.PutUint32(buffer[4:8], length)
+}
+
+func (store *Store) readDebugName(base value.HeapOff64, record []byte) (string, error) {
+	nameOffset := binary.LittleEndian.Uint32(record[0:4])
+	nameLength := binary.LittleEndian.Uint32(record[4:8])
+	if nameLength == 0 {
+		return "", nil
+	}
+	bytes, err := store.heap.Resolve(base+value.HeapOff64(nameOffset), uint64(nameLength))
+	if err != nil {
+		return "", err
+	}
+	return string(bytes), nil
 }
 
 func (store *Store) allocConstantData(owner value.HeapOff64, constants []bytecode.Constant, strings *rtstring.InternTable) (value.HeapOff64, error) {

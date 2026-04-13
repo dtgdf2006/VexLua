@@ -32,6 +32,10 @@ func TestProtoObjectLayoutContract(t *testing.T) {
 		LineInfoData:     value.HeapOff64(0x4000),
 		ConstBasePtr:     0x5566778899AABBCC,
 		CompiledEntry:    0xCCDDEEFF00112233,
+		LocVarCount:      7,
+		UpvalueNameCount: 3,
+		LocVarData:       value.HeapOff64(0x5000),
+		UpvalueNameData:  value.HeapOff64(0x6000),
 	}
 	buffer := make([]byte, ObjectSize)
 	if err := WriteObject(buffer, object); err != nil {
@@ -90,6 +94,18 @@ func TestProtoObjectLayoutContract(t *testing.T) {
 	}
 	if got := binary.LittleEndian.Uint64(buffer[CompiledEntryOff : CompiledEntryOff+8]); got != object.CompiledEntry {
 		t.Fatalf("compiled entry = %#x, want %#x", got, object.CompiledEntry)
+	}
+	if got := binary.LittleEndian.Uint32(buffer[LocVarCountOff : LocVarCountOff+4]); got != object.LocVarCount {
+		t.Fatalf("locvar count = %d, want %d", got, object.LocVarCount)
+	}
+	if got := binary.LittleEndian.Uint32(buffer[UpvalueNameCountOff : UpvalueNameCountOff+4]); got != object.UpvalueNameCount {
+		t.Fatalf("upvalue name count = %d, want %d", got, object.UpvalueNameCount)
+	}
+	if got := value.HeapOff64(binary.LittleEndian.Uint64(buffer[LocVarDataOff : LocVarDataOff+8])); got != object.LocVarData {
+		t.Fatalf("locvar data = %#x, want %#x", uint64(got), uint64(object.LocVarData))
+	}
+	if got := value.HeapOff64(binary.LittleEndian.Uint64(buffer[UpvalueNameDataOff : UpvalueNameDataOff+8])); got != object.UpvalueNameData {
+		t.Fatalf("upvalue name data = %#x, want %#x", uint64(got), uint64(object.UpvalueNameData))
 	}
 }
 
@@ -312,7 +328,9 @@ func TestStoreBuildsNativeProtoPayload(t *testing.T) {
 		Code: []bytecode.Instruction{
 			bytecode.CreateABC(bytecode.OP_RETURN, 0, 1, 0),
 		},
-		LineInfo: []int{21},
+		LineInfo:     []int{21},
+		LocVars:      []bytecode.LocVar{{Name: "arg", StartPC: 0, EndPC: 1}},
+		UpvalueNames: []string{"left", "right"},
 	}
 	parent := &bytecode.Proto{
 		Source:       "parent",
@@ -325,7 +343,9 @@ func TestStoreBuildsNativeProtoPayload(t *testing.T) {
 			bytecode.CreateABC(bytecode.OP_GETUPVAL, 0, 0, 0),
 			bytecode.CreateABC(bytecode.OP_RETURN, 0, 2, 0),
 		},
-		LineInfo: []int{10, 11, 12, 13},
+		LineInfo:     []int{10, 11, 12, 13},
+		LocVars:      []bytecode.LocVar{{Name: "x", StartPC: 0, EndPC: 4}, {Name: "y", StartPC: 1, EndPC: 3}},
+		UpvalueNames: []string{"env"},
 	}
 	handle, err := store.Intern(parent)
 	if err != nil {
@@ -339,11 +359,17 @@ func TestStoreBuildsNativeProtoPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read proto object: %v", err)
 	}
-	if object.CodeData == 0 || object.ChildProtoData == 0 || object.ClosureSiteData == 0 || object.LineInfoData == 0 {
-		t.Fatalf("expected proto native payload offsets, got code=%#x child=%#x closure=%#x line=%#x", uint64(object.CodeData), uint64(object.ChildProtoData), uint64(object.ClosureSiteData), uint64(object.LineInfoData))
+	if object.CodeData == 0 || object.ChildProtoData == 0 || object.ClosureSiteData == 0 || object.LineInfoData == 0 || object.LocVarData == 0 || object.UpvalueNameData == 0 {
+		t.Fatalf("expected proto native payload offsets, got code=%#x child=%#x closure=%#x line=%#x loc=%#x up=%#x", uint64(object.CodeData), uint64(object.ChildProtoData), uint64(object.ClosureSiteData), uint64(object.LineInfoData), uint64(object.LocVarData), uint64(object.UpvalueNameData))
 	}
 	if object.ClosureSiteCount != 1 {
 		t.Fatalf("closure site count = %d, want 1", object.ClosureSiteCount)
+	}
+	if object.LocVarCount != uint32(len(parent.LocVars)) {
+		t.Fatalf("locvar count = %d, want %d", object.LocVarCount, len(parent.LocVars))
+	}
+	if object.UpvalueNameCount != uint32(len(parent.UpvalueNames)) {
+		t.Fatalf("upvalue name count = %d, want %d", object.UpvalueNameCount, len(parent.UpvalueNames))
 	}
 	address, err := runtimeHeap.DecodeHeapRef(handle.Ref)
 	if err != nil {
@@ -418,6 +444,20 @@ func TestStoreBuildsNativeProtoPayload(t *testing.T) {
 	if len(lines) != len(parent.LineInfo) || lines[0] != 10 || lines[3] != 13 {
 		t.Fatalf("unexpected native line info: %#v", lines)
 	}
+	locals, err := store.LocVars(handle.Ref)
+	if err != nil {
+		t.Fatalf("read locvars: %v", err)
+	}
+	if len(locals) != len(parent.LocVars) || locals[0] != parent.LocVars[0] || locals[1] != parent.LocVars[1] {
+		t.Fatalf("unexpected native locvars: %#v", locals)
+	}
+	upvalueNames, err := store.UpvalueNames(handle.Ref)
+	if err != nil {
+		t.Fatalf("read upvalue names: %v", err)
+	}
+	if len(upvalueNames) != len(parent.UpvalueNames) || upvalueNames[0] != parent.UpvalueNames[0] {
+		t.Fatalf("unexpected native upvalue names: %#v", upvalueNames)
+	}
 	lineBytes, err := runtimeHeap.Resolve(object.LineInfoData, uint64(object.InstructionCount)*4)
 	if err != nil {
 		t.Fatalf("resolve canonical line info bytes: %v", err)
@@ -428,6 +468,42 @@ func TestStoreBuildsNativeProtoPayload(t *testing.T) {
 	}
 	if uintptr(unsafe.Pointer(&lineBytes[0])) != nativeLineAddress {
 		t.Fatalf("proto line-info bytes base %#x, want %#x", uintptr(unsafe.Pointer(&lineBytes[0])), nativeLineAddress)
+	}
+	locVarBytes, err := runtimeHeap.Resolve(object.LocVarData, uint64(object.LocVarCount)*locVarRecordSize)
+	if err != nil {
+		t.Fatalf("resolve canonical locvar bytes: %v", err)
+	}
+	nativeLocVarAddress, err := runtimeHeap.NativeAddressForOffset(object.LocVarData)
+	if err != nil {
+		t.Fatalf("resolve native locvar address: %v", err)
+	}
+	if uintptr(unsafe.Pointer(&locVarBytes[0])) != nativeLocVarAddress {
+		t.Fatalf("proto locvar bytes base %#x, want %#x", uintptr(unsafe.Pointer(&locVarBytes[0])), nativeLocVarAddress)
+	}
+	upvalueNameBytes, err := runtimeHeap.Resolve(object.UpvalueNameData, uint64(object.UpvalueNameCount)*debugNameRecordSize)
+	if err != nil {
+		t.Fatalf("resolve canonical upvalue-name bytes: %v", err)
+	}
+	nativeUpvalueNameAddress, err := runtimeHeap.NativeAddressForOffset(object.UpvalueNameData)
+	if err != nil {
+		t.Fatalf("resolve native upvalue-name address: %v", err)
+	}
+	if uintptr(unsafe.Pointer(&upvalueNameBytes[0])) != nativeUpvalueNameAddress {
+		t.Fatalf("proto upvalue-name bytes base %#x, want %#x", uintptr(unsafe.Pointer(&upvalueNameBytes[0])), nativeUpvalueNameAddress)
+	}
+	childLocals, err := store.LocVars(childHandle.Ref)
+	if err != nil {
+		t.Fatalf("read child locvars: %v", err)
+	}
+	if len(childLocals) != len(child.LocVars) || childLocals[0] != child.LocVars[0] {
+		t.Fatalf("unexpected child locvars: %#v", childLocals)
+	}
+	childUpvalueNames, err := store.UpvalueNames(childHandle.Ref)
+	if err != nil {
+		t.Fatalf("read child upvalue names: %v", err)
+	}
+	if len(childUpvalueNames) != len(child.UpvalueNames) || childUpvalueNames[0] != child.UpvalueNames[0] || childUpvalueNames[1] != child.UpvalueNames[1] {
+		t.Fatalf("unexpected child upvalue names: %#v", childUpvalueNames)
 	}
 	site, captures, found, err := store.ClosureSite(handle.Ref, 0)
 	if err != nil {

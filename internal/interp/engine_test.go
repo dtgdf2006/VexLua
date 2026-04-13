@@ -1136,7 +1136,7 @@ func TestInterpreterVarargTailcallAndProtectedCall(t *testing.T) {
 	varargProto := &bytecode.Proto{
 		Source:       "@vararg.lua",
 		IsVararg:     1,
-		MaxStackSize: 4,
+		MaxStackSize: 2,
 		Code: []bytecode.Instruction{
 			bytecode.CreateABC(bytecode.OP_VARARG, 0, 0, 0),
 			bytecode.CreateABC(bytecode.OP_RETURN, 0, 0, 0),

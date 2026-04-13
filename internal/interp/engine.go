@@ -513,7 +513,7 @@ func activationReservedSlots(act *activation) uint32 {
 	if act == nil || act.frame == nil || act.frame.RegisterCount == 0 {
 		return 1
 	}
-	return uint32(act.frame.RegisterCount)
+	return uint32(act.frame.RegisterCount) + uint32(act.frame.SpillCount)
 }
 
 func (engine *Engine) clearSlots(thread *state.ThreadState, start uint32, count uint32) {

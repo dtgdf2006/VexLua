@@ -123,8 +123,8 @@ func (frame CallFrameHeader) Validate() error {
 	if frame.VarargCount > 0 && !frame.Flags.Has(FrameFlagHasVararg) {
 		return fmt.Errorf("vararg_count is non-zero but has_vararg flag is not set")
 	}
-	if frame.Top > frame.RegisterCount {
-		return fmt.Errorf("top %d exceeds register_count %d", frame.Top, frame.RegisterCount)
+	if frame.Top > frame.RegisterCount+frame.SpillCount {
+		return fmt.Errorf("top %d exceeds slot capacity %d", frame.Top, frame.RegisterCount+frame.SpillCount)
 	}
 	if frame.ResultCap > 0 && frame.ResultBase == 0 {
 		return fmt.Errorf("result_cap %d requires result_base", frame.ResultCap)
@@ -140,8 +140,8 @@ func (frame *CallFrameHeader) SetTop(top uint16) error {
 	if frame == nil {
 		return fmt.Errorf("frame cannot be nil")
 	}
-	if top > frame.RegisterCount {
-		return fmt.Errorf("top %d exceeds register_count %d", top, frame.RegisterCount)
+	if top > frame.RegisterCount+frame.SpillCount {
+		return fmt.Errorf("top %d exceeds slot capacity %d", top, frame.RegisterCount+frame.SpillCount)
 	}
 	frame.Top = top
 	return nil
